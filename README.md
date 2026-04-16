@@ -5,7 +5,7 @@ and session-scoped working memory.
 
 ## Status
 
-Phase 3 E — Loop detector, interject queue, concurrency guard landed. 143 tests passing.
+Multi-agent plan mode landed. Browser control module added. 232 tests passing.
 
 | Module | Location | State |
 | --- | --- | --- |
@@ -14,13 +14,15 @@ Phase 3 E — Loop detector, interject queue, concurrency guard landed. 143 test
 | llm.clients | `src/topsport_agent/llm/clients/` | SDK client construction, env resolution, transport calls, transient retry |
 | llm.providers | `src/topsport_agent/llm/providers/` | provider orchestration around SDK clients |
 | llm.adapters | `src/topsport_agent/llm/adapters/` | provider-specific payload/response codecs |
-| engine | `src/topsport_agent/engine/` | ReAct loop, cancel, hooks, event dispatch, state machine |
+| engine | `src/topsport_agent/engine/` | ReAct loop, cancel, hooks, event dispatch, planner, orchestrator |
 | memory | `src/topsport_agent/memory/` | file store, injector, save/recall/forget tools |
 | skills | `src/topsport_agent/skills/` | registry, loader, matcher, injector, load/unload/list tools |
+| browser | `src/topsport_agent/browser/` | Playwright-based browser control with snapshot/ref interaction model |
 | mcp | `src/topsport_agent/mcp/` | JSON config, lazy client, tool bridge, prompt/resource meta tools |
 | tools | `src/topsport_agent/tools/` | executor (output cap + blob offload), safe_shell (execFile-only), blob store |
 | observability | `src/topsport_agent/observability/` | Tracer alias, NoOpTracer, LangfuseTracer |
-| tests | `tests/` | 115 passing (98 prior + 17 tools) |
+| cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
+| tests | `tests/` | 232 passing |
 
 ## Quickstart
 
@@ -28,6 +30,35 @@ Phase 3 E — Loop detector, interject queue, concurrency guard landed. 143 test
 uv sync
 uv run pytest -v
 ```
+
+## CLI
+
+Interactive REPL for verifying the engine end-to-end with a real LLM.
+
+MODEL 格式为 `provider/model-name`，支持 `anthropic` 和 `openai` 两种 provider。
+API 凭证使用通用的 `API_KEY` 和 `BASE_URL`，不带厂商前缀。
+
+```bash
+uv sync --group llm
+```
+
+通过 `.env` 文件配置（启动时自动加载）:
+
+```env
+API_KEY=sk-...
+BASE_URL=https://api.example.com/v1
+MODEL=anthropic/claude-sonnet-4-5
+```
+
+```bash
+# 直接使用 .env 配置
+uv run topsport-agent
+
+# 命令行覆盖 model
+uv run topsport-agent -m openai/gpt-4o
+```
+
+Built-in tools available in CLI mode: `echo`, `current_time`, `calc`.
 
 ## 维护说明
 
@@ -182,6 +213,53 @@ shape (`text` / `thinking` / `tool_use`), similar to AgentScope's content block
 design, so downstream code can inspect OpenAI assistant output without
 polluting the root of `Message.extra`.
 
+## Browser Control
+
+Install the optional dependency group:
+
+```bash
+uv sync --group browser
+playwright install chromium
+```
+
+The browser module provides a `BrowserToolSource` that exposes 6 tools for web
+page interaction, using a snapshot/ref model where the LLM references elements
+by `@e1`, `@e2` etc. instead of CSS selectors.
+
+```python
+from topsport_agent.browser import BrowserClient, BrowserConfig, BrowserToolSource
+from topsport_agent.engine import Engine, EngineConfig
+
+browser_client = BrowserClient.from_config(BrowserConfig(headless=True))
+browser_tools = BrowserToolSource(browser_client)
+
+engine = Engine(
+    provider,
+    tools=[...],
+    config=EngineConfig(model="claude-sonnet-4-5"),
+    tool_sources=[browser_tools],
+)
+
+# After engine run completes:
+await browser_client.close()
+```
+
+Available tools:
+
+| Tool | Description |
+| --- | --- |
+| `browser_navigate` | Navigate to URL, return snapshot of interactive elements |
+| `browser_snapshot` | Refresh the interactive element list with @refs |
+| `browser_click` | Click by @ref or CSS selector, auto-snapshot on navigation |
+| `browser_type` | Type text into input by @ref or CSS selector |
+| `browser_screenshot` | Take screenshot, return file path |
+| `browser_get_text` | Get text content from page or element |
+
+Architecture follows the MCP module pattern: `BrowserClient` accepts an
+injectable `page_factory` (like `MCPClient`'s `session_factory`), so all 34
+tests run without Playwright installed. The browser is lazily initialized on
+first use and scoped to the session lifetime.
+
 ## MCP (Model Context Protocol)
 
 Install the optional dependency group:
@@ -317,6 +395,69 @@ and working memory is injected as a `system` message every step.
 `build_memory_tools(store)` returns `save_memory`, `recall_memory`, `forget_memory`
 tool specs the agent can call directly.
 
+## Multi-Agent Plan Mode
+
+Plan mode lets an orchestrator agent generate a DAG of steps, pause for user
+approval, then execute steps in parallel using isolated sub-agents.
+
+### Usage
+
+```python
+from topsport_agent.engine import (
+    EngineConfig, Orchestrator, Planner, SubAgentConfig,
+)
+from topsport_agent.types import StepDecision
+
+# 1. Generate a plan
+planner = Planner(provider, model="claude-sonnet-4-5")
+plan = await planner.generate("Refactor auth module")
+
+# 2. Review plan.steps — each has id, title, instructions, depends_on
+
+# 3. Execute
+config = SubAgentConfig(provider=provider, model="claude-sonnet-4-5", tools=[...])
+orch = Orchestrator(plan, config, event_subscribers=[tracer])
+
+async for event in orch.execute():
+    if event.type == EventType.PLAN_WAITING:
+        # Step failed — decide: retry / skip / abort
+        orch.provide_decision(StepDecision.RETRY)
+    print(event.type, event.payload)
+```
+
+### Architecture
+
+- **Planner** sends a single LLM call with a `create_plan` tool. The LLM
+  returns structured steps with dependency declarations.
+- **Plan** validates the DAG on construction (Kahn's algorithm for cycle
+  detection, dependency existence checks).
+- **Orchestrator** executes the DAG by topological waves. Steps with all
+  dependencies satisfied run in parallel via `asyncio.gather`. Each step gets
+  a fully isolated `Engine` + `Session` instance.
+- **Step configurators**: `StepConfigurator` hooks are called before each
+  step. They can modify the sub-agent config (swap provider, inject tools,
+  override model). Multiple configurators chain in order. A broken
+  configurator is skipped with a warning.
+- **Failure handling**: on step failure, `FailureHandler` hooks are tried
+  first (auto-retry, auto-skip, auto-abort). If no handler is registered or
+  all raise, the orchestrator emits `PLAN_WAITING` and pauses until
+  `provide_decision()` is called. First handler to return wins.
+- **Cancel propagation**: `Orchestrator.cancel()` sets its own cancel event
+  and propagates to all running sub-engines.
+
+### Plan Event Types
+
+| Event | When |
+| --- | --- |
+| `plan.created` | Plan generated by planner |
+| `plan.approved` | Orchestrator begins execution |
+| `plan.step.start` | Sub-agent launched for a step |
+| `plan.step.end` | Sub-agent completed (success or failure) |
+| `plan.step.failed` | One or more steps in a wave failed |
+| `plan.waiting` | Orchestrator paused, waiting for user decision |
+| `plan.done` | All steps completed or skipped |
+| `plan.failed` | Plan aborted or no ready steps remain |
+
 ## Verified invariants
 
 - `tool_calls` are always followed immediately by matching `tool_result` messages.
@@ -332,6 +473,10 @@ tool specs the agent can call directly.
 - Every `engine.run()` is bookended by `RUN_START` and `RUN_END` events.
 - Event subscribers receive events in the same order they are yielded.
 - A subscriber raising an exception does not break the engine or other subscribers.
+- Plan DAG is validated on construction: no cycles, no self-deps, all dep IDs exist.
+- Orchestrator cancel propagates to all running sub-engines.
+- Orchestrator checks cancel immediately after `asyncio.gather` returns, before
+  entering the failure-handling path.
 - Skill activation is session-scoped — two sessions cannot see each other's active skills.
 - Loading a skill via `load_skill` becomes visible on the next engine step without cache.
 - The skill registry parses the real Claude Code `~/.claude/skills/` tree unchanged.
@@ -342,10 +487,8 @@ tool specs the agent can call directly.
 
 ## Not yet implemented
 
-- Tool executor with output caps and blob offload (Phase 3 C)
-- Context compaction (micro, auto, goal reinjection) (Phase 3 D)
-- Loop detector and interject-message queue (Phase 3 E)
-- Concurrency lock with take-and-release semantics (Phase 3 E)
-- HTTP or streaming surface for frontend integration (Phase 3 F)
-- Shared `common/frontmatter.py` — memory, skills, and future modules currently
-  carry their own copy; will be unified in Phase 3 G polish
+- HTTP or streaming surface for frontend integration
+- Plan editing after approval
+- Dynamic re-planning during execution
+- Shared `common/frontmatter.py` -- memory, skills, and future modules currently
+  carry their own copy
