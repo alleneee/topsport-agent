@@ -15,6 +15,16 @@ from .types import BrowserConfig, PageSnapshot
 PageFactory = Callable[[], AbstractAsyncContextManager[Any]]
 
 
+def _clean_text(raw: str) -> str:
+    """Collapse excessive whitespace and blank lines from page text."""
+    import re
+    # Collapse runs of whitespace (tabs, spaces) into single space
+    text = re.sub(r"[^\S\n]+", " ", raw)
+    # Collapse 3+ consecutive newlines into 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 class BrowserClient:
     """Session-scoped browser control. Lazy-initialized on first operation.
 
@@ -117,12 +127,33 @@ class BrowserClient:
         await page.screenshot(path=path)
         return path
 
+    # Selectors tried in order to find the main content area.
+    _MAIN_CONTENT_SELECTORS = [
+        "main",
+        "article",
+        "[role='main']",
+        "#content",
+        ".content",
+        ".post-content",
+        ".article-content",
+        ".entry-content",
+    ]
+
     async def get_text(self, ref_or_selector: str | None = None) -> str:
         page = await self._ensure_page()
-        if ref_or_selector is None:
-            return await page.locator("body").text_content() or ""
-        locator = self._resolve(page, ref_or_selector)
-        return await locator.text_content() or ""
+        if ref_or_selector is not None:
+            locator = self._resolve(page, ref_or_selector)
+            return await locator.text_content() or ""
+
+        # Try to find main content area first, fall back to body.
+        for selector in self._MAIN_CONTENT_SELECTORS:
+            loc = page.locator(selector).first
+            if await loc.count() > 0:
+                text = await loc.text_content() or ""
+                if len(text.strip()) > 100:
+                    return _clean_text(text)
+
+        return _clean_text(await page.locator("body").text_content() or "")
 
     async def close(self) -> None:
         if self._exit_stack is not None:

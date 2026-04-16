@@ -92,6 +92,13 @@ class MockAriaLocator:
     async def text_content(self) -> str:
         return "Full page text content"
 
+    async def count(self) -> int:
+        return 1
+
+    @property
+    def first(self) -> MockAriaLocator:
+        return self
+
 
 class MockPage:
     """Mock Playwright Page for testing BrowserClient without Playwright."""
@@ -137,6 +144,7 @@ class MockInteractionLocator:
         self._page = page
         self._role = role
         self._name = name
+        self._mock_count = 0  # default: element not found (for content selectors)
 
     async def click(self, **kwargs: Any) -> None:
         self._page.click_log.append(f"{self._role}:{self._name}")
@@ -152,7 +160,7 @@ class MockInteractionLocator:
         return self
 
     async def count(self) -> int:
-        return 1
+        return self._mock_count
 
 
 def _mock_page_factory(page: MockPage):

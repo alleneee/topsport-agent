@@ -43,6 +43,13 @@ class MockAriaLocator:
     async def text_content(self) -> str:
         return "Mock page text content"
 
+    async def count(self) -> int:
+        return 1
+
+    @property
+    def first(self) -> MockAriaLocator:
+        return self
+
 
 class MockInteractionLocator:
     def __init__(self, page: MockBrowserPage, role: str, name: str) -> None:
@@ -58,6 +65,9 @@ class MockInteractionLocator:
 
     async def text_content(self) -> str:
         return f"text of {self._role}:{self._name}"
+
+    async def count(self) -> int:
+        return 0  # Non-body selectors return 0 so get_text falls back to body
 
     @property
     def first(self) -> MockInteractionLocator:
