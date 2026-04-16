@@ -1,7 +1,16 @@
-"""Accessibility tree parsing and @ref assignment."""
+"""Accessibility tree parsing and @ref assignment.
+
+Uses Playwright's ``page.locator("body").aria_snapshot()`` which returns a
+YAML-formatted string of the accessibility tree. Each line looks like::
+
+    - role "name" [attr=value]
+    - role "name":
+      - childrole "childname"
+"""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .types import PageSnapshot, SnapshotEntry
@@ -24,34 +33,37 @@ INTERACTIVE_ROLES = frozenset({
     "menuitemradio",
 })
 
+# Matches lines like: - button "Submit" [disabled]
+# Groups: role, optional quoted name
+_LINE_RE = re.compile(r"^-\s+(\w+)(?:\s+\"([^\"]*)\")?\s*(?:\[.*\])?\s*:?\s*$")
 
-async def take_snapshot(page: Any) -> PageSnapshot:
-    """Extract interactive elements from accessibility tree, assign sequential @refs."""
-    tree = await page.accessibility_snapshot()
-    url = page.url
-    title = await page.title()
 
+def _parse_aria_yaml(yaml_text: str) -> list[SnapshotEntry]:
+    """Parse aria_snapshot YAML output, extract interactive elements with @refs."""
     entries: list[SnapshotEntry] = []
     counter = 0
 
-    def walk(node: dict[str, Any]) -> None:
-        nonlocal counter
-        role = node.get("role", "")
+    for line in yaml_text.splitlines():
+        stripped = line.lstrip()
+        m = _LINE_RE.match(stripped)
+        if not m:
+            continue
+        role = m.group(1)
+        name = m.group(2) or ""
         if role in INTERACTIVE_ROLES:
             counter += 1
-            entries.append(
-                SnapshotEntry(
-                    ref=f"@e{counter}",
-                    role=role,
-                    name=node.get("name", ""),
-                )
-            )
-        for child in node.get("children", []):
-            walk(child)
+            entries.append(SnapshotEntry(ref=f"@e{counter}", role=role, name=name))
 
-    if tree:
-        walk(tree)
+    return entries
 
+
+async def take_snapshot(page: Any) -> PageSnapshot:
+    """Extract interactive elements from accessibility tree, assign sequential @refs."""
+    yaml_text = await page.locator("body").aria_snapshot()
+    url = page.url
+    title = await page.title()
+
+    entries = _parse_aria_yaml(yaml_text) if yaml_text else []
     return PageSnapshot(url=url, title=title, entries=entries)
 
 

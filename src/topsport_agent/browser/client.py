@@ -120,9 +120,9 @@ class BrowserClient:
     async def get_text(self, ref_or_selector: str | None = None) -> str:
         page = await self._ensure_page()
         if ref_or_selector is None:
-            return await page.text_content()
+            return await page.locator("body").text_content() or ""
         locator = self._resolve(page, ref_or_selector)
-        return await locator.text_content()
+        return await locator.text_content() or ""
 
     async def close(self) -> None:
         if self._exit_stack is not None:

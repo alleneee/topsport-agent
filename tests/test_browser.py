@@ -13,6 +13,7 @@ from topsport_agent.browser.tools import BrowserToolSource
 from topsport_agent.browser.types import BrowserConfig, PageSnapshot, SnapshotEntry
 from topsport_agent.browser.snapshot import (
     INTERACTIVE_ROLES,
+    _parse_aria_yaml,
     build_ref_map,
     take_snapshot,
 )
@@ -74,9 +75,22 @@ class TestPageSnapshot:
         assert '""' not in text
 
 
-def _make_tree(nodes: list[dict]) -> dict:
-    """Helper: build a minimal accessibility tree dict."""
-    return {"role": "WebArea", "name": "", "children": nodes}
+def _make_aria_yaml(*lines: str) -> str:
+    """Helper: build aria_snapshot YAML from shorthand lines."""
+    return "\n".join(lines)
+
+
+class MockAriaLocator:
+    """Mock locator returned by page.locator('body') for aria_snapshot and text_content."""
+
+    def __init__(self, yaml_text: str) -> None:
+        self._yaml = yaml_text
+
+    async def aria_snapshot(self) -> str:
+        return self._yaml
+
+    async def text_content(self) -> str:
+        return "Full page text content"
 
 
 class MockPage:
@@ -87,26 +101,27 @@ class MockPage:
         *,
         url: str = "https://example.com",
         page_title: str = "Example",
-        tree: dict | None = None,
+        aria_yaml: str = "",
     ) -> None:
         self.url = url
         self._title = page_title
-        self._tree = tree or {"role": "WebArea", "name": "", "children": []}
+        self._aria_yaml = aria_yaml
         self.click_log: list[str] = []
         self.fill_log: list[tuple[str, str]] = []
-        self._closed = False
 
     async def title(self) -> str:
         return self._title
 
-    async def accessibility_snapshot(self) -> dict | None:
-        return self._tree
-
     async def goto(self, url: str, **kwargs: Any) -> None:
         self.url = url
 
-    def get_by_role(self, role: str, *, name: str = "") -> MockLocator:
-        return MockLocator(self, role, name)
+    def locator(self, selector: str) -> MockAriaLocator | MockInteractionLocator:
+        if selector == "body":
+            return MockAriaLocator(self._aria_yaml)
+        return MockInteractionLocator(self, "css", selector)
+
+    def get_by_role(self, role: str, *, name: str = "") -> MockInteractionLocator:
+        return MockInteractionLocator(self, role, name)
 
     async def screenshot(self, *, path: str = "", **kwargs: Any) -> bytes:
         if path:
@@ -116,11 +131,8 @@ class MockPage:
     async def text_content(self) -> str:
         return "Full page text content"
 
-    def locator(self, selector: str) -> MockLocator:
-        return MockLocator(self, "css", selector)
 
-
-class MockLocator:
+class MockInteractionLocator:
     def __init__(self, page: MockPage, role: str, name: str) -> None:
         self._page = page
         self._role = role
@@ -136,7 +148,7 @@ class MockLocator:
         return f"text of {self._role}:{self._name}"
 
     @property
-    def first(self) -> MockLocator:
+    def first(self) -> MockInteractionLocator:
         return self
 
     async def count(self) -> int:
@@ -151,91 +163,92 @@ def _mock_page_factory(page: MockPage):
     return factory
 
 
+# --- Snapshot Tests ---
+
+
+class TestParseAriaYaml:
+    def test_extracts_interactive_elements(self):
+        yaml = _make_aria_yaml(
+            '- textbox "Email"',
+            '- textbox "Password"',
+            '- button "Login"',
+        )
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 3
+        assert entries[0].ref == "@e1"
+        assert entries[0].role == "textbox"
+        assert entries[0].name == "Email"
+        assert entries[2].ref == "@e3"
+        assert entries[2].role == "button"
+
+    def test_ignores_non_interactive_roles(self):
+        yaml = _make_aria_yaml(
+            '- heading "Welcome" [level=1]',
+            '- paragraph: some text',
+            '- button "Click me"',
+        )
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 1
+        assert entries[0].role == "button"
+
+    def test_nested_children(self):
+        yaml = _make_aria_yaml(
+            '- navigation "nav":',
+            '  - link "Home"',
+            '  - link "About"',
+        )
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 2
+        assert entries[0].ref == "@e1"
+        assert entries[0].name == "Home"
+        assert entries[1].ref == "@e2"
+
+    def test_empty_string(self):
+        entries = _parse_aria_yaml("")
+        assert entries == []
+
+    def test_sequential_numbering_skips_non_interactive(self):
+        yaml = _make_aria_yaml(
+            '- link "A"',
+            '- heading "skip" [level=2]',
+            '- link "B"',
+            '- textbox "C"',
+        )
+        entries = _parse_aria_yaml(yaml)
+        refs = [e.ref for e in entries]
+        assert refs == ["@e1", "@e2", "@e3"]
+
+    def test_element_without_name(self):
+        yaml = _make_aria_yaml('- button')
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 1
+        assert entries[0].name == ""
+
+    def test_element_with_attributes(self):
+        yaml = _make_aria_yaml('- checkbox "Agree" [checked]')
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 1
+        assert entries[0].role == "checkbox"
+        assert entries[0].name == "Agree"
+
+
 class TestTakeSnapshot:
-    async def test_extracts_interactive_elements(self):
-        tree = _make_tree([
-            {"role": "textbox", "name": "Email"},
-            {"role": "textbox", "name": "Password"},
-            {"role": "button", "name": "Login"},
-        ])
-
-        class FakePage:
-            url = "https://example.com/login"
-            async def title(self): return "Login"
-            async def accessibility_snapshot(self): return tree
-
-        snap = await take_snapshot(FakePage())
-        assert len(snap.entries) == 3
-        assert snap.entries[0].ref == "@e1"
-        assert snap.entries[0].role == "textbox"
-        assert snap.entries[0].name == "Email"
-        assert snap.entries[2].ref == "@e3"
-        assert snap.entries[2].role == "button"
-
-    async def test_ignores_non_interactive_roles(self):
-        tree = _make_tree([
-            {"role": "heading", "name": "Welcome"},
-            {"role": "text", "name": "some text"},
-            {"role": "button", "name": "Click me"},
-        ])
-
-        class FakePage:
-            url = "https://example.com"
-            async def title(self): return "Test"
-            async def accessibility_snapshot(self): return tree
-
-        snap = await take_snapshot(FakePage())
-        assert len(snap.entries) == 1
-        assert snap.entries[0].role == "button"
-
-    async def test_nested_children(self):
-        tree = _make_tree([
-            {
-                "role": "navigation",
-                "name": "nav",
-                "children": [
-                    {"role": "link", "name": "Home"},
-                    {"role": "link", "name": "About"},
-                ],
-            },
-        ])
-
-        class FakePage:
-            url = "https://example.com"
-            async def title(self): return "Test"
-            async def accessibility_snapshot(self): return tree
-
-        snap = await take_snapshot(FakePage())
+    async def test_extracts_from_page(self):
+        yaml = _make_aria_yaml(
+            '- textbox "Email"',
+            '- button "Submit"',
+        )
+        page = MockPage(aria_yaml=yaml)
+        snap = await take_snapshot(page)
         assert len(snap.entries) == 2
         assert snap.entries[0].ref == "@e1"
-        assert snap.entries[1].ref == "@e2"
-
-    async def test_empty_tree(self):
-        class FakePage:
-            url = "https://example.com"
-            async def title(self): return "Empty"
-            async def accessibility_snapshot(self): return None
-
-        snap = await take_snapshot(FakePage())
-        assert snap.entries == []
         assert snap.url == "https://example.com"
 
-    async def test_sequential_numbering(self):
-        tree = _make_tree([
-            {"role": "link", "name": "A"},
-            {"role": "heading", "name": "skip"},
-            {"role": "link", "name": "B"},
-            {"role": "textbox", "name": "C"},
-        ])
-
-        class FakePage:
-            url = "https://example.com"
-            async def title(self): return "Test"
-            async def accessibility_snapshot(self): return tree
-
-        snap = await take_snapshot(FakePage())
-        refs = [e.ref for e in snap.entries]
-        assert refs == ["@e1", "@e2", "@e3"]
+    async def test_empty_page(self):
+        page = MockPage(aria_yaml="")
+        snap = await take_snapshot(page)
+        assert snap.entries == []
+        assert snap.url == "https://example.com"
 
 
 class TestBuildRefMap:
@@ -255,6 +268,9 @@ class TestBuildRefMap:
         }
 
 
+# --- Client Tests ---
+
+
 class TestBrowserClient:
     async def test_lazy_init_no_page_until_first_call(self):
         created = []
@@ -271,11 +287,11 @@ class TestBrowserClient:
         assert len(created) == 1
 
     async def test_navigate_returns_snapshot(self):
-        tree = _make_tree([
-            {"role": "button", "name": "Go"},
-            {"role": "textbox", "name": "Search"},
-        ])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml(
+            '- button "Go"',
+            '- textbox "Search"',
+        )
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
 
         snap = await client.navigate("https://example.com")
@@ -285,8 +301,8 @@ class TestBrowserClient:
         assert page.url == "https://example.com"
 
     async def test_click_with_ref(self):
-        tree = _make_tree([{"role": "button", "name": "Submit"}])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml('- button "Submit"')
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
 
         await client.navigate("https://example.com")
@@ -310,8 +326,8 @@ class TestBrowserClient:
             await client.click("@e99")
 
     async def test_type_text(self):
-        tree = _make_tree([{"role": "textbox", "name": "Email"}])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml('- textbox "Email"')
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
 
         await client.navigate("https://example.com")
@@ -346,8 +362,8 @@ class TestBrowserClient:
         assert "Full page text content" in text
 
     async def test_get_text_with_ref(self):
-        tree = _make_tree([{"role": "link", "name": "Home"}])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml('- link "Home"')
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         await client.navigate("https://example.com")
 
@@ -365,6 +381,9 @@ class TestBrowserClient:
         client = BrowserClient(BrowserConfig())
         with pytest.raises(RuntimeError, match="page_factory"):
             await client.navigate("https://example.com")
+
+
+# --- ToolSource Tests ---
 
 
 @pytest.fixture
@@ -407,8 +426,8 @@ class TestBrowserToolSource:
             assert callable(tool.handler)
 
     async def test_navigate_handler(self, cancel_event: asyncio.Event):
-        tree = _make_tree([{"role": "button", "name": "Go"}])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml('- button "Go"')
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         source = BrowserToolSource(client)
 
@@ -419,8 +438,8 @@ class TestBrowserToolSource:
         assert '@e1 [button] "Go"' in result["elements"]
 
     async def test_click_handler(self, cancel_event: asyncio.Event):
-        tree = _make_tree([{"role": "button", "name": "OK"}])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml('- button "OK"')
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         source = BrowserToolSource(client)
 
@@ -431,8 +450,8 @@ class TestBrowserToolSource:
         assert result["clicked"] == "@e1"
 
     async def test_type_handler(self, cancel_event: asyncio.Event):
-        tree = _make_tree([{"role": "textbox", "name": "Name"}])
-        page = MockPage(tree=tree)
+        yaml = _make_aria_yaml('- textbox "Name"')
+        page = MockPage(aria_yaml=yaml)
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         source = BrowserToolSource(client)
 
