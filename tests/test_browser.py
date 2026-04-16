@@ -9,12 +9,14 @@ from typing import Any
 import pytest
 
 from topsport_agent.browser.client import BrowserClient
+from topsport_agent.browser.tools import BrowserToolSource
 from topsport_agent.browser.types import BrowserConfig, PageSnapshot, SnapshotEntry
 from topsport_agent.browser.snapshot import (
     INTERACTIVE_ROLES,
     build_ref_map,
     take_snapshot,
 )
+from topsport_agent.types.tool import ToolContext, ToolSpec
 
 
 class TestBrowserConfig:
@@ -363,3 +365,119 @@ class TestBrowserClient:
         client = BrowserClient(BrowserConfig())
         with pytest.raises(RuntimeError, match="page_factory"):
             await client.navigate("https://example.com")
+
+
+@pytest.fixture
+def cancel_event() -> asyncio.Event:
+    return asyncio.Event()
+
+
+def _tool_ctx(cancel_event: asyncio.Event) -> ToolContext:
+    return ToolContext(session_id="test", call_id="c1", cancel_event=cancel_event)
+
+
+class TestBrowserToolSource:
+    async def test_list_tools_returns_six(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        tools = await source.list_tools()
+        assert len(tools) == 6
+        names = {t.name for t in tools}
+        assert names == {
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_screenshot",
+            "browser_get_text",
+        }
+
+    async def test_all_tools_are_valid_toolspecs(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        for tool in await source.list_tools():
+            assert isinstance(tool, ToolSpec)
+            assert tool.name
+            assert tool.description
+            assert tool.parameters["type"] == "object"
+            assert callable(tool.handler)
+
+    async def test_navigate_handler(self, cancel_event: asyncio.Event):
+        tree = _make_tree([{"role": "button", "name": "Go"}])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        tools = await source.list_tools()
+        nav = next(t for t in tools if t.name == "browser_navigate")
+        result = await nav.handler({"url": "https://example.com"}, _tool_ctx(cancel_event))
+        assert "URL: https://example.com" in result["elements"]
+        assert '@e1 [button] "Go"' in result["elements"]
+
+    async def test_click_handler(self, cancel_event: asyncio.Event):
+        tree = _make_tree([{"role": "button", "name": "OK"}])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        click = next(t for t in tools if t.name == "browser_click")
+        result = await click.handler({"target": "@e1"}, _tool_ctx(cancel_event))
+        assert result["clicked"] == "@e1"
+
+    async def test_type_handler(self, cancel_event: asyncio.Event):
+        tree = _make_tree([{"role": "textbox", "name": "Name"}])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        typ = next(t for t in tools if t.name == "browser_type")
+        result = await typ.handler({"target": "@e1", "text": "hello"}, _tool_ctx(cancel_event))
+        assert result["typed"] == "hello"
+
+    async def test_screenshot_handler(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        ss = next(t for t in tools if t.name == "browser_screenshot")
+        result = await ss.handler({}, _tool_ctx(cancel_event))
+        assert "path" in result
+        assert result["path"].endswith(".png")
+
+    async def test_get_text_handler(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        gt = next(t for t in tools if t.name == "browser_get_text")
+        result = await gt.handler({}, _tool_ctx(cancel_event))
+        assert "text" in result
+
+    async def test_handler_catches_errors(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        tools = await source.list_tools()
+        click = next(t for t in tools if t.name == "browser_click")
+        result = await click.handler({"target": "@e99"}, _tool_ctx(cancel_event))
+        assert result["is_error"] is True
+        assert "error" in result
+
+    async def test_source_name(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+        assert source.name == "browser"
