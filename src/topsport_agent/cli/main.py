@@ -101,6 +101,12 @@ def _print_event(event_type: EventType, payload: dict) -> None:
 def _try_make_browser() -> tuple[object | None, list[object]]:
     """尝试创建浏览器工具源。Playwright 未安装时静默跳过。"""
     try:
+        # 先验证 playwright 可导入，避免注册了工具但调用全部失败
+        pw_name = "playwright.async_api"
+        importlib.import_module(pw_name)
+    except ImportError:
+        return None, []
+    try:
         from ..browser import BrowserClient, BrowserConfig, BrowserToolSource
         client = BrowserClient.from_config(BrowserConfig(headless=True))
         source = BrowserToolSource(client)
