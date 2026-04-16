@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
+
+from ..llm.provider import LLMProvider, LLMResponse
+from ..llm.request import LLMRequest
+from ..llm.response import wrap_response_metadata
+from ..types.events import Event, EventType
+from ..types.message import Message, Role, ToolCall, ToolResult
+from ..types.session import RunState, Session
+from ..types.tool import ToolContext, ToolSpec
+from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
+
+_logger = logging.getLogger(__name__)
+
+
+class Cancelled(Exception):
+    pass
+
+
+@dataclass(slots=True)
+class EngineConfig:
+    model: str
+    max_steps: int = 20
+    provider_options: dict[str, Any] | None = None
+
+
+class Engine:
+    def __init__(
+        self,
+        provider: LLMProvider,
+        tools: list[ToolSpec],
+        config: EngineConfig,
+        *,
+        context_providers: list[ContextProvider] | None = None,
+        tool_sources: list[ToolSource] | None = None,
+        post_step_hooks: list[PostStepHook] | None = None,
+        event_subscribers: list[EventSubscriber] | None = None,
+    ) -> None:
+        self._provider = provider
+        self._tools = tools
+        self._config = config
+        self._context_providers = list(context_providers or [])
+        self._tool_sources = list(tool_sources or [])
+        self._post_step_hooks = list(post_step_hooks or [])
+        self._event_subscribers = list(event_subscribers or [])
+        self._cancel_event = asyncio.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def reset_cancel(self) -> None:
+        self._cancel_event = asyncio.Event()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise Cancelled()
+
+    async def _emit(self, event: Event) -> None:
+        for subscriber in self._event_subscribers:
+            try:
+                await subscriber.on_event(event)
+            except Exception as exc:
+                _logger.warning(
+                    "event subscriber %r failed on %s: %r",
+                    getattr(subscriber, "name", type(subscriber).__name__),
+                    event.type.value,
+                    exc,
+                )
+
+    async def _snapshot_tools(self) -> list[ToolSpec]:
+        tools = list(self._tools)
+        seen = {tool.name for tool in tools}
+        for source in self._tool_sources:
+            self._raise_if_cancelled()
+            # 每一步都重新拉取动态工具，保证 MCP 一类的外部工具列表是最新快照。
+            dynamic = await source.list_tools()
+            for tool in dynamic:
+                if tool.name in seen:
+                    continue
+                seen.add(tool.name)
+                tools.append(tool)
+        return tools
+
+    async def _collect_ephemeral_context(self, session: Session) -> list[Message]:
+        collected: list[Message] = []
+        for provider in self._context_providers:
+            self._raise_if_cancelled()
+            collected.extend(await provider.provide(session))
+        return collected
+
+    def _build_call_messages(
+        self, session: Session, ephemeral: list[Message]
+    ) -> list[Message]:
+        system_parts: list[str] = []
+        if session.system_prompt:
+            system_parts.append(session.system_prompt)
+        non_system: list[Message] = []
+        for msg in ephemeral:
+            # 额外上下文里的 system 消息会被折叠成一次 LLM 调用的统一 system prompt。
+            if msg.role == Role.SYSTEM and msg.content:
+                system_parts.append(msg.content)
+            else:
+                non_system.append(msg)
+
+        result: list[Message] = []
+        if system_parts:
+            result.append(Message(role=Role.SYSTEM, content="\n\n".join(system_parts)))
+        result.extend(non_system)
+        result.extend(session.messages)
+        return result
+
+    @staticmethod
+    def _find_tool(name: str, pool: list[ToolSpec]) -> ToolSpec | None:
+        for tool in pool:
+            if tool.name == name:
+                return tool
+        return None
+
+    def _transition(self, session: Session, state: RunState) -> Event:
+        session.state = state
+        return Event(
+            type=EventType.STATE_CHANGED,
+            session_id=session.id,
+            payload={"state": state.value},
+        )
+
+    def _event(
+        self,
+        event_type: EventType,
+        session: Session,
+        payload: dict[str, Any],
+    ) -> Event:
+        return Event(type=event_type, session_id=session.id, payload=payload)
+
+    async def _call_llm_with_cancel(
+        self, messages: list[Message], tools: list[ToolSpec]
+    ) -> LLMResponse:
+        # LLM 调用和取消信号并行等待，谁先结束就按谁的结果收口。
+        llm_task = asyncio.create_task(
+            self._provider.complete(
+                LLMRequest(
+                    model=self._config.model,
+                    messages=messages,
+                    tools=tools,
+                    provider_options=dict(self._config.provider_options or {}),
+                )
+            )
+        )
+        cancel_task = asyncio.create_task(self._cancel_event.wait())
+
+        done, _ = await asyncio.wait(
+            {llm_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if cancel_task in done:
+            llm_task.cancel()
+            try:
+                await llm_task
+            except BaseException:
+                pass
+            raise Cancelled()
+
+        cancel_task.cancel()
+        try:
+            await cancel_task
+        except asyncio.CancelledError:
+            pass
+        return llm_task.result()
+
+    async def _run_post_step_hooks(self, session: Session, step: int) -> None:
+        for hook in self._post_step_hooks:
+            self._raise_if_cancelled()
+            await hook.after_step(session, step)
+
+    async def run(self, session: Session) -> AsyncIterator[Event]:
+        # run 负责包住完整生命周期，统一发出 RUN_START / RUN_END。
+        run_start = Event(
+            type=EventType.RUN_START,
+            session_id=session.id,
+            payload={
+                "model": self._config.model,
+                "goal": session.goal,
+                "initial_message_count": len(session.messages),
+                "max_steps": self._config.max_steps,
+            },
+        )
+        await self._emit(run_start)
+        yield run_start
+
+        final_state = session.state.value
+        async for event in self._run_inner(session):
+            await self._emit(event)
+            yield event
+            if event.type == EventType.STATE_CHANGED:
+                final_state = event.payload.get("state", final_state)
+
+        run_end = Event(
+            type=EventType.RUN_END,
+            session_id=session.id,
+            payload={
+                "final_state": final_state,
+                "message_count": len(session.messages),
+            },
+        )
+        await self._emit(run_end)
+        yield run_end
+
+    async def _run_inner(self, session: Session) -> AsyncIterator[Event]:
+        yield self._transition(session, RunState.RUNNING)
+
+        try:
+            for step in range(self._config.max_steps):
+                self._raise_if_cancelled()
+                yield self._event(EventType.STEP_START, session, {"step": step})
+
+                # 先冻结本步用到的上下文和工具集，避免一步内前后视图不一致。
+                ephemeral = await self._collect_ephemeral_context(session)
+                tools_snapshot = await self._snapshot_tools()
+                call_messages = self._build_call_messages(session, ephemeral)
+
+                yield self._event(
+                    EventType.LLM_CALL_START,
+                    session,
+                    {
+                        "step": step,
+                        "model": self._config.model,
+                        "tool_count": len(tools_snapshot),
+                        "ephemeral_msg_count": len(ephemeral),
+                        "call_msg_count": len(call_messages),
+                    },
+                )
+                response = await self._call_llm_with_cancel(
+                    call_messages, tools_snapshot
+                )
+                yield self._event(
+                    EventType.LLM_CALL_END,
+                    session,
+                    {
+                        "step": step,
+                        "tool_call_count": len(response.tool_calls),
+                        "finish_reason": response.finish_reason,
+                        "usage": response.usage,
+                    },
+                )
+
+                self._raise_if_cancelled()
+
+                # 无论后面是否要调工具，模型这一步的 assistant 输出都先落到会话里。
+                assistant_msg = Message(
+                    role=Role.ASSISTANT,
+                    content=response.text,
+                    tool_calls=list(response.tool_calls),
+                    extra=wrap_response_metadata(response.response_metadata),
+                )
+                session.messages.append(assistant_msg)
+                yield self._event(
+                    EventType.MESSAGE_APPENDED,
+                    session,
+                    {
+                        "role": Role.ASSISTANT.value,
+                        "tool_call_count": len(response.tool_calls),
+                    },
+                )
+
+                if not response.tool_calls:
+                    # 没有工具调用就说明本轮推理结束，直接进入完成态。
+                    await self._run_post_step_hooks(session, step)
+                    yield self._transition(session, RunState.DONE)
+                    return
+
+                async for event in self._execute_tool_calls(
+                    session, response.tool_calls, tools_snapshot
+                ):
+                    yield event
+
+                await self._run_post_step_hooks(session, step)
+                yield self._event(EventType.STEP_END, session, {"step": step})
+
+            yield self._event(
+                EventType.STEP_END,
+                session,
+                {"reason": "max_steps_reached"},
+            )
+            yield self._transition(session, RunState.DONE)
+
+        except Cancelled:
+            yield self._event(EventType.CANCELLED, session, {})
+            yield self._transition(session, RunState.WAITING_USER)
+        except Exception as exc:
+            yield self._event(
+                EventType.ERROR,
+                session,
+                {"kind": type(exc).__name__, "message": str(exc)},
+            )
+            yield self._transition(session, RunState.ERROR)
+
+    async def _execute_tool_calls(
+        self,
+        session: Session,
+        calls: list[ToolCall],
+        pool: list[ToolSpec],
+    ) -> AsyncIterator[Event]:
+        for call in calls:
+            self._raise_if_cancelled()
+
+            tool = self._find_tool(call.name, pool)
+            yield self._event(
+                EventType.TOOL_CALL_START,
+                session,
+                {
+                    "name": call.name,
+                    "call_id": call.id,
+                    "registered": tool is not None,
+                },
+            )
+
+            if tool is None:
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"tool '{call.name}' not registered",
+                    is_error=True,
+                )
+            else:
+                try:
+                    # 工具上下文把取消信号和调用元信息一起传给 handler。
+                    ctx = ToolContext(
+                        session_id=session.id,
+                        call_id=call.id,
+                        cancel_event=self._cancel_event,
+                    )
+                    output = await tool.handler(call.arguments, ctx)
+                    result = ToolResult(call_id=call.id, output=output)
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    result = ToolResult(
+                        call_id=call.id,
+                        output=f"{type(exc).__name__}: {exc}",
+                        is_error=True,
+                    )
+
+            # 工具结果也写回会话，供下一轮 LLM 继续读取和推理。
+            session.messages.append(Message(role=Role.TOOL, tool_results=[result]))
+            yield self._event(
+                EventType.MESSAGE_APPENDED,
+                session,
+                {"role": Role.TOOL.value, "call_id": call.id},
+            )
+            yield self._event(
+                EventType.TOOL_CALL_END,
+                session,
+                {
+                    "name": call.name,
+                    "call_id": call.id,
+                    "is_error": result.is_error,
+                },
+            )
