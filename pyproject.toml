@@ -3,7 +3,10 @@ name = "topsport-agent"
 version = "0.0.1"
 description = "Agent runtime with ReAct loop, multi-provider LLM abstraction, and pluggable tools"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "prompt_toolkit>=3.0.0",
+    "rich>=13.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -29,6 +32,12 @@ llm = [
     "anthropic>=0.40.0",
     "openai>=1.50.0",
 ]
+browser = [
+    "playwright>=1.40.0",
+]
+
+[project.scripts]
+topsport-agent = "topsport_agent.cli.main:main"
 
 [tool.ruff]
 target-version = "py311"

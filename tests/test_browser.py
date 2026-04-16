@@ -481,3 +481,17 @@ class TestBrowserToolSource:
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         source = BrowserToolSource(client)
         assert source.name == "browser"
+
+
+class TestBrowserPublicAPI:
+    def test_public_imports(self):
+        from topsport_agent.browser import (
+            BrowserClient,
+            BrowserConfig,
+            BrowserToolSource,
+            PageFactory,
+        )
+        assert BrowserClient is not None
+        assert BrowserConfig is not None
+        assert BrowserToolSource is not None
+        assert PageFactory is not None
