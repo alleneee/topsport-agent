@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from topsport_agent.browser.client import BrowserClient
 from topsport_agent.browser.types import BrowserConfig, PageSnapshot, SnapshotEntry
 from topsport_agent.browser.snapshot import (
     INTERACTIVE_ROLES,
@@ -66,6 +75,78 @@ class TestPageSnapshot:
 def _make_tree(nodes: list[dict]) -> dict:
     """Helper: build a minimal accessibility tree dict."""
     return {"role": "WebArea", "name": "", "children": nodes}
+
+
+class MockPage:
+    """Mock Playwright Page for testing BrowserClient without Playwright."""
+
+    def __init__(
+        self,
+        *,
+        url: str = "https://example.com",
+        page_title: str = "Example",
+        tree: dict | None = None,
+    ) -> None:
+        self.url = url
+        self._title = page_title
+        self._tree = tree or {"role": "WebArea", "name": "", "children": []}
+        self.click_log: list[str] = []
+        self.fill_log: list[tuple[str, str]] = []
+        self._closed = False
+
+    async def title(self) -> str:
+        return self._title
+
+    async def accessibility_snapshot(self) -> dict | None:
+        return self._tree
+
+    async def goto(self, url: str, **kwargs: Any) -> None:
+        self.url = url
+
+    def get_by_role(self, role: str, *, name: str = "") -> MockLocator:
+        return MockLocator(self, role, name)
+
+    async def screenshot(self, *, path: str = "", **kwargs: Any) -> bytes:
+        if path:
+            Path(path).write_bytes(b"fake-png-data")
+        return b"fake-png-data"
+
+    async def text_content(self) -> str:
+        return "Full page text content"
+
+    def locator(self, selector: str) -> MockLocator:
+        return MockLocator(self, "css", selector)
+
+
+class MockLocator:
+    def __init__(self, page: MockPage, role: str, name: str) -> None:
+        self._page = page
+        self._role = role
+        self._name = name
+
+    async def click(self, **kwargs: Any) -> None:
+        self._page.click_log.append(f"{self._role}:{self._name}")
+
+    async def fill(self, text: str, **kwargs: Any) -> None:
+        self._page.fill_log.append((f"{self._role}:{self._name}", text))
+
+    async def text_content(self) -> str:
+        return f"text of {self._role}:{self._name}"
+
+    @property
+    def first(self) -> MockLocator:
+        return self
+
+    async def count(self) -> int:
+        return 1
+
+
+def _mock_page_factory(page: MockPage):
+    @contextlib.asynccontextmanager
+    async def factory():
+        yield page
+
+    return factory
 
 
 class TestTakeSnapshot:
@@ -170,3 +251,115 @@ class TestBuildRefMap:
             "@e1": ("button", "Submit"),
             "@e2": ("textbox", "Email"),
         }
+
+
+class TestBrowserClient:
+    async def test_lazy_init_no_page_until_first_call(self):
+        created = []
+
+        @contextlib.asynccontextmanager
+        async def factory():
+            page = MockPage()
+            created.append(page)
+            yield page
+
+        client = BrowserClient(BrowserConfig(), page_factory=factory)
+        assert len(created) == 0
+        await client.navigate("https://example.com")
+        assert len(created) == 1
+
+    async def test_navigate_returns_snapshot(self):
+        tree = _make_tree([
+            {"role": "button", "name": "Go"},
+            {"role": "textbox", "name": "Search"},
+        ])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+
+        snap = await client.navigate("https://example.com")
+        assert snap.url == "https://example.com"
+        assert len(snap.entries) == 2
+        assert snap.entries[0].ref == "@e1"
+        assert page.url == "https://example.com"
+
+    async def test_click_with_ref(self):
+        tree = _make_tree([{"role": "button", "name": "Submit"}])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+
+        await client.navigate("https://example.com")
+        result = await client.click("@e1")
+        assert page.click_log == ["button:Submit"]
+        assert "clicked" in result
+
+    async def test_click_with_css_selector(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+
+        result = await client.click("#my-button")
+        assert page.click_log == ["css:#my-button"]
+
+    async def test_stale_ref_raises_error(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+
+        with pytest.raises(KeyError, match="@e99"):
+            await client.click("@e99")
+
+    async def test_type_text(self):
+        tree = _make_tree([{"role": "textbox", "name": "Email"}])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+
+        await client.navigate("https://example.com")
+        await client.type_text("@e1", "user@example.com")
+        assert page.fill_log == [("textbox:Email", "user@example.com")]
+
+    async def test_screenshot_returns_path(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "shot.png")
+            result = await client.screenshot(path)
+            assert result == path
+            assert Path(path).exists()
+
+    async def test_screenshot_auto_path(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+
+        result = await client.screenshot()
+        assert result.endswith(".png")
+
+    async def test_get_text_full_page(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+
+        text = await client.get_text()
+        assert "Full page text content" in text
+
+    async def test_get_text_with_ref(self):
+        tree = _make_tree([{"role": "link", "name": "Home"}])
+        page = MockPage(tree=tree)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+
+        text = await client.get_text("@e1")
+        assert "link:Home" in text
+
+    async def test_close_releases_resources(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+        await client.close()
+        assert client._page is None
+
+    async def test_navigate_without_factory_raises(self):
+        client = BrowserClient(BrowserConfig())
+        with pytest.raises(RuntimeError, match="page_factory"):
+            await client.navigate("https://example.com")
