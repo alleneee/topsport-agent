@@ -232,3 +232,96 @@ async def test_engine_persists_response_metadata_on_assistant_message():
         provider="anthropic",
         assistant_blocks=[{"type": "text", "text": "hello"}],
     )
+
+
+# ---------------------------------------------------------------------------
+# H-R2 · token budget 强制
+# ---------------------------------------------------------------------------
+
+
+async def test_token_budget_accumulates_across_steps():
+    """每次 LLM_CALL_END 的 usage 累加到 session.token_spent。"""
+    provider = ScriptedProvider(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id="c1", name="echo", arguments={})],
+            ),
+            ScriptedTurn(text="done"),
+        ]
+    )
+    # 覆写 complete 使其返回带 usage 的 response
+    original_complete = provider.complete
+
+    async def _with_usage(req):
+        resp = await original_complete(req)
+        return LLMResponse(
+            text=resp.text,
+            tool_calls=list(resp.tool_calls),
+            finish_reason=resp.finish_reason,
+            usage={"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        )
+
+    provider.complete = _with_usage  # type: ignore[method-assign]
+
+    engine = Engine(provider, tools=[_echo_tool()], config=EngineConfig(model="m"))
+    session = _session()
+    await _collect(engine.run(session))
+
+    # 两次 LLM 调用 = 300 tokens
+    assert session.token_spent == 300
+
+
+async def test_token_budget_exceeded_aborts_run():
+    """超出 budget 后 Engine 转 ERROR 并发送 error 事件。"""
+    provider = ScriptedProvider(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id="c1", name="echo", arguments={})],
+            ),
+            ScriptedTurn(text="should-not-reach"),
+        ]
+    )
+
+    async def _with_usage(req):
+        return LLMResponse(
+            text=None,
+            tool_calls=[ToolCall(id="c1", name="echo", arguments={})],
+            finish_reason="tool_use",
+            usage={"input_tokens": 200, "output_tokens": 50},
+        )
+
+    provider.complete = _with_usage  # type: ignore[method-assign]
+
+    engine = Engine(provider, tools=[_echo_tool()], config=EngineConfig(model="m"))
+    session = _session()
+    session.token_budget = 100  # 一步就超
+
+    events = await _collect(engine.run(session))
+
+    assert session.state == RunState.ERROR
+    error_events = [e for e in events if e.type == EventType.ERROR]
+    assert len(error_events) == 1
+    assert "BudgetExceeded" == error_events[0].payload["kind"]
+    assert "token budget exceeded" in error_events[0].payload["message"]
+
+
+async def test_token_budget_unset_does_not_enforce():
+    """token_budget=None 时永不阻止运行。"""
+    provider = ScriptedProvider([ScriptedTurn(text="done")])
+
+    async def _with_usage(req):
+        return LLMResponse(
+            text="done",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10_000_000, "completion_tokens": 10_000_000},
+        )
+
+    provider.complete = _with_usage  # type: ignore[method-assign]
+
+    engine = Engine(provider, tools=[], config=EngineConfig(model="m"))
+    session = _session()
+    assert session.token_budget is None
+
+    await _collect(engine.run(session))
+    assert session.state == RunState.DONE
+    assert session.token_spent == 20_000_000

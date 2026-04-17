@@ -6,12 +6,13 @@ from .hooks import (
     StepConfigurator,
     ToolSource,
 )
-from .loop import Cancelled, Engine, EngineConfig
+from .loop import BudgetExceeded, Cancelled, Engine, EngineConfig
 from .orchestrator import Orchestrator, SubAgentConfig
 from .planner import Planner
 from .prompt import PromptBuilder, PromptSection, SectionPriority
 
 __all__ = [
+    "BudgetExceeded",
     "Cancelled",
     "ContextProvider",
     "Engine",

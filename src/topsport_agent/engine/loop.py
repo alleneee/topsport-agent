@@ -23,6 +23,28 @@ class Cancelled(Exception):
     pass
 
 
+class BudgetExceeded(Exception):
+    """Session.token_budget 被突破时抛出，Engine 转 RunState.ERROR。"""
+
+
+def _accumulate_usage(session: Any, usage: dict[str, Any] | None) -> None:
+    """兼容 Anthropic (input_tokens/output_tokens) 和 OpenAI (prompt_tokens/
+    completion_tokens) 两种字段名；都缺就退化用 total_tokens。"""
+    if not usage:
+        return
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        total = int(usage.get("prompt_tokens", 0) or 0) + int(
+            usage.get("completion_tokens", 0) or 0
+        )
+    elif "input_tokens" in usage or "output_tokens" in usage:
+        total = int(usage.get("input_tokens", 0) or 0) + int(
+            usage.get("output_tokens", 0) or 0
+        )
+    else:
+        total = int(usage.get("total_tokens", 0) or 0)
+    session.token_spent += total
+
+
 @dataclass(slots=True)
 class EngineConfig:
     model: str
@@ -339,6 +361,17 @@ class Engine:
                         "usage": response.usage,
                     },
                 )
+
+                # H-R2 token budget 计费与强制
+                _accumulate_usage(session, response.usage)
+                if (
+                    session.token_budget is not None
+                    and session.token_spent > session.token_budget
+                ):
+                    raise BudgetExceeded(
+                        f"session {session.id} token budget exceeded: "
+                        f"{session.token_spent} > {session.token_budget}"
+                    )
 
                 self._raise_if_cancelled()
 
