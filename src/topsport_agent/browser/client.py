@@ -11,6 +11,7 @@ from typing import Any
 
 from .snapshot import build_ref_map, take_snapshot
 from .types import BrowserConfig, PageSnapshot
+from .url_policy import BrowserURLPolicy
 
 PageFactory = Callable[[], AbstractAsyncContextManager[Any]]
 
@@ -36,9 +37,13 @@ class BrowserClient:
         self,
         config: BrowserConfig,
         page_factory: PageFactory | None = None,
+        *,
+        url_policy: BrowserURLPolicy | None = None,
     ) -> None:
         self._config = config
         self._page_factory = page_factory
+        # 默认严格策略：http/https + 拒绝 RFC1918 + 拒绝 metadata
+        self._url_policy = url_policy or BrowserURLPolicy()
         self._page: Any | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._ref_map: dict[str, tuple[str, str]] = {}
@@ -86,6 +91,8 @@ class BrowserClient:
         return self._page
 
     async def navigate(self, url: str) -> PageSnapshot:
+        # H-S6: 在 playwright goto 之前挡 scheme / 内网 / metadata 目标
+        self._url_policy.check(url)
         page = await self._ensure_page()
         await page.goto(url, wait_until="domcontentloaded")
         snapshot = await take_snapshot(page)

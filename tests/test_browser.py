@@ -521,3 +521,89 @@ class TestBrowserPublicAPI:
         assert BrowserConfig is not None
         assert BrowserToolSource is not None
         assert PageFactory is not None
+
+
+# ---------------------------------------------------------------------------
+# H-S6 · URL policy: scheme + 内网 + metadata 拦截
+# ---------------------------------------------------------------------------
+
+from topsport_agent.browser import BrowserURLPolicy, BrowserURLRejected
+
+
+class TestBrowserURLPolicy:
+    def setup_method(self):
+        self.policy = BrowserURLPolicy()
+
+    def test_allows_https(self):
+        self.policy.check("https://example.com/path")
+
+    def test_allows_http(self):
+        self.policy.check("http://example.com")
+
+    def test_rejects_file_scheme(self):
+        with pytest.raises(BrowserURLRejected, match="scheme"):
+            self.policy.check("file:///etc/passwd")
+
+    def test_rejects_javascript_scheme(self):
+        with pytest.raises(BrowserURLRejected, match="scheme"):
+            self.policy.check("javascript:alert(1)")
+
+    def test_rejects_loopback_ipv4(self):
+        with pytest.raises(BrowserURLRejected, match="loopback"):
+            self.policy.check("http://127.0.0.1/admin")
+
+    def test_rejects_ipv6_loopback(self):
+        with pytest.raises(BrowserURLRejected, match="loopback"):
+            self.policy.check("http://[::1]/")
+
+    def test_rejects_private_rfc1918(self):
+        with pytest.raises(BrowserURLRejected, match="non-public"):
+            self.policy.check("http://10.0.0.1/")
+        with pytest.raises(BrowserURLRejected, match="non-public"):
+            self.policy.check("http://192.168.1.1/")
+        with pytest.raises(BrowserURLRejected, match="non-public"):
+            self.policy.check("http://172.16.0.1/")
+
+    def test_rejects_link_local(self):
+        with pytest.raises(BrowserURLRejected, match="non-public"):
+            self.policy.check("http://169.254.1.1/")
+
+    def test_rejects_aws_metadata(self):
+        with pytest.raises(BrowserURLRejected, match="metadata"):
+            self.policy.check("http://169.254.169.254/latest/meta-data/")
+
+    def test_rejects_gcp_metadata(self):
+        with pytest.raises(BrowserURLRejected, match="metadata"):
+            self.policy.check("http://metadata.google.internal/")
+
+    def test_rejects_aliyun_metadata(self):
+        with pytest.raises(BrowserURLRejected, match="metadata"):
+            self.policy.check("http://100.100.100.200/")
+
+    def test_allow_private_still_blocks_metadata_and_loopback(self):
+        policy = BrowserURLPolicy(allow_private=True)
+        policy.check("http://10.0.0.1/")  # 内网通过
+        with pytest.raises(BrowserURLRejected, match="loopback"):
+            policy.check("http://127.0.0.1/")
+        with pytest.raises(BrowserURLRejected, match="metadata"):
+            policy.check("http://169.254.169.254/")
+
+    def test_extra_host_denylist(self):
+        policy = BrowserURLPolicy(extra_host_denylist=frozenset({"evil.example"}))
+        with pytest.raises(BrowserURLRejected, match="operator denylist"):
+            policy.check("https://evil.example/")
+
+
+async def test_browser_client_navigate_rejects_policy_violation() -> None:
+    """navigate 调用会在 page.goto 前触发策略检查。"""
+    from topsport_agent.browser.client import BrowserClient
+    from topsport_agent.browser.types import BrowserConfig
+
+    page = MockPage()  # 初始 url = https://example.com
+    initial_url = page.url
+    client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+
+    with pytest.raises(BrowserURLRejected):
+        await client.navigate("file:///etc/passwd")
+    # 策略在 _ensure_page 之前拒绝：page.goto 从未被调用，url 保持初始值
+    assert page.url == initial_url
