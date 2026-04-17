@@ -214,13 +214,26 @@ Issues and PRs referencing this document should tag `[review-2026-04-17]` so pro
 
 Until all Critical items are `resolved`, the service MUST NOT be exposed on a network that is not fully operator-controlled.
 
-### Status (2026-04-17, post-Phase-0)
+### Status (2026-04-17, post-Phase-0 + Phase-1 High items)
 
-| Finding | Status     | Commit     | Notes                                                                                     |
-| ------- | ---------- | ---------- | ----------------------------------------------------------------------------------------- |
-| CR-01   | `resolved` | `b33d1e1`  | `AuthConfig` + principal namespacing + secure-by-default + `/readyz` + `max_plan_steps`   |
-| CR-02   | `resolved` | `93635e1`  | `MCPSecurityPolicy` + shell-interpreter basename block + allowlist `(name, cmd, prefix)`  |
+| Finding | Status     | Commit     | Notes                                                                                             |
+| ------- | ---------- | ---------- | ------------------------------------------------------------------------------------------------- |
+| CR-01   | `resolved` | `b33d1e1`  | `AuthConfig` + principal namespacing + secure-by-default + `/readyz` + `max_plan_steps`           |
+| CR-02   | `resolved` | `93635e1`  | `MCPSecurityPolicy` + shell-interpreter basename block + allowlist `(name, cmd, prefix)`          |
 | CR-03   | `resolved` | `7a1ca81`  | `argv: list[str]` + `create_subprocess_exec` + `PluginSecurityPolicy`; shell-meta regression lock |
-| CR-04   | `resolved` | `df3f443`  | `ToolContext.workspace_root` + symlink rejection + `os.replace` atomic write + edit lock  |
+| CR-04   | `resolved` | `df3f443`  | `ToolContext.workspace_root` + symlink rejection + `os.replace` atomic write + edit lock          |
+| H-R1    | `resolved` | `dcac039`  | streaming retry while no delta yielded yet; non-streaming parity                                  |
+| H-S1    | `resolved` | `12a0dc3`  | MCP httpx `follow_redirects=False`; no cross-origin Authorization replay                          |
+| H-S3    | `resolved` | `ba8b472`  | `.env` only via `--env-file`; POSIX owner+0600 enforced                                           |
+| H-S2    | `resolved` | `2392105`  | `SimpleRedactor` pre-send payload scrubber + Langfuse `base_url` allowlist                        |
+| H-S6    | `resolved` | `a957e2a`  | `BrowserURLPolicy`: scheme allowlist + RFC1918/metadata denylist; loopback always blocked         |
+| H-R4    | `resolved` | `5816bd8`  | `EventSubscriber.critical` flag + per-name failure counter + ERROR-level logging                  |
+| H-R2    | `resolved` | `4c1b0eb`  | `Session.token_budget`/`token_spent` accumulator + `BudgetExceeded` → `RunState.ERROR`            |
+| H-R3    | `resolved` | `5bae292`  | `PrometheusMetrics` EventSubscriber + `/metrics` endpoint; optional `metrics` dep group           |
+| H-R5    | `resolved` | `4a3f5d4`  | `_DrainMiddleware` + lifespan handshake waiting on `inflight==0` with configurable timeout        |
+| H-R8    | `resolved` | `eb4608b`  | `GET/DELETE/LIST /v1/sessions/*` principal-scoped; 404 for cross-tenant attempts                  |
 
-Phase 0 complete. The service is now safe to run behind an operator-controlled ingress with a bearer token. Phase 1 (H-S1..6, H-R1..8) begins next.
+Phase 0 + Phase 1 High (8 R + 4 S items) complete. Remaining Phase 1 candidates
+(H-S4 safe_shell hardening, H-R6 health split variants, H-R7 per-user quota) are
+Medium follow-ups and no longer block enterprise deployment. Test suite 472/472
+green; optional deps `api`, `metrics`, `llm`, `mcp`, `tracing` all covered.
