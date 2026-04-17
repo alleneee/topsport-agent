@@ -15,8 +15,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from topsport_agent.agent import AgentConfig, default_agent
+from topsport_agent.agent import Agent, AgentConfig, default_agent
 from topsport_agent.agent.base import _build_spawn_executor
+from topsport_agent.engine import Engine, EngineConfig
 from topsport_agent.llm.provider import LLMResponse
 from topsport_agent.llm.request import LLMRequest
 from topsport_agent.plugins.agent_registry import (
@@ -25,6 +26,33 @@ from topsport_agent.plugins.agent_registry import (
     build_agent_tools,
 )
 from topsport_agent.types.tool import ToolContext, ToolSpec
+
+
+def _mock_parent_agent(
+    provider: Any,
+    *,
+    model: str = "parent-model",
+    tools: list[ToolSpec] | None = None,
+) -> Agent:
+    """构造最小化父 Agent（带 capability_bundle），供 spawn_child 复用能力。"""
+    tools = tools or []
+    config = AgentConfig(
+        name="p", description="", system_prompt="", model=model,
+        enable_skills=False, enable_memory=False, enable_plugins=False,
+        enable_browser=False,
+    )
+    engine = Engine(provider, tools=tools, config=EngineConfig(model=model))
+    bundle = {
+        "tools": list(tools),
+        "context_providers": [],
+        "tool_sources": [],
+        "post_step_hooks": [],
+        "event_subscribers": [],
+    }
+    return Agent(
+        provider=provider, config=config, engine=engine,
+        capability_bundle=bundle,
+    )
 
 
 @dataclass
@@ -151,7 +179,8 @@ async def test_real_executor_uses_inherit_model() -> None:
         name="sub", qualified_name="p:sub",
         description="", body="sub prompt", model="inherit",
     )
-    executor = _build_spawn_executor(provider, parent_config, lambda: [])  # type: ignore[arg-type]
+    parent = _mock_parent_agent(provider, model=parent_config.model)
+    executor = _build_spawn_executor(lambda: parent)
     result = await executor(agent_def, "task", _ctx())
 
     assert result["ok"] is True
@@ -174,7 +203,8 @@ async def test_real_executor_uses_override_model() -> None:
         name="sub", qualified_name="p:sub",
         description="", body="", model="sonnet",
     )
-    executor = _build_spawn_executor(provider, parent_config, lambda: [])  # type: ignore[arg-type]
+    parent = _mock_parent_agent(provider, model=parent_config.model)
+    executor = _build_spawn_executor(lambda: parent)
     await executor(agent_def, "task", _ctx())
 
     assert provider.calls[0].model == "sonnet"
@@ -198,7 +228,8 @@ async def test_real_executor_filters_allowed_tools() -> None:
         name="sub", qualified_name="p:sub",
         description="", body="", model="inherit", allowed_tools=["keep"],
     )
-    executor = _build_spawn_executor(provider, parent_config, lambda: parent_tools)  # type: ignore[arg-type]
+    parent = _mock_parent_agent(provider, model=parent_config.model, tools=parent_tools)
+    executor = _build_spawn_executor(lambda: parent)
     await executor(agent_def, "task", _ctx())
 
     tools_sent = provider.calls[0].tools
@@ -223,7 +254,8 @@ async def test_real_executor_inherits_all_tools_when_empty_allowed() -> None:
         name="sub", qualified_name="p:sub",
         description="", body="", model="inherit", allowed_tools=[],
     )
-    executor = _build_spawn_executor(provider, parent_config, lambda: parent_tools)  # type: ignore[arg-type]
+    parent = _mock_parent_agent(provider, model=parent_config.model, tools=parent_tools)
+    executor = _build_spawn_executor(lambda: parent)
     await executor(agent_def, "task", _ctx())
 
     names = {t.name for t in provider.calls[0].tools}
@@ -240,7 +272,8 @@ async def test_real_executor_session_is_isolated() -> None:
         name="sub", qualified_name="p:sub",
         description="", body="subsystem", model="inherit",
     )
-    executor = _build_spawn_executor(provider, parent_config, lambda: [])  # type: ignore[arg-type]
+    parent = _mock_parent_agent(provider, model=parent_config.model)
+    executor = _build_spawn_executor(lambda: parent)
 
     result = await executor(agent_def, "task-input", _ctx())
 
@@ -284,3 +317,124 @@ def test_default_agent_has_spawn_executor_wired(tmp_path: Path) -> None:
     if agent.plugin_manager and agent.plugin_manager.agent_registry().list():
         # 实际运行太昂贵（真会调 provider），只做工具 schema 检查
         assert "task" in spawn_tool.parameters["properties"]
+
+
+# ---------------------------------------------------------------------------
+# H-A2 · 子代理继承 context_providers / tool_sources / subscribers / hooks
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_child_inherits_all_capabilities() -> None:
+    """parent.spawn_child 构造出的子 Engine 带齐父 Agent 的 5 类能力 by reference。"""
+    provider = MockProvider(responses=[LLMResponse(
+        text="sub done", tool_calls=[], finish_reason="stop", usage={},
+    )])
+
+    class _CP:
+        name = "ctx-parent"
+
+        async def provide(self, session):
+            return []
+
+    class _TS:
+        name = "ts-parent"
+
+        async def list_tools(self):
+            return []
+
+    class _PSH:
+        name = "ps-parent"
+
+        async def after_step(self, session, step):
+            pass
+
+    class _ES:
+        name = "es-parent"
+
+        async def on_event(self, event):
+            pass
+
+    # 手工搭 Agent 带完整 bundle
+    tools: list[ToolSpec] = []
+    config = AgentConfig(
+        name="p", description="", system_prompt="", model="m",
+        enable_skills=False, enable_memory=False, enable_plugins=False,
+        enable_browser=False,
+    )
+    engine = Engine(provider, tools=tools, config=EngineConfig(model="m"))
+    bundle = {
+        "tools": tools,
+        "context_providers": [_CP()],
+        "tool_sources": [_TS()],
+        "post_step_hooks": [_PSH()],
+        "event_subscribers": [_ES()],
+    }
+    parent = Agent(
+        provider=provider, config=config, engine=engine,
+        capability_bundle=bundle,
+    )
+
+    sub_session, sub_engine = await parent.spawn_child(
+        model="m",
+        system_prompt="sub prompt",
+        task="do it",
+    )
+
+    report = sub_engine.capabilities_report()
+    assert "ctx-parent" in report["context_providers"]
+    assert "ts-parent" in report["tool_sources"]
+    assert "ps-parent" in report["post_step_hooks"]
+    assert "es-parent" in report["event_subscribers"]
+    # sub_session 系统提示是子自己的，user 消息是 task
+    assert sub_session.system_prompt == "sub prompt"
+    assert sub_session.messages[0].content == "do it"
+
+
+async def test_spawn_child_filters_tools_by_allowed() -> None:
+    """allowed_tool_names 非 None 时只有命中工具被传给子 Engine；其他能力仍完整继承。"""
+    async def _h(args, ctx):
+        return {}
+
+    tool_keep = ToolSpec(
+        name="keep", description="", parameters={"type": "object"}, handler=_h,
+    )
+    tool_drop = ToolSpec(
+        name="drop", description="", parameters={"type": "object"}, handler=_h,
+    )
+
+    class _CP:
+        name = "inherited-cp"
+
+        async def provide(self, session):
+            return []
+
+    provider = MockProvider()
+    config = AgentConfig(
+        name="p", description="", system_prompt="", model="m",
+        enable_skills=False, enable_memory=False, enable_plugins=False,
+        enable_browser=False,
+    )
+    engine = Engine(
+        provider, tools=[tool_keep, tool_drop], config=EngineConfig(model="m")
+    )
+    bundle = {
+        "tools": [tool_keep, tool_drop],
+        "context_providers": [_CP()],
+        "tool_sources": [],
+        "post_step_hooks": [],
+        "event_subscribers": [],
+    }
+    parent = Agent(
+        provider=provider, config=config, engine=engine,
+        capability_bundle=bundle,
+    )
+
+    _, sub_engine = await parent.spawn_child(
+        model="m", system_prompt="", task="x",
+        allowed_tool_names=["keep"],
+    )
+
+    report = sub_engine.capabilities_report()
+    assert report["tools"] == ["keep"]
+    # context_providers 仍完整继承 —— 工具过滤不影响别的能力
+    assert "inherited-cp" in report["context_providers"]

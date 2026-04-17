@@ -84,6 +84,7 @@ class Agent:
         cleanup_callbacks: list[Callable[[], Awaitable[None]]] | None = None,
         skill_registry: SkillRegistry | None = None,
         plugin_manager: PluginManager | None = None,
+        capability_bundle: dict[str, Any] | None = None,
     ) -> None:
         self._provider = provider
         self._config = config
@@ -91,6 +92,9 @@ class Agent:
         self._cleanup_callbacks = list(cleanup_callbacks or [])
         self._skill_registry = skill_registry
         self._plugin_manager = plugin_manager
+        # H-A2：父 Agent 构造期的能力快照（tools / providers / sources / hooks /
+        # subscribers），spawn_child 要拿来给子代理用，实现能力 parity。
+        self._capability_bundle: dict[str, Any] = capability_bundle or {}
 
     @property
     def config(self) -> AgentConfig:
@@ -157,11 +161,23 @@ class Agent:
         if config.enable_plugins:
             plugin_manager = PluginManager()
             plugin_manager.load()
-            # 构造 spawn_executor：引用父 provider + 父 tools 快照，使子代理有隔离执行环境
-            executor = _build_spawn_executor(provider, config, lambda: list(tools))
+            # spawn_executor 需要访问构造完成后的父 Agent 实例；先用占位符引用，
+            # from_config 末尾回填真正的 Agent。
+            parent_ref: list[Agent] = []
+
+            def _parent_getter() -> Agent:
+                if not parent_ref:
+                    raise RuntimeError(
+                        "spawn_agent invoked before parent Agent finished construction"
+                    )
+                return parent_ref[0]
+
+            executor = _build_spawn_executor(_parent_getter)
             tools.extend(build_agent_tools(plugin_manager.agent_registry(), executor))
             event_subscribers.append(plugin_manager.hook_runner())
             cleanup_callbacks.append(_async_wrap(plugin_manager.cleanup))
+        else:
+            parent_ref = []
 
         if config.enable_skills:
             plugin_skill_dirs = plugin_manager.skill_dirs() if plugin_manager else []
@@ -204,14 +220,82 @@ class Agent:
             event_subscribers=event_subscribers,
         )
 
-        return cls(
+        bundle: dict[str, Any] = {
+            "tools": list(tools),
+            "context_providers": list(context_providers),
+            "tool_sources": list(tool_sources),
+            "post_step_hooks": list(post_step_hooks),
+            "event_subscribers": list(event_subscribers),
+        }
+
+        agent = cls(
             provider=provider,
             config=config,
             engine=engine,
             cleanup_callbacks=cleanup_callbacks,
             skill_registry=skill_registry,
             plugin_manager=plugin_manager,
+            capability_bundle=bundle,
         )
+        # 回填占位符，spawn_child 现在拿得到完整能力
+        parent_ref.append(agent)
+        return agent
+
+    # -----------------------------------------------------------------
+    # Sub-agent (spawn_child) — H-A2 capability parity
+    # -----------------------------------------------------------------
+
+    async def spawn_child(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        task: str,
+        allowed_tool_names: list[str] | None = None,
+        session_id_prefix: str = "sub",
+    ) -> tuple[Session, Engine]:
+        """构造一个继承父 Agent 全部能力的子代理 Engine + Session。
+
+        继承内容（by reference，共享单例）：
+        - context_providers（skills / memory injector / 任何 extra）
+        - tool_sources（MCP 桥接 / browser）
+        - post_step_hooks（compaction 等）
+        - event_subscribers（Langfuse / metrics / plugin hooks）
+
+        仅 tools 可按 allowed_tool_names 收窄；model 可覆盖；system_prompt 子代理自定。
+        调用方自行驱动 engine.run(session) 并收集事件。
+        """
+        parent_tools: list[ToolSpec] = self._capability_bundle.get("tools", [])
+        if allowed_tool_names is not None:
+            allow = set(allowed_tool_names)
+            sub_tools = [t for t in parent_tools if t.name in allow]
+        else:
+            sub_tools = list(parent_tools)
+
+        sub_engine = Engine(
+            provider=self._provider,
+            tools=sub_tools,
+            config=EngineConfig(
+                model=model,
+                max_steps=self._config.max_steps,
+                provider_options=self._config.provider_options,
+            ),
+            # H-A2 关键：把所有非 tool 的能力 by reference 传给子 Engine
+            context_providers=list(
+                self._capability_bundle.get("context_providers", [])
+            ),
+            tool_sources=list(self._capability_bundle.get("tool_sources", [])),
+            post_step_hooks=list(self._capability_bundle.get("post_step_hooks", [])),
+            event_subscribers=list(
+                self._capability_bundle.get("event_subscribers", [])
+            ),
+        )
+        sub_session = Session(
+            id=f"{session_id_prefix}:{uuid.uuid4().hex[:8]}",
+            system_prompt=system_prompt,
+        )
+        sub_session.messages.append(Message(role=Role.USER, content=task))
+        return sub_session, sub_engine
 
 
 # ---------------------------------------------------------------------------
@@ -261,49 +345,41 @@ def extract_assistant_text(events: list[Event], session: Session) -> str | None:
 
 
 def _build_spawn_executor(
-    provider: LLMProvider,
-    parent_config: AgentConfig,
-    get_parent_tools: Callable[[], list[ToolSpec]],
+    get_parent_agent: Callable[[], Agent],
 ) -> Callable[[AgentDefinition, str, ToolContext], Awaitable[dict[str, Any]]]:
     """构造 spawn_agent 的真实执行器。
 
-    捕获父 Agent 的 provider 和工具快照（延迟求值 via get_parent_tools，
-    这样子代理可见到父 Agent 在 from_config 中最终注册的全部工具）。
+    H-A2 关键变化：子代理通过 parent.spawn_child() 继承父 Agent 的**全部**能力
+    （context_providers / tool_sources / post_step_hooks / event_subscribers）。
+    之前版本只继承 tools，子代理丢了 skills/memory/compaction/tracing，三个
+    reviewer 独立发现的问题。
+
+    get_parent_agent 是迟绑：构造阶段父 Agent 还在拼装，使用阶段它已完整可用。
 
     子代理执行策略:
     - model: AgentDefinition.model 若为 "inherit" 则用父 config.model，否则原样使用
     - tools: 若 allowed_tools 非空则按名字过滤父工具集；否则继承父完整工具集
     - system_prompt: 直接使用 AgentDefinition.body
-    - auto_skills: 暂未实现（需要子 Engine 有自己的 skill_matcher），记为已知 TODO
     - 子 session 独立，不与父 session 共享消息历史
     """
 
     async def executor(
         agent: AgentDefinition, task: str, ctx: ToolContext
     ) -> dict[str, Any]:
-        model = parent_config.model if agent.model == "inherit" else agent.model
-
-        parent_tools = get_parent_tools()
-        if agent.allowed_tools:
-            allowed = set(agent.allowed_tools)
-            sub_tools = [t for t in parent_tools if t.name in allowed]
-        else:
-            sub_tools = list(parent_tools)
-
-        sub_engine = Engine(
-            provider=provider,
-            tools=sub_tools,
-            config=EngineConfig(
-                model=model,
-                max_steps=parent_config.max_steps,
-                provider_options=parent_config.provider_options,
-            ),
+        parent = get_parent_agent()
+        model = (
+            parent.config.model if agent.model == "inherit" else agent.model
         )
-        sub_session = Session(
-            id=f"{ctx.session_id}:sub:{agent.qualified_name}:{uuid.uuid4().hex[:6]}",
+
+        sub_session, sub_engine = await parent.spawn_child(
+            model=model,
             system_prompt=agent.body,
+            task=task,
+            allowed_tool_names=(
+                list(agent.allowed_tools) if agent.allowed_tools else None
+            ),
+            session_id_prefix=f"{ctx.session_id}:sub:{agent.qualified_name}",
         )
-        sub_session.messages.append(Message(role=Role.USER, content=task))
 
         final_text: str | None = None
         tool_call_count = 0
