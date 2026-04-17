@@ -3,17 +3,27 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from ..types.events import Event, EventType
+from .redaction import Redactor, validate_base_url
 
 _logger = logging.getLogger(__name__)
+
+
+def _identity(v: Any) -> Any:
+    return v
 
 
 class LangfuseTracer:
     """事件驱动的 Langfuse 追踪器：span 生命周期跨越多个异步事件，不能用 with 块。
 
     使用 start_observation + end 的显式 API（v3），兼容 v4 的统一接口。
+
+    H-S2 脱敏：redactor 在 payload 进入 start_observation/update/update_trace
+    之前运行；默认恒等函数（不改变历史行为），生产建议注入 SimpleRedactor。
+    allowed_base_urls 非空时强制 base_url 前缀白名单，避免追踪流量被导向任意目标。
     """
     name = "langfuse"
 
@@ -27,8 +37,11 @@ class LangfuseTracer:
         release: str | None = None,
         client: Any | None = None,
         flush_on_run_end: bool = True,
+        redactor: Redactor | None = None,
+        allowed_base_urls: Iterable[str] = (),
     ) -> None:
         self._flush_on_run_end = flush_on_run_end
+        self._redact: Callable[[Any], Any] = redactor or _identity
         # 按 session_id 隔离追踪状态，支持并发多 session。
         self._state_by_session: dict[str, dict[str, Any]] = {}
 
@@ -58,6 +71,8 @@ class LangfuseTracer:
         if resolved_secret:
             kwargs["secret_key"] = resolved_secret
         if resolved_base:
+            # base_url 白名单校验在真正构造 Langfuse 客户端之前，避免先泄露一次。
+            validate_base_url(resolved_base, allowed_base_urls)
             kwargs["base_url"] = resolved_base
         if resolved_environment:
             kwargs["environment"] = resolved_environment
@@ -91,12 +106,12 @@ class LangfuseTracer:
         root = self._client.start_observation(
             name=f"agent.run[{event.session_id}]",
             as_type="agent",
-            input=event.payload,
+            input=self._redact(event.payload),
         )
         try:
             root.update_trace(
                 session_id=event.session_id,
-                input=event.payload,
+                input=self._redact(event.payload),
             )
         except Exception:
             _logger.debug("langfuse operation failed", exc_info=True)
@@ -110,11 +125,11 @@ class LangfuseTracer:
         root = state.get("root")
         if root is not None:
             try:
-                root.update(output=event.payload)
+                root.update(output=self._redact(event.payload))
             except Exception:
                 pass
             try:
-                root.update_trace(output=event.payload)
+                root.update_trace(output=self._redact(event.payload))
             except Exception:
                 pass
             try:
@@ -134,7 +149,7 @@ class LangfuseTracer:
         span = parent.start_observation(
             name=f"step.{event.payload.get('step', 0)}",
             as_type="span",
-            input=event.payload,
+            input=self._redact(event.payload),
         )
         state["step"] = span
 
@@ -143,7 +158,7 @@ class LangfuseTracer:
         span = state.pop("step", None)
         if span is not None:
             try:
-                span.update(output=event.payload)
+                span.update(output=self._redact(event.payload))
             except Exception:
                 pass
             try:
@@ -159,7 +174,7 @@ class LangfuseTracer:
             name="llm.call",
             as_type="generation",
             model=event.payload.get("model"),
-            input=event.payload,
+            input=self._redact(event.payload),
         )
         state["llm"] = gen
 
@@ -192,7 +207,7 @@ class LangfuseTracer:
         tool_span = parent.start_observation(
             name=f"tool.{event.payload.get('name', 'unknown')}",
             as_type="tool",
-            input=event.payload,
+            input=self._redact(event.payload),
         )
         state["tools"][event.payload["call_id"]] = tool_span
 
@@ -201,7 +216,7 @@ class LangfuseTracer:
         tool_span = state["tools"].pop(event.payload["call_id"], None)
         if tool_span is None:
             return
-        update_kwargs: dict[str, Any] = {"output": event.payload}
+        update_kwargs: dict[str, Any] = {"output": self._redact(event.payload)}
         if event.payload.get("is_error"):
             update_kwargs["level"] = "ERROR"
             update_kwargs["status_message"] = f"tool {event.payload.get('name')} errored"

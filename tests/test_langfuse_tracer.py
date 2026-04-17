@@ -247,3 +247,80 @@ async def test_langfuse_tracer_handles_client_exceptions_silently():
     await tracer.on_event(
         Event(type=EventType.RUN_END, session_id="s1", payload={})
     )
+
+
+# ---------------------------------------------------------------------------
+# H-S2 · 脱敏 + base_url 白名单
+# ---------------------------------------------------------------------------
+
+
+def test_simple_redactor_masks_sensitive_keys() -> None:
+    from topsport_agent.observability import SimpleRedactor
+
+    r = SimpleRedactor()
+    out = r({"model": "claude", "api_key": "sk-abc", "messages": [{"role": "user", "content": "hi"}]})
+    assert out["model"] == "claude"
+    assert out["api_key"] == "[REDACTED]"
+    assert out["messages"][0]["content"] == "hi"
+
+
+def test_simple_redactor_masks_sk_ant_pattern() -> None:
+    from topsport_agent.observability import SimpleRedactor
+
+    r = SimpleRedactor()
+    out = r({"note": "my key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz and works"})
+    assert out["note"] == "[REDACTED]"
+
+
+def test_simple_redactor_preserves_structure() -> None:
+    from topsport_agent.observability import SimpleRedactor
+
+    r = SimpleRedactor()
+    payload = {"x": [{"token": "t", "value": "v"}], "y": ("a", "b")}
+    out = r(payload)
+    assert out["x"][0]["token"] == "[REDACTED]"
+    assert out["x"][0]["value"] == "v"
+    assert out["y"] == ("a", "b")
+    # 原 payload 未被修改
+    assert payload["x"][0]["token"] == "t"
+
+
+async def test_langfuse_tracer_redacts_payload_before_send() -> None:
+    from topsport_agent.observability import LangfuseTracer, SimpleRedactor
+
+    client = MockClient()
+    tracer = LangfuseTracer(client=client, redactor=SimpleRedactor())
+
+    from topsport_agent.types.events import Event, EventType
+
+    await tracer.on_event(
+        Event(
+            type=EventType.RUN_START,
+            session_id="s",
+            payload={"api_key": "sk-secret", "model": "m"},
+        )
+    )
+
+    # root span 的 input 应已脱敏
+    assert client.root_spans, "no root span created"
+    obs_input = client.root_spans[0].input
+    assert obs_input["api_key"] == "[REDACTED]"
+    assert obs_input["model"] == "m"
+
+
+def test_validate_base_url_allowlist() -> None:
+    from topsport_agent.observability import validate_base_url
+    import pytest as _pytest
+
+    # 空允许列表 → 跳过
+    validate_base_url("https://anywhere.example", [])
+
+    # 匹配 → 通过
+    validate_base_url("https://cloud.langfuse.com", ["https://cloud.langfuse.com"])
+
+    # 前缀匹配 → 通过
+    validate_base_url("https://cloud.langfuse.com/api/v1", ["https://cloud.langfuse.com"])
+
+    # 不匹配 → 抛
+    with _pytest.raises(ValueError, match="not in allowlist"):
+        validate_base_url("https://evil.example", ["https://cloud.langfuse.com"])
