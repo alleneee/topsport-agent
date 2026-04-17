@@ -84,11 +84,7 @@ def browser_agent(
 
 
 def _has_browser_tools(agent: Agent) -> bool:
-    """检查 Engine 的 tool_sources 中是否有 browser 源。"""
-    engine = agent.engine
-    # Engine 没有公开 tool_sources 的访问器，走私有字段
-    sources = getattr(engine, "_tool_sources", [])
-    for source in sources:
-        if getattr(source, "name", "") == "browser":
-            return True
-    return False
+    """检查 Engine 的 tool_sources 中是否有 browser 源。
+    H-A3: 走公共 tool_source_names()，不再读 Engine._tool_sources 私有字段。
+    """
+    return "browser" in agent.engine.tool_source_names()

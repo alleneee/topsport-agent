@@ -64,7 +64,7 @@ def _wrap_with_metrics(
 
     def factory(provider: LLMProvider, model: str) -> Agent:
         agent = inner(provider, model)
-        agent.engine._event_subscribers.append(metrics)
+        agent.engine.add_event_subscriber(metrics)
         return agent
 
     return factory

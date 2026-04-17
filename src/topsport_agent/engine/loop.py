@@ -84,6 +84,41 @@ class Engine:
     def reset_cancel(self) -> None:
         self._cancel_event.clear()
 
+    def tool_source_names(self) -> list[str]:
+        """已注册的 ToolSource 名字列表。H-A3 公共访问器，替代私有字段读取。"""
+        return [
+            getattr(s, "name", type(s).__name__) for s in self._tool_sources
+        ]
+
+    def tool_names(self) -> list[str]:
+        """已注册的静态 ToolSpec 名字（不含 ToolSource 动态工具）。"""
+        return [t.name for t in self._tools]
+
+    def add_event_subscriber(self, subscriber: EventSubscriber) -> None:
+        """追加一个 EventSubscriber。Engine 构造后的能力装配（如 metrics）走此接口。"""
+        self._event_subscribers.append(subscriber)
+
+    def capabilities_report(self) -> dict[str, list[str]]:
+        """一站式能力快照：工具 / 工具源 / 上下文提供者 / 订阅者名字。
+        调用方（如 Agent.from_config 返回值、browser_agent 校验）用它验证能力装配。
+        """
+        return {
+            "tools": self.tool_names(),
+            "tool_sources": self.tool_source_names(),
+            "context_providers": [
+                getattr(p, "name", type(p).__name__)
+                for p in self._context_providers
+            ],
+            "event_subscribers": [
+                getattr(s, "name", type(s).__name__)
+                for s in self._event_subscribers
+            ],
+            "post_step_hooks": [
+                getattr(h, "name", type(h).__name__)
+                for h in self._post_step_hooks
+            ],
+        }
+
     def _raise_if_cancelled(self) -> None:
         if self._cancel_event.is_set():
             raise Cancelled()

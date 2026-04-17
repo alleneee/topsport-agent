@@ -189,3 +189,101 @@ async def test_tool_source_dedup_prefers_builtin():
     names = [t.name for t in seen]
     assert names.count("echo") == 1
     assert seen[0] is builtin
+
+
+# ---------------------------------------------------------------------------
+# H-A3 · Engine 公共访问器（替代 ._tool_sources 私有读取）
+# ---------------------------------------------------------------------------
+
+
+def test_engine_tool_source_names() -> None:
+    """tool_source_names 返回已注册 ToolSource 的 name 列表。"""
+    from topsport_agent.engine.loop import Engine, EngineConfig
+
+    class _NamedSource:
+        name = "fs"
+
+        async def list_tools(self):
+            return []
+
+    class _NoNameSource:
+        # 故意没有 name，走 type(s).__name__ fallback
+        async def list_tools(self):
+            return []
+
+    class _P:
+        name = "p"
+
+        async def complete(self, req):
+            from topsport_agent.llm.provider import LLMResponse
+            return LLMResponse(text="ok", finish_reason="stop")
+
+    engine = Engine(
+        _P(), tools=[], config=EngineConfig(model="m"),
+        tool_sources=[_NamedSource(), _NoNameSource()],
+    )
+    names = engine.tool_source_names()
+    assert names[0] == "fs"
+    assert names[1] == "_NoNameSource"
+
+
+def test_engine_capabilities_report_shape() -> None:
+    """capabilities_report 提供一站式能力快照，key 覆盖 5 类。"""
+    from topsport_agent.engine.loop import Engine, EngineConfig
+    from topsport_agent.types.tool import ToolContext, ToolSpec
+
+    async def _h(args, ctx: ToolContext):
+        return {}
+
+    class _P:
+        name = "p"
+
+        async def complete(self, req):
+            from topsport_agent.llm.provider import LLMResponse
+            return LLMResponse(text="ok", finish_reason="stop")
+
+    engine = Engine(
+        _P(),
+        tools=[ToolSpec(name="add", description="", parameters={}, handler=_h)],
+        config=EngineConfig(model="m"),
+    )
+    report = engine.capabilities_report()
+    assert report["tools"] == ["add"]
+    assert report["tool_sources"] == []
+    assert set(report.keys()) == {
+        "tools", "tool_sources", "context_providers",
+        "event_subscribers", "post_step_hooks",
+    }
+
+
+async def test_engine_add_event_subscriber_public_mutator() -> None:
+    """add_event_subscriber 替代原先对 _event_subscribers 的直接读写。"""
+    from topsport_agent.engine.loop import Engine, EngineConfig
+
+    class _P:
+        name = "p"
+
+        async def complete(self, req):
+            from topsport_agent.llm.provider import LLMResponse
+            return LLMResponse(text="ok", finish_reason="stop")
+
+    class _Rec:
+        name = "rec"
+
+        def __init__(self):
+            self.got: list[str] = []
+
+        async def on_event(self, event):
+            self.got.append(event.type.value)
+
+    engine = Engine(_P(), tools=[], config=EngineConfig(model="m"))
+    rec = _Rec()
+    engine.add_event_subscriber(rec)
+
+    from topsport_agent.types.session import Session
+    session = Session(id="s", system_prompt="")
+    async for _ in engine.run(session):
+        pass
+
+    assert "run.start" in rec.got
+    assert "run.end" in rec.got
