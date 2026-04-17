@@ -29,6 +29,7 @@ from .chat import router as chat_router
 from .config import ServerConfig
 from .plan import router as plan_router
 from .sessions import SessionStore
+from .sessions_api import router as sessions_router
 
 _logger = logging.getLogger(__name__)
 
@@ -222,6 +223,7 @@ def create_app(
 
     app.include_router(chat_router)
     app.include_router(plan_router)
+    app.include_router(sessions_router)
     return app
 
 

@@ -632,3 +632,104 @@ def test_drain_timeout_respects_config() -> None:
 
     cfg = _SC(api_key="x", auth_required=False, drain_timeout_seconds=7.5)
     assert cfg.drain_timeout_seconds == 7.5
+
+
+# ---------------------------------------------------------------------------
+# H-R8 · GDPR session export / delete / list
+# ---------------------------------------------------------------------------
+
+
+def test_session_export_returns_messages_for_owner() -> None:
+    app = _make_test_app(MockStreamProvider(text="hello"))
+    with TestClient(app) as client:
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "first message"}],
+                "user": "gdpr-session",
+            },
+        )
+        r = client.get("/v1/sessions/gdpr-session")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["session_id"] == "anonymous::gdpr-session"
+        assert body["user_hint"] == "gdpr-session"
+        assert body["principal"] == "anonymous"
+        assert body["message_count"] >= 2  # user + assistant 至少
+        roles = [m["role"] for m in body["messages"]]
+        assert "user" in roles
+        assert "assistant" in roles
+
+
+def test_session_export_404_for_unknown() -> None:
+    app = _make_test_app(MockStreamProvider())
+    with TestClient(app) as client:
+        r = client.get("/v1/sessions/nonexistent")
+        assert r.status_code == 404
+
+
+def test_session_delete_removes_session() -> None:
+    app = _make_test_app(MockStreamProvider(text="bye"))
+    with TestClient(app) as client:
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "x"}],
+                "user": "del-me",
+            },
+        )
+        store = app.state.session_store
+        assert "anonymous::del-me" in store._entries
+
+        r = client.delete("/v1/sessions/del-me")
+        assert r.status_code == 204
+        assert "anonymous::del-me" not in store._entries
+
+        # 再删返回 404
+        r = client.delete("/v1/sessions/del-me")
+        assert r.status_code == 404
+
+
+def test_session_list_scoped_to_principal() -> None:
+    app = _make_test_app(MockStreamProvider(text="hi"))
+    with TestClient(app) as client:
+        for hint in ("alpha", "beta", "gamma"):
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic/m",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "user": hint,
+                },
+            )
+        r = client.get("/v1/sessions")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["principal"] == "anonymous"
+        assert set(body["sessions"]) == {"alpha", "beta", "gamma"}
+        assert body["count"] == 3
+
+
+def test_session_delete_requires_auth_when_enabled() -> None:
+    def agent_factory(p: LLMProvider, model: str) -> Agent:
+        return Agent.from_config(
+            p,
+            AgentConfig(
+                name="t", description="", system_prompt="", model=model,
+                enable_skills=False, enable_memory=False, enable_plugins=False,
+                enable_browser=False, stream=True,
+            ),
+        )
+
+    app = create_app(
+        ServerConfig(api_key="dummy", auth_required=True, auth_token="s"),
+        provider_name="anthropic",
+        provider=MockStreamProvider(),
+        agent_factory=agent_factory,
+    )
+    with TestClient(app) as client:
+        # 不带 token
+        r = client.delete("/v1/sessions/any")
+        assert r.status_code == 401

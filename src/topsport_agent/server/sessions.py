@@ -103,3 +103,23 @@ class SessionStore:
         async with self._global_lock:
             for sid in list(self._entries):
                 await self._close_entry(sid)
+
+    async def get(self, sid: str) -> SessionEntry | None:
+        async with self._global_lock:
+            entry = self._entries.get(sid)
+            if entry is not None:
+                entry.last_used_at = time.monotonic()
+            return entry
+
+    async def delete(self, sid: str) -> bool:
+        """按 sid 删除 session。找到返回 True，未找到 False。"""
+        async with self._global_lock:
+            if sid not in self._entries:
+                return False
+            await self._close_entry(sid)
+            return True
+
+    async def ids_with_prefix(self, prefix: str) -> list[str]:
+        """列出以给定前缀开头的 session id（用于按 principal 过滤）。"""
+        async with self._global_lock:
+            return sorted(sid for sid in self._entries if sid.startswith(prefix))
