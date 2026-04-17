@@ -68,15 +68,30 @@ class AnthropicMessagesClient:
           {"type": "text_delta", "text": "..."}
           {"type": "final_message", "message": <sdk message object>}
 
-        内部使用 SDK 的 `client.messages.stream(...)` async context manager。
-        重试暂不支持流式（连接中断重传复杂度高，简化为不重试）。
+        重试策略（修 H-R1 流式/非流式不对称）：
+        - 首个 delta yield 之前发生的瞬态错误做指数退避重试
+        - 已经 yield 过内容后的错误原样抛出（无法回滚已交付的字节）
         """
-        async with self._client.messages.stream(**payload) as stream:
-            async for text_chunk in stream.text_stream:
-                if text_chunk:
-                    yield {"type": "text_delta", "text": text_chunk}
-            final_message = await stream.get_final_message()
-            yield {"type": "final_message", "message": final_message}
+        attempt = 0
+        while True:
+            yielded_any = False
+            try:
+                async with self._client.messages.stream(**payload) as stream:
+                    async for text_chunk in stream.text_stream:
+                        if text_chunk:
+                            yield {"type": "text_delta", "text": text_chunk}
+                            yielded_any = True
+                    final_message = await stream.get_final_message()
+                    yield {"type": "final_message", "message": final_message}
+                return
+            except Exception as exc:
+                if yielded_any:
+                    # 已经有内容流出，重试会破坏下游上下文 —— 原样抛出
+                    raise
+                if attempt >= self._max_retries or not self._should_retry(exc):
+                    raise
+                await asyncio.sleep(self._retry_base_delay * (2**attempt))
+                attempt += 1
 
     @staticmethod
     def _should_retry(exc: Exception) -> bool:

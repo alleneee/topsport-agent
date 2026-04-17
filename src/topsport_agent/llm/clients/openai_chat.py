@@ -72,6 +72,10 @@ class OpenAIChatClient:
 
         OpenAI 流式没有 get_final_message，这里手工累积 text / tool_calls / usage，
         构造与非流式 response 结构等价的 SimpleNamespace，供 adapter.parse_response 使用。
+
+        重试策略（修 H-R1 流式/非流式不对称）：
+        - 首个 delta yield 之前发生的瞬态错误做指数退避重试
+        - 已经 yield 过内容后的错误原样抛出
         """
         stream_payload = dict(payload)
         stream_payload["stream"] = True
@@ -80,53 +84,65 @@ class OpenAIChatClient:
         opts.setdefault("include_usage", True)
         stream_payload["stream_options"] = opts
 
-        text_parts: list[str] = []
-        # tool_calls 按 index 累积 arguments 字符串
-        tc_buffer: dict[int, dict[str, Any]] = {}
-        finish_reason: str | None = None
-        usage_data: dict[str, int] = {}
-        model_name: str | None = None
+        attempt = 0
+        while True:
+            text_parts: list[str] = []
+            tc_buffer: dict[int, dict[str, Any]] = {}
+            finish_reason: str | None = None
+            usage_data: dict[str, int] = {}
+            model_name: str | None = None
+            yielded_any = False
 
-        stream = await self._client.chat.completions.create(**stream_payload)
-        async for chunk in stream:
-            if getattr(chunk, "model", None):
-                model_name = chunk.model
+            try:
+                stream = await self._client.chat.completions.create(**stream_payload)
+                async for chunk in stream:
+                    if getattr(chunk, "model", None):
+                        model_name = chunk.model
 
-            usage = getattr(chunk, "usage", None)
-            if usage is not None:
-                for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    val = getattr(usage, field, None)
-                    if val is not None:
-                        usage_data[field] = int(val)
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                            val = getattr(usage, field, None)
+                            if val is not None:
+                                usage_data[field] = int(val)
 
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = getattr(choice, "delta", None)
-            fr = getattr(choice, "finish_reason", None)
-            if fr:
-                finish_reason = fr
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = getattr(choice, "delta", None)
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr:
+                        finish_reason = fr
 
-            if delta is None:
-                continue
+                    if delta is None:
+                        continue
 
-            content = getattr(delta, "content", None)
-            if content:
-                text_parts.append(content)
-                yield {"type": "text_delta", "text": content}
+                    content = getattr(delta, "content", None)
+                    if content:
+                        text_parts.append(content)
+                        yield {"type": "text_delta", "text": content}
+                        yielded_any = True
 
-            for tc_delta in getattr(delta, "tool_calls", None) or []:
-                idx = getattr(tc_delta, "index", 0)
-                entry = tc_buffer.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if getattr(tc_delta, "id", None):
-                    entry["id"] = tc_delta.id
-                func = getattr(tc_delta, "function", None)
-                if func is not None:
-                    if getattr(func, "name", None):
-                        entry["name"] = func.name
-                    if getattr(func, "arguments", None):
-                        entry["arguments"] += func.arguments
+                    for tc_delta in getattr(delta, "tool_calls", None) or []:
+                        idx = getattr(tc_delta, "index", 0)
+                        entry = tc_buffer.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if getattr(tc_delta, "id", None):
+                            entry["id"] = tc_delta.id
+                        func = getattr(tc_delta, "function", None)
+                        if func is not None:
+                            if getattr(func, "name", None):
+                                entry["name"] = func.name
+                            if getattr(func, "arguments", None):
+                                entry["arguments"] += func.arguments
+                break  # 流完整消费完毕，跳出重试循环
+            except Exception as exc:
+                if yielded_any:
+                    raise
+                if attempt >= self._max_retries or not self._should_retry(exc):
+                    raise
+                await asyncio.sleep(self._retry_base_delay * (2**attempt))
+                attempt += 1
 
         # 聚合为 non-streaming response 结构供 adapter 复用
         aggregated_message = SimpleNamespace(
