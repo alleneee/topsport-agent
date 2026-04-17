@@ -1,3 +1,5 @@
+"""粗估而非精确 tokenize：避免引入 tiktoken 等重依赖，阈值判断容忍误差。"""
+
 from __future__ import annotations
 
 from ...types.message import Message

@@ -1,4 +1,4 @@
-"""topsport-agent CLI: 交互式 REPL，验证引擎核心链路。
+"""topsport-agent CLI: 交互式 REPL。
 
 用法:
     uv run topsport-agent --model anthropic/claude-sonnet-4-5
@@ -6,6 +6,9 @@
 
 MODEL 格式为 provider/model-name，provider 支持 anthropic 和 openai。
 API_KEY 和 BASE_URL 从 .env 或环境变量读取，不带厂商前缀。
+
+CLI 只负责：参数解析、provider 构造、交互循环、输出渲染。
+Agent 组装由 Agent.default() 统一处理，CLI 不再关心具体能力的拼装逻辑。
 """
 
 from __future__ import annotations
@@ -14,9 +17,8 @@ import argparse
 import asyncio
 import importlib
 import os
-from pathlib import Path
 import sys
-import uuid
+from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -25,10 +27,9 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from ..engine import Engine, EngineConfig
+from ..agent import default_agent
 from ..types.events import EventType
-from ..types.message import Message, Role
-from ..types.session import RunState, Session
+from ..types.message import Role
 from .tools import builtin_tools
 
 console = Console()
@@ -98,102 +99,97 @@ def _print_event(event_type: EventType, payload: dict) -> None:
         console.print(f"  [bold red]error:[/] {kind}: {msg}")
 
 
-def _try_make_browser() -> tuple[object | None, list[object]]:
-    """尝试创建浏览器工具源。Playwright 未安装时静默跳过。"""
-    try:
-        # 先验证 playwright 可导入，避免注册了工具但调用全部失败
-        pw_name = "playwright.async_api"
-        importlib.import_module(pw_name)
-    except ImportError:
-        return None, []
-    try:
-        from ..browser import BrowserClient, BrowserConfig, BrowserToolSource
-        client = BrowserClient.from_config(BrowserConfig(headless=True))
-        source = BrowserToolSource(client)
-        return client, [source]
-    except Exception:
-        return None, []
-
-
-async def _run_loop(provider: object, model: str, system_prompt: str) -> None:
-    """主交互循环：prompt_toolkit 读取输入 -> 引擎推理 -> rich 输出结果。"""
-    browser_client, browser_sources = _try_make_browser()
-
-    engine = Engine(
+async def _run_loop(
+    provider: object, model: str, system_prompt: str | None, *, stream: bool = True
+) -> None:
+    """主交互循环：使用 Agent.default() 组装完整能力栈，然后进入 REPL。"""
+    agent = default_agent(
         provider=provider,  # type: ignore[arg-type]
-        tools=builtin_tools(),
-        config=EngineConfig(model=model, max_steps=10),
-        tool_sources=browser_sources,  # type: ignore[arg-type]
-    )
-
-    session = Session(
-        id=str(uuid.uuid4()),
+        model=model,
         system_prompt=system_prompt,
+        stream=stream,
+        extra_tools=builtin_tools(),
     )
 
-    # 历史记录持久化到用户目录
-    history_dir = Path.home() / ".topsport-agent"
-    history_dir.mkdir(exist_ok=True)
-    history_file = history_dir / "history.txt"
+    try:
+        session = agent.new_session()
 
-    prompt_session: PromptSession = PromptSession(
-        history=FileHistory(str(history_file)),
-    )
+        history_dir = Path.home() / ".topsport-agent"
+        history_dir.mkdir(exist_ok=True)
+        history_file = history_dir / "history.txt"
 
-    all_tool_names = [t.name for t in builtin_tools()]
-    if browser_sources:
-        all_tool_names.extend(["browser_navigate", "browser_snapshot", "browser_click",
-                               "browser_type", "browser_screenshot", "browser_get_text"])
-    tools_text = ", ".join(all_tool_names)
-    console.print(Panel.fit(
-        f"[bold]model:[/] {model}\n[bold]tools:[/] {tools_text}\n[bold]session:[/] {session.id[:8]}...",
-        title="[bold cyan]topsport-agent[/]",
-        border_style="cyan",
-    ))
-    console.print("[dim]type 'quit' or Ctrl+D to exit[/]\n")
+        prompt_session: PromptSession = PromptSession(
+            history=FileHistory(str(history_file)),
+        )
 
-    while True:
-        try:
-            raw = await prompt_session.prompt_async(
-                [("class:prompt", "you> ")],
-                style=_prompt_style,
-            )
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]bye[/]")
-            break
+        skill_count = len(agent.skill_registry.list()) if agent.skill_registry else 0
+        plugin_agent_count = (
+            len(agent.plugin_manager.agent_registry().list())
+            if agent.plugin_manager
+            else 0
+        )
+        console.print(Panel.fit(
+            f"[bold]agent:[/] {agent.config.name}\n"
+            f"[bold]model:[/] {model}\n"
+            f"[bold]skills:[/] {skill_count} loaded\n"
+            f"[bold]plugin agents:[/] {plugin_agent_count} loaded\n"
+            f"[bold]session:[/] {session.id[:8]}...",
+            title="[bold cyan]topsport-agent[/]",
+            border_style="cyan",
+        ))
+        console.print("[dim]type 'quit' or Ctrl+D to exit[/]\n")
 
-        user_input = raw.strip()
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit", "q"):
-            console.print("[dim]bye[/]")
-            break
+        while True:
+            try:
+                raw = await prompt_session.prompt_async(
+                    [("class:prompt", "you> ")],
+                    style=_prompt_style,
+                )
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]bye[/]")
+                break
 
-        session.messages.append(Message(role=Role.USER, content=user_input))
-        session.state = RunState.IDLE
+            user_input = raw.strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "q"):
+                console.print("[dim]bye[/]")
+                break
 
-        assistant_text: str | None = None
+            assistant_text: str | None = None
+            streaming_started = False  # 流式模式下文本已经渐进打印，结束不重复渲染
 
-        async for event in engine.run(session):
-            _print_event(event.type, event.payload)
+            async for event in agent.run(user_input, session):
+                if event.type == EventType.LLM_TEXT_DELTA:
+                    # 流式 text chunk：裸文本渐进输出，不加换行
+                    delta = event.payload.get("delta", "")
+                    if delta:
+                        if not streaming_started:
+                            console.print()
+                            streaming_started = True
+                        console.print(delta, end="", markup=False, highlight=False)
+                    continue
 
-            if event.type == EventType.MESSAGE_APPENDED:
-                if event.payload.get("role") == "assistant":
-                    last_msg = session.messages[-1] if session.messages else None
-                    if last_msg and last_msg.role == Role.ASSISTANT and last_msg.content:
-                        assistant_text = last_msg.content
+                _print_event(event.type, event.payload)
 
-        if assistant_text:
-            console.print()
-            console.print(Markdown(assistant_text))
-            console.print()
-        else:
-            console.print()
+                if event.type == EventType.MESSAGE_APPENDED:
+                    if event.payload.get("role") == "assistant":
+                        last_msg = session.messages[-1] if session.messages else None
+                        if last_msg and last_msg.role == Role.ASSISTANT and last_msg.content:
+                            assistant_text = last_msg.content
 
-        engine.reset_cancel()
-
-    if browser_client is not None:
-        await browser_client.close()  # type: ignore[union-attr]
+            if streaming_started:
+                # 流式完成后补一个换行
+                console.print()
+                console.print()
+            elif assistant_text:
+                console.print()
+                console.print(Markdown(assistant_text))
+                console.print()
+            else:
+                console.print()
+    finally:
+        await agent.close()
 
 
 def _load_dotenv() -> None:
@@ -228,7 +224,12 @@ def main() -> None:
     parser.add_argument(
         "--system",
         default=None,
-        help="system prompt",
+        help="custom system prompt (overrides DEFAULT_SYSTEM_PROMPT)",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="disable streaming output (enabled by default when provider supports it)",
     )
 
     args = parser.parse_args()
@@ -256,19 +257,7 @@ def main() -> None:
         console.print("  run: uv sync --group llm")
         sys.exit(1)
 
-    system_prompt = args.system
-    if system_prompt is None:
-        system_prompt = (
-            "You are a helpful assistant with browser control capabilities. "
-            "You can navigate web pages, click elements, type text, take screenshots, and extract text. "
-            "When asked to visit a website, use browser_navigate first, then use the @refs from the snapshot "
-            "to interact with page elements (browser_click, browser_type). "
-            "Use browser_get_text to extract page content. "
-            "Use browser_screenshot to capture visual evidence. "
-            "You also have: echo, current_time, calc tools."
-        )
-
-    asyncio.run(_run_loop(provider, model, system_prompt))
+    asyncio.run(_run_loop(provider, model, args.system, stream=not args.no_stream))
 
 
 if __name__ == "__main__":

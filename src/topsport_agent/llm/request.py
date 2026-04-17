@@ -9,6 +9,12 @@ from ..types.tool import ToolSpec
 
 @dataclass(slots=True)
 class LLMRequest:
+    """供应商无关的 LLM 调用描述，Engine 侧构建、Adapter 侧消费。
+
+    provider_options 按供应商 key 隔离（如 {"anthropic": {...}, "openai": {...}}），
+    Adapter 只取自己那份，互不干扰。
+    """
+
     model: str
     messages: list[Message]
     tools: list[ToolSpec] = field(default_factory=list)

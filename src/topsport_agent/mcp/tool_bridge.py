@@ -10,6 +10,7 @@ _logger = logging.getLogger(__name__)
 
 
 class MCPToolSource:
+    """桥接层：把远端 MCP 工具描述翻译成引擎 ToolSpec，通过 <server>.<tool> 前缀避免跨服务重名。"""
     def __init__(self, client: MCPClient, *, prefix: str | None = None) -> None:
         self._client = client
         # 运行时统一把 MCP 原始工具名包成 <server>.<tool>，避免跨服务重名。
@@ -42,12 +43,16 @@ class MCPToolSource:
         )
 
     def _make_handler(self, raw_name: str):
+        """三层错误模型：传输异常 -> handler catch; MCP isError -> 透传给 LLM。
+
+        引擎层 ToolResult.is_error 保留给引擎自身。
+        """
         client = self._client
 
         async def handler(
             args: dict[str, Any], ctx: ToolContext
         ) -> dict[str, Any]:
-            # 这里保留运行时工具返回结构，屏蔽底层 MCP 返回对象差异。
+            # 统一返回结构，屏蔽底层 MCP 返回对象差异。
             try:
                 result = await client.call_tool(raw_name, args)
             except Exception as exc:

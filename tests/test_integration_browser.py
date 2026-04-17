@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from topsport_agent.browser.client import BrowserClient
 from topsport_agent.browser.tools import BrowserToolSource
 from topsport_agent.browser.types import BrowserConfig
@@ -26,7 +24,6 @@ from topsport_agent.types.message import Message, Role, ToolCall
 from topsport_agent.types.plan import Plan, PlanStep
 from topsport_agent.types.session import RunState, Session
 from topsport_agent.types.tool import ToolContext, ToolSpec
-
 
 # ---------------------------------------------------------------------------
 # Mock Browser

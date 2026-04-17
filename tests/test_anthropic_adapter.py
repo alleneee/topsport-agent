@@ -432,7 +432,7 @@ async def test_engine_integration_with_anthropic_adapter():
     assert tool_msg.tool_results[0].output == {"echo": {"x": 7}}
 
     first_request = client.messages.requests[0]
-    assert first_request["system"] == "you are a helper"
+    assert "you are a helper" in first_request["system"]
     assert first_request["messages"] == []
     assert first_request["tools"][0]["name"] == "echo"
 

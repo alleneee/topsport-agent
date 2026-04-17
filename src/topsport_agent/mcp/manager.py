@@ -8,6 +8,7 @@ from .tool_bridge import MCPToolSource
 
 
 class MCPManager:
+    """多服务编排器：统一管理所有 MCP 客户端，对引擎暴露聚合的 tool_sources 列表。"""
     def __init__(self) -> None:
         self._clients: dict[str, MCPClient] = {}
 
@@ -28,4 +29,5 @@ class MCPManager:
         return self._clients.get(name)
 
     def tool_sources(self) -> list[MCPToolSource]:
+        """每次调用都新建 MCPToolSource，引擎每步重新快照工具列表时自然拿到最新状态。"""
         return [MCPToolSource(client) for client in self._clients.values()]

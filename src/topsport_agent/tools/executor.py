@@ -8,6 +8,7 @@ from .output_cap import DEFAULT_CAP, enforce_cap
 
 
 class ToolExecutor:
+    """装饰器式执行器：在原始 handler 外层套上 output cap，引擎只需调用 wrap/wrap_all 即可。"""
     def __init__(
         self,
         *,
@@ -20,6 +21,7 @@ class ToolExecutor:
         self._default_cap = default_cap
 
     def wrap(self, spec: ToolSpec) -> ToolSpec:
+        """返回新的 ToolSpec 而非修改原始对象，保持不可变语义。"""
         cap = self._caps.get(spec.name, self._default_cap)
         blob_store = self._blob_store
         original_handler = spec.handler

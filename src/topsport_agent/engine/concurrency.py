@@ -8,6 +8,8 @@ from ..types.session import Session
 
 
 class EngineGuard:
+    """同一个 session 同一时刻只允许一个 engine.run 在执行，防止消息序列并发写坏。"""
+
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._busy: dict[str, bool] = {}
@@ -32,6 +34,7 @@ async def guarded_run(
     session: Session,
     guard: EngineGuard,
 ) -> AsyncIterator[Event]:
+    """包装 engine.run 为互斥执行；无论正常结束还是异常，finally 保证释放占位。"""
     taken = await guard.try_take(session.id)
     if not taken:
         raise RuntimeError(f"session '{session.id}' is already running")

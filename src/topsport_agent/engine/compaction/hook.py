@@ -31,6 +31,8 @@ class CompactionHook:
         self._keep_tool_results = keep_recent_tool_results
 
     async def after_step(self, session: Session, step: int) -> None:
+        """每步结束后两阶段压缩：先 micro（廉价，清工具输出）再 auto（昂贵，LLM 摘要）。"""
+        # micro 先跑，缩减 token 数，可能让 auto 阈值判定通过得更晚。
         session.messages[:] = micro_compact(
             session.messages, self._keep_tool_results
         )
@@ -54,4 +56,5 @@ class CompactionHook:
                 len(session.messages),
                 len(compacted),
             )
+            # 原地替换 session.messages，外部引用同一个列表仍然有效。
             session.messages[:] = compacted

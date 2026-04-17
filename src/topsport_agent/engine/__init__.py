@@ -1,5 +1,15 @@
-from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
+from .hooks import (
+    ContextProvider,
+    EventSubscriber,
+    FailureHandler,
+    PostStepHook,
+    StepConfigurator,
+    ToolSource,
+)
 from .loop import Cancelled, Engine, EngineConfig
+from .orchestrator import Orchestrator, SubAgentConfig
+from .planner import Planner
+from .prompt import PromptBuilder, PromptSection, SectionPriority
 
 __all__ = [
     "Cancelled",
@@ -7,6 +17,14 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "EventSubscriber",
+    "FailureHandler",
+    "Orchestrator",
+    "Planner",
     "PostStepHook",
+    "PromptBuilder",
+    "PromptSection",
+    "SectionPriority",
+    "StepConfigurator",
+    "SubAgentConfig",
     "ToolSource",
 ]

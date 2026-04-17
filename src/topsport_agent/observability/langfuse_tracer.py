@@ -11,6 +11,10 @@ _logger = logging.getLogger(__name__)
 
 
 class LangfuseTracer:
+    """事件驱动的 Langfuse 追踪器：span 生命周期跨越多个异步事件，不能用 with 块。
+
+    使用 start_observation + end 的显式 API（v3），兼容 v4 的统一接口。
+    """
     name = "langfuse"
 
     def __init__(
@@ -25,8 +29,10 @@ class LangfuseTracer:
         flush_on_run_end: bool = True,
     ) -> None:
         self._flush_on_run_end = flush_on_run_end
+        # 按 session_id 隔离追踪状态，支持并发多 session。
         self._state_by_session: dict[str, dict[str, Any]] = {}
 
+        # 测试路径：直接注入 mock client；生产路径：延迟 import langfuse。
         if client is not None:
             self._client = client
             return
@@ -61,6 +67,7 @@ class LangfuseTracer:
         self._client = Langfuse(**kwargs)
 
     async def on_event(self, event: Event) -> None:
+        """事件派发表模式：O(1) 查找，新事件类型只需在 _handlers 表末尾加一行。"""
         try:
             handler = self._handlers.get(event.type)
             if handler is not None:
@@ -74,7 +81,7 @@ class LangfuseTracer:
         try:
             self._client.flush()
         except Exception:
-            pass
+            _logger.debug("langfuse operation failed", exc_info=True)
 
     def _state(self, session_id: str) -> dict[str, Any]:
         return self._state_by_session.setdefault(session_id, {"tools": {}})
@@ -92,10 +99,11 @@ class LangfuseTracer:
                 input=event.payload,
             )
         except Exception:
-            pass
+            _logger.debug("langfuse operation failed", exc_info=True)
         state["root"] = root
 
     def _handle_run_end(self, event: Event) -> None:
+        """RUN_END 关闭根 span 并清理 session 状态，flush 保证 trace 落盘。"""
         state = self._state_by_session.get(event.session_id)
         if state is None:
             return
@@ -144,6 +152,7 @@ class LangfuseTracer:
                 pass
 
     def _handle_llm_start(self, event: Event) -> None:
+        """LLM 调用挂在当前 step 下；若无 step 则挂在 root 下，保证 trace 树结构正确。"""
         state = self._state(event.session_id)
         parent = state.get("step") or state.get("root") or self._client
         gen = parent.start_observation(
@@ -171,11 +180,11 @@ class LangfuseTracer:
         try:
             gen.update(**update_kwargs)
         except Exception:
-            pass
+            _logger.debug("langfuse operation failed", exc_info=True)
         try:
             gen.end()
         except Exception:
-            pass
+            _logger.debug("langfuse operation failed", exc_info=True)
 
     def _handle_tool_start(self, event: Event) -> None:
         state = self._state(event.session_id)
@@ -199,13 +208,14 @@ class LangfuseTracer:
         try:
             tool_span.update(**update_kwargs)
         except Exception:
-            pass
+            _logger.debug("langfuse operation failed", exc_info=True)
         try:
             tool_span.end()
         except Exception:
-            pass
+            _logger.debug("langfuse operation failed", exc_info=True)
 
     def _handle_error(self, event: Event) -> None:
+        """异常和取消都要清理 session 状态，避免内存泄漏。"""
         state = self._state_by_session.get(event.session_id)
         if state is None:
             return
@@ -217,7 +227,8 @@ class LangfuseTracer:
                     status_message=event.payload.get("message", ""),
                 )
             except Exception:
-                pass
+                _logger.debug("langfuse error update failed", exc_info=True)
+        self._state_by_session.pop(event.session_id, None)
 
     def _handle_cancelled(self, event: Event) -> None:
         state = self._state_by_session.get(event.session_id)
@@ -228,8 +239,10 @@ class LangfuseTracer:
             try:
                 root.update(level="WARNING", status_message="cancelled")
             except Exception:
-                pass
+                _logger.debug("langfuse cancel update failed", exc_info=True)
+        self._state_by_session.pop(event.session_id, None)
 
+    # 事件类型 -> 处理方法的静态派发表；顺序无关，dict 查找 O(1)。
     _handlers: dict[EventType, Any] = {
         EventType.RUN_START: _handle_run_start,
         EventType.RUN_END: _handle_run_end,

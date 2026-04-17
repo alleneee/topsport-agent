@@ -1,7 +1,8 @@
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 .claude/hooks/statusline.py"
+    "command": "~/.claude/ccline/ccline",
+    "padding": 0
   },
   "hooks": {
     "SessionStart": [

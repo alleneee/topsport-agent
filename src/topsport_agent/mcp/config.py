@@ -7,6 +7,7 @@ from .types import MCPServerConfig, MCPTransport
 
 
 def load_mcp_config(path: str | Path) -> list[MCPServerConfig]:
+    """直接读取 Claude Desktop 格式的 mcpServers JSON，零转换复用已有配置。"""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     raw_servers = data.get("mcpServers", {})
     if not isinstance(raw_servers, dict):
@@ -40,6 +41,7 @@ def load_mcp_config(path: str | Path) -> list[MCPServerConfig]:
 
 
 def _validate(config: MCPServerConfig) -> None:
+    """stdio 必须有 command，http 必须有 url -- 传输层缺少入口点就无法建立连接。"""
     if config.transport == MCPTransport.STDIO:
         if not config.command:
             raise ValueError(

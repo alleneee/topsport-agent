@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from ..llm.provider import LLMProvider, LLMResponse
+from ..llm.provider import LLMProvider, LLMResponse, StreamingLLMProvider
 from ..llm.request import LLMRequest
 from ..llm.response import wrap_response_metadata
 from ..types.events import Event, EventType
@@ -14,6 +14,7 @@ from ..types.message import Message, Role, ToolCall, ToolResult
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
+from .prompt import PromptBuilder, SectionPriority
 
 _logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ class EngineConfig:
     model: str
     max_steps: int = 20
     provider_options: dict[str, Any] | None = None
+    # 是否使用流式调用。只有在 provider 也实现 StreamingLLMProvider 时才真正生效。
+    stream: bool = False
 
 
 class Engine:
@@ -54,7 +57,7 @@ class Engine:
         self._cancel_event.set()
 
     def reset_cancel(self) -> None:
-        self._cancel_event = asyncio.Event()
+        self._cancel_event.clear()
 
     def _raise_if_cancelled(self) -> None:
         if self._cancel_event.is_set():
@@ -96,20 +99,26 @@ class Engine:
     def _build_call_messages(
         self, session: Session, ephemeral: list[Message]
     ) -> list[Message]:
-        system_parts: list[str] = []
+        builder = PromptBuilder()
+
+        # session.system_prompt 是最高优先级的 section
         if session.system_prompt:
-            system_parts.append(session.system_prompt)
+            builder.add("system-prompt", session.system_prompt, SectionPriority.SYSTEM_PROMPT)
+
         non_system: list[Message] = []
         for msg in ephemeral:
-            # 额外上下文里的 system 消息会被折叠成一次 LLM 调用的统一 system prompt。
             if msg.role == Role.SYSTEM and msg.content:
-                system_parts.append(msg.content)
+                # 从 Message.extra 中读取 section 元信息，无则使用默认值
+                tag = msg.extra.get("section_tag", "context") if msg.extra else "context"
+                priority = msg.extra.get("section_priority", 500) if msg.extra else 500
+                builder.add(tag, msg.content, priority)
             else:
                 non_system.append(msg)
 
         result: list[Message] = []
-        if system_parts:
-            result.append(Message(role=Role.SYSTEM, content="\n\n".join(system_parts)))
+        system_text = builder.build()
+        if system_text:
+            result.append(Message(role=Role.SYSTEM, content=system_text))
         result.extend(non_system)
         result.extend(session.messages)
         return result
@@ -173,6 +182,62 @@ class Engine:
             pass
         return llm_task.result()
 
+    async def _stream_llm_events(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        session: Session,
+        step: int,
+        final_holder: list[LLMResponse],
+    ) -> AsyncIterator[Event]:
+        """流式调用路径：yield LLM_TEXT_DELTA 事件给上层，final_holder[0] 回填最终 response。
+
+        用 list 作为可变容器传递最终 response，规避 async generator 无法 return 值的限制。
+        取消支持：每次接收一个 chunk 前检查 cancel_event，取消时 raise Cancelled()。
+        """
+        assert isinstance(self._provider, StreamingLLMProvider)
+
+        request = LLMRequest(
+            model=self._config.model,
+            messages=messages,
+            tools=tools,
+            provider_options=dict(self._config.provider_options or {}),
+        )
+
+        stream = self._provider.stream(request)
+        final: LLMResponse | None = None
+        try:
+            async for chunk in stream:
+                if self._cancel_event.is_set():
+                    raise Cancelled()
+
+                if chunk.type == "text_delta" and chunk.text_delta:
+                    yield self._event(
+                        EventType.LLM_TEXT_DELTA,
+                        session,
+                        {"step": step, "delta": chunk.text_delta},
+                    )
+                elif chunk.type == "done" and chunk.final_response is not None:
+                    final = chunk.final_response
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    pass
+
+        if final is None:
+            # Provider 没发 done chunk，当作异常返回空响应，避免引擎卡住
+            final = LLMResponse(
+                text="",
+                tool_calls=[],
+                finish_reason="error",
+                usage={},
+                response_metadata=None,
+            )
+        final_holder.append(final)
+
     async def _run_post_step_hooks(self, session: Session, step: int) -> None:
         for hook in self._post_step_hooks:
             self._raise_if_cancelled()
@@ -224,6 +289,10 @@ class Engine:
                 tools_snapshot = await self._snapshot_tools()
                 call_messages = self._build_call_messages(session, ephemeral)
 
+                use_stream = (
+                    self._config.stream
+                    and isinstance(self._provider, StreamingLLMProvider)
+                )
                 yield self._event(
                     EventType.LLM_CALL_START,
                     session,
@@ -233,11 +302,20 @@ class Engine:
                         "tool_count": len(tools_snapshot),
                         "ephemeral_msg_count": len(ephemeral),
                         "call_msg_count": len(call_messages),
+                        "stream": use_stream,
                     },
                 )
-                response = await self._call_llm_with_cancel(
-                    call_messages, tools_snapshot
-                )
+                if use_stream:
+                    final_holder: list[LLMResponse] = []
+                    async for evt in self._stream_llm_events(
+                        call_messages, tools_snapshot, session, step, final_holder,
+                    ):
+                        yield evt
+                    response = final_holder[0]
+                else:
+                    response = await self._call_llm_with_cancel(
+                        call_messages, tools_snapshot
+                    )
                 yield self._event(
                     EventType.LLM_CALL_END,
                     session,

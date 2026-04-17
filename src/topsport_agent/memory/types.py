@@ -6,6 +6,7 @@ from enum import StrEnum
 
 
 class MemoryType(StrEnum):
+    """记忆分类：语义标签决定注入优先级和 compaction 策略，而非纯粹的分组标签。"""
     GOAL = "goal"
     IDENTITY = "identity"
     FACT = "fact"

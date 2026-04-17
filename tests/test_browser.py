@@ -9,14 +9,13 @@ from typing import Any
 import pytest
 
 from topsport_agent.browser.client import BrowserClient
-from topsport_agent.browser.tools import BrowserToolSource
-from topsport_agent.browser.types import BrowserConfig, PageSnapshot, SnapshotEntry
 from topsport_agent.browser.snapshot import (
-    INTERACTIVE_ROLES,
     _parse_aria_yaml,
     build_ref_map,
     take_snapshot,
 )
+from topsport_agent.browser.tools import BrowserToolSource
+from topsport_agent.browser.types import BrowserConfig, PageSnapshot, SnapshotEntry
 from topsport_agent.types.tool import ToolContext, ToolSpec
 
 

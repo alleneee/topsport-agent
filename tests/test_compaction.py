@@ -154,7 +154,7 @@ async def test_auto_compact_triggers_on_large_context():
     reinject = result[0]
     assert reinject.role == Role.SYSTEM
     reinject_content = reinject.content or ""
-    assert "Identity" in reinject_content
+    assert "<identity>" in reinject_content
     assert "python agent" in reinject_content
     assert "Task goal" in reinject_content
     assert "refactor ingest" in reinject_content
@@ -208,9 +208,8 @@ async def test_auto_compact_handles_summary_failure():
         keep_recent=1,
     )
 
-    assert did is True
-    reinject = result[0]
-    assert "summary generation failed" in (reinject.content or "")
+    assert did is False
+    assert len(result) == len(messages)
 
 
 async def test_compaction_hook_runs_micro_and_auto():

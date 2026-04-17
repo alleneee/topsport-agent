@@ -459,10 +459,9 @@ async def test_engine_integration_with_openai_adapter():
     assert tool_msg.tool_results[0].output == {"echo": {"x": 7}}
 
     first_request = client.completions.requests[0]
-    assert first_request["messages"][0] == {
-        "role": "system",
-        "content": "you are a helper",
-    }
+    first_system = first_request["messages"][0]
+    assert first_system["role"] == "system"
+    assert "you are a helper" in first_system["content"]
     assert first_request["tools"][0]["type"] == "function"
 
     second_request = client.completions.requests[1]

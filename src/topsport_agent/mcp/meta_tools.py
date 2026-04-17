@@ -7,6 +7,7 @@ from .manager import MCPManager
 
 
 def build_mcp_meta_tools(manager: MCPManager) -> list[ToolSpec]:
+    """把 MCP 的 prompt / resource 能力作为 LLM 可调用工具暴露，让模型能主动拉取外部上下文。"""
     async def list_mcp_prompts(
         args: dict[str, Any], ctx: ToolContext
     ) -> dict[str, Any]:
@@ -44,6 +45,7 @@ def build_mcp_meta_tools(manager: MCPManager) -> list[ToolSpec]:
     async def get_mcp_prompt(
         args: dict[str, Any], ctx: ToolContext
     ) -> dict[str, Any]:
+        """渲染指定 MCP 服务的 prompt 模板，返回展开后的消息列表供 LLM 使用。"""
         server = args["server"]
         name = args["name"]
         prompt_args = args.get("arguments") or {}
@@ -100,6 +102,7 @@ def build_mcp_meta_tools(manager: MCPManager) -> list[ToolSpec]:
     async def read_mcp_resource(
         args: dict[str, Any], ctx: ToolContext
     ) -> dict[str, Any]:
+        """按 URI 读取单个资源的完整内容，将多段 content 拼接为纯文本返回。"""
         server = args["server"]
         uri = args["uri"]
         client = manager.get(server)

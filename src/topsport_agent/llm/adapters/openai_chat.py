@@ -14,6 +14,12 @@ from ..response import (
 
 
 class OpenAIChatAdapter:
+    """OpenAI Chat Completions API 的编解码器。
+
+    与 Anthropic 的关键差异：system 保留为 messages 数组中的 role=system；
+    tool_result 是独立的 role=tool 消息（不合并）；tool_call arguments 是 JSON 字符串。
+    """
+
     provider_name = "openai"
 
     def __init__(
@@ -26,6 +32,11 @@ class OpenAIChatAdapter:
         self._reasoning_effort = reasoning_effort
 
     def build_payload(self, request: LLMRequest) -> dict[str, Any]:
+        """构建 OpenAI API payload。
+
+        新模型使用 max_completion_tokens 替代 max_tokens，
+        通过 provider_options 中是否显式指定来自动切换键名。
+        """
         options = dict(request.provider_options.get("openai", {}))
         payload: dict[str, Any] = {
             "model": request.model,
@@ -62,6 +73,11 @@ class OpenAIChatAdapter:
         return payload
 
     def parse_response(self, completion: Any) -> LLMResponse:
+        """解析 OpenAI 响应：只取 choices[0]。
+
+        tool_call arguments 是 JSON 字符串，
+        解析失败时降级为 {"_raw_arguments": ...} 保留原文。
+        """
         choices = getattr(completion, "choices", None) or []
         if not choices:
             return LLMResponse(text=None, raw=completion)
@@ -139,6 +155,11 @@ class OpenAIChatAdapter:
     def _convert_messages(
         self, messages: list[Message]
     ) -> list[dict[str, Any]]:
+        """OpenAI 消息转换。
+
+        每条 TOOL 消息的每个 tool_result 独立为一条 role=tool 消息，
+        assistant 的 tool_calls arguments 必须是 JSON 字符串（非 dict）。
+        """
         converted: list[dict[str, Any]] = []
 
         for msg in messages:
@@ -175,11 +196,14 @@ class OpenAIChatAdapter:
 
             if msg.role == Role.TOOL:
                 for result in msg.tool_results:
+                    content = self._coerce_output(result.output)
+                    if result.is_error:
+                        content = f"[ERROR] {content}"
                     converted.append(
                         {
                             "role": "tool",
                             "tool_call_id": result.call_id,
-                            "content": self._coerce_output(result.output),
+                            "content": content,
                         }
                     )
 

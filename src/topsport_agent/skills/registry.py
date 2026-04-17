@@ -9,6 +9,10 @@ _RESERVED_KEYS = {"name", "description"}
 
 
 class SkillRegistry:
+    """注册表负责扫描目录树、解析 SKILL.md frontmatter，构建 name -> manifest 映射。
+
+    同名冲突时先扫描到的优先（setdefault），目录顺序决定优先级。
+    """
     def __init__(self, skill_dirs: list[Path]) -> None:
         self._skill_dirs = [Path(p) for p in skill_dirs]
         self._manifests: dict[str, SkillManifest] = {}
@@ -39,8 +43,10 @@ class SkillRegistry:
         if not name:
             return None
         description = meta.get("description", "").strip()
+        # frontmatter 中 name/description 之外的键保留为 extra，保持扩展性
         extra = {k: v for k, v in meta.items() if k not in _RESERVED_KEYS}
         skill_dir = skill_md.parent
+        # 同级目录下除 SKILL.md 之外的所有文件视为技能资源（模板、示例等）
         resources = [
             path
             for path in sorted(skill_dir.rglob("*"))

@@ -11,6 +11,7 @@ class MCPTransport(StrEnum):
 
 @dataclass(slots=True)
 class MCPServerConfig:
+    """直接复用 Claude Desktop 的 JSON 配置结构，省去格式转换和迁移成本。"""
     name: str
     transport: MCPTransport
     command: str | None = None

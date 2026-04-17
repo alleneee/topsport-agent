@@ -6,6 +6,7 @@ from typing import Any
 
 from .blob_store import BlobStore
 
+# 按工具类型设定字符上限，防止单次工具输出撑爆 LLM 上下文窗口。
 DEFAULT_CAPS: dict[str, int] = {
     "read_file": 20_000,
     "search": 10_000,
@@ -36,6 +37,7 @@ def enforce_cap(
     cap: int,
     blob_store: BlobStore | None = None,
 ) -> CapResult:
+    """超限时：有 blob_store 则全量落盘并返回 blob_ref + preview；无则只返回截断预览。"""
     serialized = serialize_output(output)
     size = len(serialized)
 

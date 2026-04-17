@@ -8,8 +8,10 @@ from .types import MemoryEntry, MemoryType
 
 
 def build_memory_tools(store: MemoryStore) -> list[ToolSpec]:
+    """闭包工厂：通过 store 参数注入具体存储实现，返回的 ToolSpec 列表可直接交给 Engine。"""
     async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         raw_type = args.get("type", MemoryType.NOTE.value)
+        # 类型校验失败时返回合法枚举值列表，引导 LLM 自行修正参数
         try:
             memory_type = MemoryType(raw_type)
         except ValueError:
@@ -29,6 +31,7 @@ def build_memory_tools(store: MemoryStore) -> list[ToolSpec]:
         return {"ok": True, "key": entry.key, "type": entry.type.value}
 
     async def recall_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+        """recall 双模式：传 key 精确读取单条，省略 key 列出全部摘要（不含 content），控制返回体积。"""
         key = args.get("key")
         if key:
             entry = await store.read(ctx.session_id, key)

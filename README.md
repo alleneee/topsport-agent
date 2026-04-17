@@ -5,7 +5,11 @@ and session-scoped working memory.
 
 ## Status
 
-Multi-agent plan mode landed. Browser control module added. 232 tests passing.
+Multi-agent plan mode landed. Browser control module added. Claude plugin
+ecosystem integration added. Tagged prompt section system added. Agent
+abstraction layer with default/browser presets. File operation tool suite.
+Real sub-agent execution via spawn_agent. LLM streaming output. 383 tests
+passing.
 
 | Module | Location | State |
 | --- | --- | --- |
@@ -21,8 +25,10 @@ Multi-agent plan mode landed. Browser control module added. 232 tests passing.
 | mcp | `src/topsport_agent/mcp/` | JSON config, lazy client, tool bridge, prompt/resource meta tools |
 | tools | `src/topsport_agent/tools/` | executor (output cap + blob offload), safe_shell (execFile-only), blob store |
 | observability | `src/topsport_agent/observability/` | Tracer alias, NoOpTracer, LangfuseTracer |
+| plugins | `src/topsport_agent/plugins/` | Claude Code plugin ecosystem: discovery, skills, agents, hooks |
+| agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
-| tests | `tests/` | 232 passing |
+| tests | `tests/` | 341 passing |
 
 ## Quickstart
 
@@ -30,6 +36,47 @@ Multi-agent plan mode landed. Browser control module added. 232 tests passing.
 uv sync
 uv run pytest -v
 ```
+
+## Agent Abstraction
+
+The `Agent` class packages `Engine` + skills + memory + plugins + browser
+into a single high-level object. Two preset factories ship out of the box:
+
+```python
+from topsport_agent import default_agent, browser_agent
+
+# General-purpose agent with all standard capabilities
+agent = default_agent(provider, model="anthropic/claude-sonnet-4-5")
+
+# Browser automation specialist (requires playwright)
+agent = browser_agent(provider, model="anthropic/claude-sonnet-4-5")
+
+session = agent.new_session()
+async for event in agent.run("navigate to example.com and extract the title", session):
+    ...
+await agent.close()
+```
+
+### AgentConfig Capability Switches
+
+| Field | Default | Effect when enabled |
+| --- | --- | --- |
+| `enable_skills` | `True` | Load skills from `local_skill_dirs` + plugin skill dirs; mount `load_skill`/`unload_skill`/`list_skills` tools |
+| `enable_memory` | `True` | `FileMemoryStore` under `memory_base_path`; mount `save_memory`/`recall_memory`/`forget_memory` |
+| `enable_plugins` | `True` | Full Claude plugin ecosystem loaded; expose `list_agents`/`spawn_agent`; hooks wired |
+| `enable_browser` | `False` | Playwright-backed browser control with 6 `browser_*` tools |
+
+### Available Presets
+
+- **`default_agent(provider, model, ...)`**: all capabilities on,
+  `DEFAULT_SYSTEM_PROMPT` describes the full toolset
+- **`browser_agent(provider, model, ...)`**: browser mandatory (raises
+  `BrowserUnavailableError` if Playwright missing); specialized prompt
+  explains `@ref` snapshot model and browser workflow
+
+Custom Agents are built via `Agent.from_config(provider, AgentConfig(...))`
+— declare the capability flags and extras you need.
+
 
 ## CLI
 
@@ -60,9 +107,161 @@ uv run topsport-agent -m openai/gpt-4o
 
 Built-in tools available in CLI mode: `echo`, `current_time`, `calc`.
 
+## HTTP Server
+
+OpenAI-compatible chat completions endpoint plus a plan execution endpoint,
+both streaming via Server-Sent Events. Stateful sessions, per-session LRU,
+client-disconnect cancellation.
+
+```bash
+uv sync --group llm --group api
+```
+
+Reuses the CLI `.env` (`API_KEY` / `BASE_URL` / `MODEL`). Optional:
+`HOST`, `PORT`, `SESSION_TTL_SECONDS`, `MAX_SESSIONS`.
+
+```bash
+uv run topsport-agent-serve --host 0.0.0.0 --port 8000
+```
+
+### POST /v1/chat/completions
+
+OpenAI wire format. The `user` field is repurposed as `session_id`
+(auto-generated when omitted). Server-side history is authoritative: only
+the last `role=user` message in the request body is taken as new input.
+
+```bash
+# non-streaming JSON
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "anthropic/claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "user": "my-session"
+    }'
+
+# streaming SSE
+curl -N http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "anthropic/claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    }'
+```
+
+SSE frames are standard OpenAI `chat.completion.chunk` objects terminated
+by `data: [DONE]`. Only `delta.content` and `finish_reason` are emitted —
+internal tool-call events are not surfaced.
+
+### POST /v1/plan/execute
+
+Run a DAG of sub-agent steps, each with its own isolated Engine+Session,
+streamed as named SSE events.
+
+```bash
+curl -N http://localhost:8000/v1/plan/execute \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "anthropic/claude-sonnet-4-5",
+        "plan": {
+            "id": "p1",
+            "goal": "fan-out",
+            "steps": [
+                {"id": "s1", "title": "A", "instructions": "Answer: ALPHA"},
+                {"id": "s2", "title": "B", "instructions": "Answer: BETA"},
+                {"id": "s3", "title": "sum",
+                 "instructions": "Say DONE",
+                 "depends_on": ["s1","s2"]}
+            ]
+        }
+    }'
+```
+
+Event names: `plan_approved`, `plan_step_start`, `plan_step_end`,
+`plan_step_failed`, `plan_waiting`, `plan_done`, `plan_failed`,
+`cancelled`, `error`. Failed steps with no human-in-the-loop adjudicator
+are auto-aborted (`PLAN_WAITING` → `ABORT`) to avoid hangs.
+
+### Session semantics
+
+- `user` → `session_id`; first request creates an Agent, subsequent requests reuse it.
+- Per-session `asyncio.Lock` serializes concurrent requests on the same id.
+- LRU eviction at `MAX_SESSIONS`; TTL sweep at `SESSION_TTL_SECONDS` (default 3600).
+- Eviction calls `agent.close()` (cleans up plugins / browser if enabled).
+- Client disconnect triggers `agent.cancel()` / `orchestrator.cancel()`.
+
 ## 维护说明
 
 - 核心运行链路、MCP 桥接、技能加载和文件记忆存储模块已补充中文代码注释，注释只解释流程意图和边界，不重复代码字面含义。
+
+## Prompt Section System
+
+System prompts are organized into tagged sections, inspired by Claude Code's
+XML tag structure. Each section has a tag name and priority (lower = earlier).
+
+```
+<system-prompt>
+You are a helpful assistant.
+</system-prompt>
+
+<working-memory>
+[goal] Refactor pipeline — current task
+</working-memory>
+
+<skills-catalog>
+- `superpowers:tdd`: Use when implementing features...
+</skills-catalog>
+
+<active-skills>
+## Skill: superpowers:tdd
+[full skill body]
+</active-skills>
+```
+
+### Built-in Section Priorities
+
+| Priority | Tag | Source |
+| --- | --- | --- |
+| 0 | `system-prompt` | `session.system_prompt` |
+| 100 | `identity` | Agent identity (future) |
+| 200 | `working-memory` | `MemoryInjector` |
+| 300 | `skills-catalog` | `SkillInjector` (catalog) |
+| 400 | `active-skills` | `SkillInjector` (active bodies) |
+| 500 | `plugin-context` | Plugin context (future) |
+| 600 | `tools-guide` | Tool guidance (future) |
+| 700 | `session-state` | Session state (future) |
+| 900 | `instructions` | High-priority instructions |
+
+### Selective Compaction
+
+The tag structure enables targeted context compression:
+
+- **Protected tags** (`system-prompt`, `identity`, `instructions`): never
+  dropped during compaction
+- **Compressible tags** (`session-state`, `tools-guide`, `plugin-context`,
+  `skills-catalog`, `working-memory`): dropped in order when token budget
+  is exceeded
+- `PromptBuilder.build_with_budget()` automatically drops compressible
+  sections to fit within a token limit
+- `compact_system_prompt(text, drop_tags=...)` removes specific tagged
+  sections from an assembled prompt
+- `extract_protected_sections(text)` keeps only protected sections for
+  extreme compression scenarios
+
+### Custom Sections
+
+ContextProviders declare sections via `Message.extra`:
+
+```python
+Message(
+    role=Role.SYSTEM,
+    content="my context",
+    extra={"section_tag": "my-custom-section", "section_priority": 550},
+)
+```
+
+Providers without section metadata default to tag `"context"`, priority 500.
 
 ## Engine hooks
 
@@ -484,6 +683,72 @@ async for event in orch.execute():
 - MCP tool names are always prefixed with `<server>.` to prevent collisions.
 - MCP tool errors and connection faults are reported as `is_error=True` in the
   result dict, not as engine-level exceptions.
+
+## Claude Code Plugin Ecosystem
+
+topsport-agent can load the full Claude Code plugin ecosystem from
+`~/.claude/plugins/`, supporting all four extension types.
+
+### Supported Extension Types
+
+| Type | Source | Integration |
+| --- | --- | --- |
+| Skills | `plugins/cache/*/skills/*/SKILL.md` | Registered in `SkillRegistry` as `plugin:skill` |
+| Commands | `plugins/cache/*/commands/*.md` | Converted to skills as `plugin:command` |
+| Agents | `plugins/cache/*/agents/*.md` | `list_agents` / `spawn_agent` tools |
+| Hooks | `plugins/cache/*/hooks/hooks.json` | `EventSubscriber` bridging to shell commands |
+
+### Usage
+
+```python
+from topsport_agent.plugins import PluginManager
+from topsport_agent.skills import SkillRegistry
+
+mgr = PluginManager()
+mgr.load()
+
+# Skills: local dirs first (higher priority), plugin dirs after
+local_dirs = [Path.home() / ".claude" / "skills"]
+registry = SkillRegistry(local_dirs + mgr.skill_dirs())
+registry.load()
+
+# Agents: expose as tools
+agent_tools = build_agent_tools(mgr.agent_registry())
+
+# Hooks: inject as event subscriber
+engine = Engine(
+    provider, tools=[...],
+    config=config,
+    event_subscribers=[mgr.hook_runner()],
+)
+
+# Cleanup temp dirs on exit
+mgr.cleanup()
+```
+
+### Plugin Discovery
+
+Reads `~/.claude/plugins/installed_plugins.json` to find all installed
+plugins. Only explicitly installed plugins are loaded. Naming convention:
+`plugin_name:extension_name` (e.g. `superpowers:brainstorming`).
+
+### Priority
+
+Local `~/.claude/skills/` always wins over plugin skills on name collision.
+Among plugins, first discovered wins (sorted by marketplace then name).
+
+### Hook Event Mapping
+
+| Claude Hook Event | Engine EventType | Matcher target |
+| --- | --- | --- |
+| SessionStart | `RUN_START` | always |
+| SessionEnd | `RUN_END` | always |
+| PreToolUse | `TOOL_CALL_START` | `payload["name"]` |
+| PostToolUse | `TOOL_CALL_END` | `payload["name"]` |
+| UserPromptSubmit | `MESSAGE_APPENDED` (role=user) | always |
+
+Hooks execute in subprocess with 30s default timeout. Failures are logged
+but never interrupt the engine.
 
 ## Not yet implemented
 

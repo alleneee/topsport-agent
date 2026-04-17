@@ -11,7 +11,9 @@ def build_skill_tools(
     registry: SkillRegistry,
     matcher: SkillMatcher,
 ) -> list[ToolSpec]:
+    """三个工具让 LLM 自主管理技能生命周期：发现(list) -> 加载(load) -> 卸载(unload)。"""
     async def load_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+        """加载失败时返回可用列表，让 LLM 自行选择正确名称重试。"""
         name = args["name"]
         manifest = registry.get(name)
         if manifest is None:

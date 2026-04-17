@@ -12,6 +12,10 @@ SessionFactory = Callable[[], AbstractAsyncContextManager[Any]]
 
 
 class MCPClient:
+    """MCP 会话不能跨 asyncio task 共享（cancel scope 绑定到创建它的 task）。
+
+    因此每次调用都新建一个短生命周期的 session，只缓存不可变的列表结果。
+    """
     def __init__(self, name: str, session_factory: SessionFactory) -> None:
         self._name = name
         self._session_factory = session_factory
@@ -25,6 +29,7 @@ class MCPClient:
 
     @classmethod
     def from_config(cls, config: MCPServerConfig) -> MCPClient:
+        """生产入口；测试走 __init__ 直接注入 mock factory，不触碰真实 MCP 依赖。"""
         return cls(config.name, _make_real_session_factory(config))
 
     async def list_tools(self, *, force_refresh: bool = False) -> list[Any]:
@@ -35,6 +40,7 @@ class MCPClient:
         return list(self._cached_tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """写操作不走缓存，每次新建 session 保证 task 安全。"""
         async with self._session_factory() as session:
             return await session.call_tool(name, arguments=arguments)
 
@@ -69,6 +75,10 @@ class MCPClient:
 
 
 def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
+    """通过变量间接 importlib.import_module 绕过 Pyright 的 reportMissingImports。
+
+    mcp / httpx 都是可选依赖，只在 from_config 路径上触发导入。
+    """
     mcp_module_name = "mcp"
     stdio_module_name = "mcp.client.stdio"
     http_module_name = "mcp.client.streamable_http"
@@ -95,6 +105,7 @@ def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
                     yield session
             return
 
+        # HTTP 传输走 MCP SDK v2 的 streamable_http_client，外部 httpx 客户端负责 headers/timeout。
         if config.transport == MCPTransport.HTTP:
             http_mod = importlib.import_module(http_module_name)
             streamable_http_client = http_mod.streamable_http_client

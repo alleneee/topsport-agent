@@ -14,6 +14,12 @@ from ..response import (
 
 
 class AnthropicMessagesAdapter:
+    """Anthropic Messages API 的编解码器：LLMRequest -> API payload，SDK response -> LLMResponse。
+
+    核心差异点：system 提升为顶层参数；连续 tool_result 合并进同一个 user 消息；
+    thinking 块需要独立预算控制。
+    """
+
     provider_name = "anthropic"
 
     def __init__(
@@ -26,6 +32,11 @@ class AnthropicMessagesAdapter:
         self._thinking_budget = thinking_budget
 
     def build_payload(self, request: LLMRequest) -> dict[str, Any]:
+        """构建 Anthropic API payload。
+
+        provider_options["anthropic"] 中的选项可覆盖默认值，
+        但已显式设置的字段优先（通过 setdefault 语义）。
+        """
         options = dict(request.provider_options.get("anthropic", {}))
         system, converted_messages = self._convert_messages(request.messages)
 
@@ -59,6 +70,10 @@ class AnthropicMessagesAdapter:
         return payload
 
     def parse_response(self, response: Any) -> LLMResponse:
+        """从 SDK 响应对象中提取内容块，同时保留原始 assistant_blocks 供追踪和回放。
+
+        thinking 块单独记录但不计入 text 输出。
+        """
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         assistant_blocks: list[AssistantResponseBlock] = []
@@ -122,10 +137,17 @@ class AnthropicMessagesAdapter:
     def _convert_messages(
         self, messages: list[Message]
     ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Anthropic 消息格式转换。
+
+        1. system 消息提取到顶层，不出现在 messages 数组中
+        2. 连续 TOOL 消息的 tool_result 块攒入同一个 user 消息（Anthropic 要求如此）
+        3. assistant 消息的 text 和 tool_use 混合为 content blocks 数组
+        """
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
 
+        # 遇到非 TOOL 消息时，将累积的 tool_result 块作为一条 user 消息刷出。
         def flush() -> None:
             if pending_tool_results:
                 converted.append(
@@ -193,6 +215,7 @@ class AnthropicMessagesAdapter:
 
     @staticmethod
     def _coerce_tool_result_content(output: Any) -> list[dict[str, Any]]:
+        """Anthropic 的 tool_result content 必须是 content blocks 数组，不接受裸字符串。"""
         if isinstance(output, str):
             return [{"type": "text", "text": output}]
         try:
