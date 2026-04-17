@@ -16,11 +16,12 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..types.events import EventType
 from ..types.message import Role
+from .auth import namespace_session_id, require_principal
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -57,7 +58,11 @@ def _parse_model(model_str: str) -> tuple[str, str]:
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionRequest, request: Request):
+async def chat_completions(
+    body: ChatCompletionRequest,
+    request: Request,
+    principal: str = Depends(require_principal),
+):
     store: SessionStore = request.app.state.session_store
     server_provider: str = request.app.state.provider_name
 
@@ -73,7 +78,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if not user_input:
         raise HTTPException(400, detail="messages must contain at least one user message")
 
-    _, entry, _ = await store.get_or_create(body.user, model_name)
+    # principal 前缀隔离：不同 principal 即便传同一个 body.user 也命中不同 session
+    session_key = namespace_session_id(principal, body.user)
+    _, entry, _ = await store.get_or_create(session_key, model_name)
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 

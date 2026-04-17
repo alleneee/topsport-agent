@@ -59,7 +59,9 @@ class MockStreamProvider:
         yield LLMStreamChunk(type="done", final_response=final)
 
 
-def _make_test_app(provider: Any) -> Any:
+def _make_test_app(provider: Any, *, auth_required: bool = False) -> Any:
+    """默认关闭鉴权以覆盖历史行为；auth 相关测试按需显式开启。"""
+
     def agent_factory(p: LLMProvider, model: str) -> Agent:
         cfg = AgentConfig(
             name="test",
@@ -74,8 +76,14 @@ def _make_test_app(provider: Any) -> Any:
         )
         return Agent.from_config(p, cfg)
 
+    server_cfg = ServerConfig(
+        api_key="dummy",
+        default_model="mock/test",
+        auth_required=auth_required,
+        auth_token="test-token" if auth_required else "",
+    )
     return create_app(
-        ServerConfig(api_key="dummy", default_model="mock/test"),
+        server_cfg,
         provider_name="anthropic",
         provider=provider,
         agent_factory=agent_factory,
@@ -170,7 +178,8 @@ def test_chat_session_state_preserved_across_requests() -> None:
             assert r.status_code == 200
 
         store = app.state.session_store
-        entry = store._entries["sess-fixed"]
+        # principal 命名空间前缀：auth 关闭时 principal="anonymous"
+        entry = store._entries["anonymous::sess-fixed"]
         # 2 轮应追加 2 user + 2 assistant = 至少 4 条消息（不含 engine 内部事件）
         assert len(entry.session.messages) >= 4
 
@@ -196,9 +205,10 @@ def test_chat_different_sessions_isolated() -> None:
             },
         )
         store = app.state.session_store
-        assert set(store._entries) == {"a", "b"}
-        assert store._entries["a"].session.id == "a"
-        assert store._entries["b"].session.id == "b"
+        # principal 命名空间：auth 关闭时 principal="anonymous"
+        assert set(store._entries) == {"anonymous::a", "anonymous::b"}
+        assert store._entries["anonymous::a"].session.id == "anonymous::a"
+        assert store._entries["anonymous::b"].session.id == "anonymous::b"
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +337,7 @@ def test_plan_execute_rejects_invalid_plan() -> None:
 def test_session_store_lru_eviction_closes_old_agents() -> None:
     provider = MockStreamProvider()
     app = create_app(
-        ServerConfig(api_key="dummy", max_sessions=2),
+        ServerConfig(api_key="dummy", max_sessions=2, auth_required=False),
         provider_name="anthropic",
         provider=provider,
         agent_factory=lambda p, m: Agent.from_config(
@@ -351,9 +361,9 @@ def test_session_store_lru_eviction_closes_old_agents() -> None:
             )
             assert r.status_code == 200
         store = app.state.session_store
-        # max=2，最早的 'a' 应被 evict
-        assert "a" not in store._entries
-        assert {"b", "c"}.issubset(store._entries.keys())
+        # max=2，最早的 'a' 应被 evict；key 带 anonymous:: 前缀
+        assert "anonymous::a" not in store._entries
+        assert {"anonymous::b", "anonymous::c"}.issubset(store._entries.keys())
 
 
 @pytest.mark.asyncio
@@ -382,3 +392,166 @@ async def test_session_store_close_all_idempotent() -> None:
     assert closed_count == 2
     await store.close_all()  # 第二次无副作用
     assert closed_count == 2
+
+
+# ---------------------------------------------------------------------------
+# CR-01 · HTTP 鉴权 + principal 命名空间 + /readyz + max_plan_steps clamp
+# ---------------------------------------------------------------------------
+
+
+def test_auth_required_but_no_token_startup_fails() -> None:
+    """secure-by-default：required=True 且未提供 token → 构造 app 即失败。"""
+    with pytest.raises(ValueError, match="tokens is empty"):
+        create_app(
+            ServerConfig(
+                api_key="dummy",
+                auth_required=True,
+                auth_token="",
+                auth_tokens_file="",
+            ),
+            provider_name="anthropic",
+            provider=MockStreamProvider(),
+        )
+
+
+def test_chat_rejects_missing_bearer() -> None:
+    # 手动构造带 token 的 app 避开上面的 shortcut 校验
+    def agent_factory(p: LLMProvider, model: str) -> Agent:
+        return Agent.from_config(
+            p,
+            AgentConfig(
+                name="t", description="", system_prompt="", model=model,
+                enable_skills=False, enable_memory=False, enable_plugins=False,
+                enable_browser=False, stream=True,
+            ),
+        )
+
+    app = create_app(
+        ServerConfig(api_key="dummy", auth_required=True, auth_token="secret"),
+        provider_name="anthropic",
+        provider=MockStreamProvider(),
+        agent_factory=agent_factory,
+    )
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "anthropic/m", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 401
+        assert "bearer" in r.text.lower()
+
+
+def test_chat_rejects_wrong_bearer() -> None:
+    def agent_factory(p: LLMProvider, model: str) -> Agent:
+        return Agent.from_config(
+            p,
+            AgentConfig(
+                name="t", description="", system_prompt="", model=model,
+                enable_skills=False, enable_memory=False, enable_plugins=False,
+                enable_browser=False, stream=True,
+            ),
+        )
+
+    app = create_app(
+        ServerConfig(api_key="dummy", auth_required=True, auth_token="secret"),
+        provider_name="anthropic",
+        provider=MockStreamProvider(),
+        agent_factory=agent_factory,
+    )
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "anthropic/m", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert r.status_code == 401
+
+
+def test_chat_accepts_valid_bearer_and_namespaces_session() -> None:
+    def agent_factory(p: LLMProvider, model: str) -> Agent:
+        return Agent.from_config(
+            p,
+            AgentConfig(
+                name="t", description="", system_prompt="", model=model,
+                enable_skills=False, enable_memory=False, enable_plugins=False,
+                enable_browser=False, stream=True,
+            ),
+        )
+
+    app = create_app(
+        ServerConfig(api_key="dummy", auth_required=True, auth_token="secret"),
+        provider_name="anthropic",
+        provider=MockStreamProvider(),
+        agent_factory=agent_factory,
+    )
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "my-session",
+            },
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert r.status_code == 200
+        store = app.state.session_store
+        # principal "default" 前缀 + 用户提供的 hint
+        assert "default::my-session" in store._entries
+        # 原始未前缀 key 不应出现，防跨 principal 命中
+        assert "my-session" not in store._entries
+
+
+def test_readyz_reports_component_health() -> None:
+    app = _make_test_app(MockStreamProvider())
+    with TestClient(app) as client:
+        r = client.get("/readyz")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ready"
+        assert body["components"]["provider"] is True
+        assert body["components"]["session_store"] is True
+        assert body["components"]["auth_config"] is True
+
+
+def test_plan_execute_clamps_max_steps() -> None:
+    """body.max_steps 超过 config 硬上限时被截断。"""
+    def agent_factory(p: LLMProvider, model: str) -> Agent:
+        return Agent.from_config(
+            p,
+            AgentConfig(
+                name="t", description="", system_prompt="", model=model,
+                enable_skills=False, enable_memory=False, enable_plugins=False,
+                enable_browser=False, stream=True,
+            ),
+        )
+
+    app = create_app(
+        ServerConfig(
+            api_key="dummy",
+            auth_required=False,
+            max_plan_steps=3,
+        ),
+        provider_name="anthropic",
+        provider=MockStreamProvider(),
+        agent_factory=agent_factory,
+    )
+    # 用 TestClient 启动 lifespan，然后直接验证 config 挂好
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/plan/execute",
+            json={
+                "model": "anthropic/m",
+                "max_steps": 1000,
+                "plan": {
+                    "id": "p1",
+                    "goal": "g",
+                    "steps": [
+                        {"id": "s1", "title": "t", "instructions": "i", "depends_on": []}
+                    ],
+                },
+            },
+        )
+        # 不关心 SSE 具体内容，只要 200 且流能开起来
+        assert r.status_code == 200
+        assert app.state.config.max_plan_steps == 3

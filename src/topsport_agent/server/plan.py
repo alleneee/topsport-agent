@@ -14,13 +14,15 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..engine.orchestrator import Orchestrator, SubAgentConfig
 from ..tools import file_tools
 from ..types.events import EventType
 from ..types.plan import Plan, PlanStep, StepDecision
+from .auth import require_principal
+from .config import ServerConfig
 from .schemas import PlanExecuteRequest
 from .sse import sse_event
 
@@ -62,19 +64,39 @@ def _build_plan(req: PlanExecuteRequest) -> Plan:
 
 
 @router.post("/v1/plan/execute")
-async def plan_execute(body: PlanExecuteRequest, request: Request):
+async def plan_execute(
+    body: PlanExecuteRequest,
+    request: Request,
+    principal: str = Depends(require_principal),
+):
     provider = request.app.state.provider
     server_provider_name: str = request.app.state.provider_name
+    cfg: ServerConfig = request.app.state.config
     model = _parse_model(body.model, server_provider_name)
 
     plan = _build_plan(body)
+
+    # 服务端 clamp：客户端的 max_steps 不得越过运营预算的硬上限
+    effective_max_steps = min(body.max_steps, cfg.max_plan_steps)
+
+    # 对外执行默认不带 file_tools —— 除非 operator 显式 ENABLE_FILE_TOOLS=true
+    tools = file_tools() if cfg.enable_file_tools else []
+
     sub_config = SubAgentConfig(
         provider=provider,
         model=model,
-        tools=file_tools(),
-        max_steps=body.max_steps,
+        tools=tools,
+        max_steps=effective_max_steps,
     )
     orchestrator = Orchestrator(plan, sub_config)
+    _logger.info(
+        "plan.execute principal=%s plan_id=%s steps=%d max_steps=%d file_tools=%s",
+        principal,
+        plan.id,
+        len(plan.steps),
+        effective_max_steps,
+        cfg.enable_file_tools,
+    )
 
     return StreamingResponse(
         _stream_plan(orchestrator, request),

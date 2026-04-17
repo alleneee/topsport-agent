@@ -5,6 +5,7 @@
 """
 
 from .app import create_app
+from .auth import AuthConfig
 from .config import ServerConfig
 
-__all__ = ["ServerConfig", "create_app"]
+__all__ = ["AuthConfig", "ServerConfig", "create_app"]
