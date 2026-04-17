@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .request import LLMRequest
 from .response import LLMResponse
@@ -28,3 +28,24 @@ class StreamingLLMProvider(Protocol):
     """
 
     def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]: ...
+
+
+@runtime_checkable
+class StructuredOutputProvider(Protocol):
+    """可选的结构化输出能力。H-A4：Planner 等需要 JSON schema 结果的调用方不再
+    绑死在 tool-call ABI 上——Gemini/Bedrock/原生 JSON mode 都可以实现此 Protocol，
+    Planner 通过 isinstance 检测并优先走该路径，兜底仍是 tool-call emulation。
+
+    complete_structured 必须返回符合 schema 的 dict（可以是嵌套结构）。
+    实现侧决定如何让 LLM 产生这个结构（tool-call / json_mode / function_call 等）。
+    """
+
+    name: str
+
+    async def complete_structured(
+        self,
+        request: LLMRequest,
+        schema: dict[str, Any],
+        *,
+        tool_name: str = "structured_output",
+    ) -> dict[str, Any]: ...

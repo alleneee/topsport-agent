@@ -150,3 +150,82 @@ class TestParsePlan:
             {"steps": [{"id": "a", "title": "A", "instructions": "do A"}]},
         )
         assert plan.steps[0].depends_on == []
+
+
+# ---------------------------------------------------------------------------
+# H-A4 · StructuredOutputProvider 优先路径
+# ---------------------------------------------------------------------------
+
+
+class StructuredProvider:
+    """同时实现 complete + complete_structured。Planner 应优先走 structured。"""
+
+    name = "structured"
+
+    def __init__(self, result: dict) -> None:
+        self.result = result
+        self.complete_called = False
+        self.structured_called = False
+        self.received_schema: dict | None = None
+
+    async def complete(self, request):
+        from topsport_agent.llm.provider import LLMResponse
+
+        self.complete_called = True
+        # 故意返回空 tool_calls，走到 complete 说明 Planner 没用 structured
+        return LLMResponse(text="fallback used", tool_calls=[], finish_reason="stop")
+
+    async def complete_structured(self, request, schema, *, tool_name="structured_output"):
+        self.structured_called = True
+        self.received_schema = schema
+        return self.result
+
+
+class TestPlannerStructuredOutput:
+    async def test_uses_structured_when_provider_supports_it(self):
+        from topsport_agent.engine.planner import Planner
+
+        provider = StructuredProvider(
+            result={
+                "steps": [
+                    {"id": "a", "title": "A", "instructions": "do A"},
+                    {"id": "b", "title": "B", "instructions": "do B", "depends_on": ["a"]},
+                ]
+            }
+        )
+        planner = Planner(provider, "m")  # type: ignore[arg-type]
+        plan = await planner.generate("goal")
+
+        assert provider.structured_called is True
+        assert provider.complete_called is False  # 没走到兜底
+        assert [s.id for s in plan.steps] == ["a", "b"]
+
+    async def test_structured_provider_receives_plan_schema(self):
+        from topsport_agent.engine.planner import Planner, _PLAN_TOOL_SCHEMA
+
+        provider = StructuredProvider(
+            result={"steps": [{"id": "x", "title": "X", "instructions": "do x"}]}
+        )
+        planner = Planner(provider, "m")  # type: ignore[arg-type]
+        await planner.generate("goal")
+
+        assert provider.received_schema == _PLAN_TOOL_SCHEMA
+
+    async def test_non_structured_provider_uses_tool_call_fallback(self):
+        """未实现 complete_structured 的 provider 继续走 tool-call emulation。"""
+        from topsport_agent.engine.planner import Planner
+
+        provider = MockProvider(
+            response=LLMResponse(
+                text=None,
+                tool_calls=[
+                    _plan_tool_call(
+                        [{"id": "only", "title": "T", "instructions": "i"}]
+                    )
+                ],
+                finish_reason="tool_use",
+            )
+        )
+        planner = Planner(provider, "m")  # type: ignore[arg-type]
+        plan = await planner.generate("goal")
+        assert plan.steps[0].id == "only"

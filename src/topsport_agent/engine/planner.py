@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ..llm.provider import LLMProvider
+from ..llm.provider import LLMProvider, StructuredOutputProvider
 from ..llm.request import LLMRequest
 from ..types.message import Message, Role
 from ..types.plan import Plan, PlanStep
@@ -64,6 +64,10 @@ class Planner:
         *,
         provider_options: dict[str, Any] | None = None,
     ) -> Plan:
+        """H-A4: 优先走 StructuredOutputProvider（如果 provider 实现了），
+        兜底才用 tool-call emulation。这让不支持 tool-use 的 provider（Gemini JSON
+        mode、Bedrock、自建模型等）只要实现 complete_structured 就能跑计划。
+        """
         # 系统提示 + 可选上下文 + 目标三段拼成完整输入。
         messages: list[Message] = []
         if context:
@@ -72,24 +76,39 @@ class Planner:
             )
         messages.append(Message(role=Role.USER, content=f"Goal: {goal}"))
 
+        request = LLMRequest(
+            model=self._model,
+            messages=[
+                Message(role=Role.SYSTEM, content=PLAN_SYSTEM_PROMPT),
+                *messages,
+            ],
+            tools=[],
+            provider_options=dict(provider_options or {}),
+        )
+
+        if isinstance(self._provider, StructuredOutputProvider):
+            arguments = await self._provider.complete_structured(
+                request, _PLAN_TOOL_SCHEMA, tool_name="create_plan"
+            )
+            return _parse_plan(goal, arguments)
+
+        return await self._generate_via_tool_call(goal, request)
+
+    async def _generate_via_tool_call(self, goal: str, base: LLMRequest) -> Plan:
+        """兜底路径：把 create_plan 塞进 tools 让 LLM 以 tool-call 形式返回 JSON。"""
         plan_tool = ToolSpec(
             name="create_plan",
             description="Create a structured execution plan with steps and dependencies",
             parameters=_PLAN_TOOL_SCHEMA,
             handler=_noop_handler,
         )
-
-        response = await self._provider.complete(
-            LLMRequest(
-                model=self._model,
-                messages=[
-                    Message(role=Role.SYSTEM, content=PLAN_SYSTEM_PROMPT),
-                    *messages,
-                ],
-                tools=[plan_tool],
-                provider_options=dict(provider_options or {}),
-            )
+        request = LLMRequest(
+            model=base.model,
+            messages=list(base.messages),
+            tools=[plan_tool],
+            provider_options=dict(base.provider_options or {}),
         )
+        response = await self._provider.complete(request)
 
         # 只取第一个 tool call；LLM 若返回多个则忽略后续的。
         if not response.tool_calls:
