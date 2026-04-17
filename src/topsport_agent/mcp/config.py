@@ -3,15 +3,28 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .policy import AllowEntry, MCPSecurityPolicy, enforce_stdio_policy
 from .types import MCPServerConfig, MCPTransport
 
 
-def load_mcp_config(path: str | Path) -> list[MCPServerConfig]:
-    """直接读取 Claude Desktop 格式的 mcpServers JSON，零转换复用已有配置。"""
+def load_mcp_config(
+    path: str | Path,
+    *,
+    policy: MCPSecurityPolicy | None = None,
+) -> list[MCPServerConfig]:
+    """读取 Claude Desktop 格式的 mcpServers JSON 并校验 stdio 安全策略。
+
+    策略解析顺序：
+    1. 调用方显式传入的 policy 优先
+    2. JSON 文件顶层存在 `allowlist` 字段 → 自动 strict
+    3. 否则 permissive（兼容历史配置，但日志会对可疑 stdio 启动记告警）
+    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     raw_servers = data.get("mcpServers", {})
     if not isinstance(raw_servers, dict):
         raise ValueError("mcp config: 'mcpServers' must be an object")
+
+    effective_policy = policy or _policy_from_data(data)
 
     configs: list[MCPServerConfig] = []
     for name, raw in raw_servers.items():
@@ -36,8 +49,43 @@ def load_mcp_config(path: str | Path) -> list[MCPServerConfig]:
             timeout=float(raw.get("timeout", 30.0)),
         )
         _validate(config)
+        if config.transport == MCPTransport.STDIO:
+            enforce_stdio_policy(
+                server_name=config.name,
+                command=config.command,
+                args=list(config.args),
+                policy=effective_policy,
+            )
         configs.append(config)
     return configs
+
+
+def _policy_from_data(data: dict) -> MCPSecurityPolicy:
+    """配置文件顶层可选 `allowlist: [{name, command, args_prefix?}, ...]`。
+    出现即 strict；不出现 permissive 以兼容历史配置。
+    """
+    raw_allowlist = data.get("allowlist")
+    if raw_allowlist is None:
+        return MCPSecurityPolicy.permissive()
+    if not isinstance(raw_allowlist, list):
+        raise ValueError("mcp config: 'allowlist' must be an array")
+
+    entries: list[AllowEntry] = []
+    for idx, raw in enumerate(raw_allowlist):
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"mcp config: allowlist[{idx}] must be an object"
+            )
+        try:
+            name = str(raw["name"])
+            command = str(raw["command"])
+        except KeyError as exc:
+            raise ValueError(
+                f"mcp config: allowlist[{idx}] missing required field {exc}"
+            ) from exc
+        args_prefix = tuple(str(a) for a in raw.get("args_prefix", []))
+        entries.append(AllowEntry(name=name, command=command, args_prefix=args_prefix))
+    return MCPSecurityPolicy.strict(entries)
 
 
 def _validate(config: MCPServerConfig) -> None:
