@@ -601,3 +601,34 @@ def test_dotenv_does_not_overwrite_existing_env(tmp_path, monkeypatch) -> None:
     _load_dotenv(env)
     # 已有 env 不覆盖，保持 process env 为权威
     assert _os.environ["DOTENV_TEST_VAR2"] == "from-env"
+
+
+# ---------------------------------------------------------------------------
+# H-R5 · graceful drain
+# ---------------------------------------------------------------------------
+
+
+def test_drain_rejects_new_api_requests_but_allows_health() -> None:
+    app = _make_test_app(MockStreamProvider())
+    with TestClient(app) as client:
+        # 模拟进入 drain 状态
+        app.state.draining = True
+
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "anthropic/m", "messages": [{"role": "user", "content": "x"}]},
+        )
+        assert r.status_code == 503
+        assert "draining" in r.text
+
+        # /healthz 和 /readyz 不受 drain 影响
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/readyz").status_code == 200
+
+
+def test_drain_timeout_respects_config() -> None:
+    """drain_timeout_seconds 可从 ServerConfig 读到。"""
+    from topsport_agent.server.config import ServerConfig as _SC
+
+    cfg = _SC(api_key="x", auth_required=False, drain_timeout_seconds=7.5)
+    assert cfg.drain_timeout_seconds == 7.5

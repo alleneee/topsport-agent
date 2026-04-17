@@ -9,14 +9,17 @@ lifespan 内统一初始化/销毁：
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..agent.base import Agent
 from ..agent.default import default_agent
@@ -131,6 +134,8 @@ def create_app(
         app.state.session_store = store
         app.state.config = cfg
         app.state.auth_config = auth_config
+        app.state.draining = False
+        app.state.inflight = 0
         if not auth_config.required:
             _logger.warning(
                 "server starting with auth DISABLED — acceptable only for CLI "
@@ -139,6 +144,16 @@ def create_app(
         try:
             yield
         finally:
+            # H-R5 graceful drain：先拒新请求，再等 in-flight 归零或超时，最后关资源
+            app.state.draining = True
+            deadline = time.monotonic() + cfg.drain_timeout_seconds
+            while app.state.inflight > 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            if app.state.inflight > 0:
+                _logger.warning(
+                    "drain timed out with %d in-flight requests still active",
+                    app.state.inflight,
+                )
             await store.close_all()
 
     app = FastAPI(
@@ -147,6 +162,34 @@ def create_app(
         description="OpenAI-compatible chat + Plan execution API for topsport-agent",
         lifespan=lifespan,
     )
+
+    class _DrainMiddleware(BaseHTTPMiddleware):
+        """H-R5: 正在 drain 时，对 /v1/* 新请求返回 503；健康检查和 /metrics 放行。
+        正常路径跟踪 in-flight 计数，lifespan 等它归零再继续关资源。
+        """
+
+        async def dispatch(self, request: Request, call_next):
+            path = request.url.path
+            is_api = path.startswith("/v1/")
+            if is_api and getattr(request.app.state, "draining", False):
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "server draining, please retry"},
+                    headers={"Retry-After": "5"},
+                )
+            if is_api:
+                request.app.state.inflight = (
+                    getattr(request.app.state, "inflight", 0) + 1
+                )
+                try:
+                    return await call_next(request)
+                finally:
+                    request.app.state.inflight = max(
+                        request.app.state.inflight - 1, 0
+                    )
+            return await call_next(request)
+
+    app.add_middleware(_DrainMiddleware)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

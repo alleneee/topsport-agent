@@ -33,6 +33,8 @@ class ServerConfig:
     enable_plugins: bool = False
     # Plan 执行的硬上限，防止客户端提交超大 max_steps 绕过运营预算
     max_plan_steps: int = 20
+    # 进程收到 SIGTERM 后等待 in-flight 请求的最大秒数（H-R5 graceful drain）
+    drain_timeout_seconds: float = 25.0
 
     @classmethod
     def from_env(cls) -> ServerConfig:
@@ -53,6 +55,9 @@ class ServerConfig:
             enable_skills=_parse_bool(os.environ.get("ENABLE_SKILLS"), default=False),
             enable_plugins=_parse_bool(os.environ.get("ENABLE_PLUGINS"), default=False),
             max_plan_steps=int(os.environ.get("MAX_PLAN_STEPS", "20")),
+            drain_timeout_seconds=float(
+                os.environ.get("DRAIN_TIMEOUT_SECONDS", "25")
+            ),
         )
 
 
