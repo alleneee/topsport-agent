@@ -11,8 +11,13 @@ from topsport_agent.tools.file_ops import file_tools
 from topsport_agent.types.tool import ToolContext
 
 
-def _ctx() -> ToolContext:
-    return ToolContext(session_id="s", call_id="c", cancel_event=asyncio.Event())
+def _ctx(workspace_root: Path | None = None) -> ToolContext:
+    return ToolContext(
+        session_id="s",
+        call_id="c",
+        cancel_event=asyncio.Event(),
+        workspace_root=workspace_root,
+    )
 
 
 def _find(name: str):
@@ -289,3 +294,146 @@ def test_file_tools_have_schemas() -> None:
         assert tool.parameters["type"] == "object"
         assert "properties" in tool.parameters
         assert tool.description
+
+
+# ---------------------------------------------------------------------------
+# workspace_root 沙箱（CR-04）
+# ---------------------------------------------------------------------------
+
+
+async def test_read_file_rejects_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+
+    result = await _find("read_file").handler(
+        {"path": str(outside)}, _ctx(workspace_root=workspace)
+    )
+    assert result["ok"] is False
+    assert "escape" in result["error"]
+
+
+async def test_read_file_allows_inside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    f = workspace / "inside.txt"
+    f.write_text("hello")
+
+    result = await _find("read_file").handler(
+        {"path": str(f)}, _ctx(workspace_root=workspace)
+    )
+    assert result["ok"] is True
+
+
+async def test_read_file_rejects_symlink_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("leaked")
+    trap = workspace / "trap"
+    trap.symlink_to(secret)
+
+    result = await _find("read_file").handler(
+        {"path": str(trap)}, _ctx(workspace_root=workspace)
+    )
+    assert result["ok"] is False
+    assert "escape" in result["error"]
+
+
+async def test_write_file_rejects_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+
+    result = await _find("write_file").handler(
+        {"path": str(outside), "content": "x"}, _ctx(workspace_root=workspace)
+    )
+    assert result["ok"] is False
+    assert "escape" in result["error"]
+    assert not outside.exists()
+
+
+async def test_edit_file_rejects_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("hello")
+
+    result = await _find("edit_file").handler(
+        {"path": str(outside), "old_string": "hello", "new_string": "bye"},
+        _ctx(workspace_root=workspace),
+    )
+    assert result["ok"] is False
+    assert "escape" in result["error"]
+    assert outside.read_text() == "hello"
+
+
+async def test_list_dir_rejects_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    result = await _find("list_dir").handler(
+        {"path": str(outside)}, _ctx(workspace_root=workspace)
+    )
+    assert result["ok"] is False
+    assert "escape" in result["error"]
+
+
+async def test_glob_files_filters_symlink_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / "inside.py").write_text("pass")
+    secret = tmp_path / "secret.py"
+    secret.write_text("leaked")
+    (workspace / "escape.py").symlink_to(secret)
+
+    result = await _find("glob_files").handler(
+        {"pattern": "*.py", "path": str(workspace)},
+        _ctx(workspace_root=workspace),
+    )
+    assert result["ok"] is True
+    matches = {Path(m).name for m in result["matches"]}
+    assert "inside.py" in matches
+    assert "escape.py" not in matches
+
+
+# ---------------------------------------------------------------------------
+# 原子写 + edit 并发串行化（CR-04）
+# ---------------------------------------------------------------------------
+
+
+async def test_write_file_is_atomic_no_partial_tmp_leak(tmp_path: Path) -> None:
+    """正常写入后，临时 .tmp 文件不应残留在目录下。"""
+    target = tmp_path / "target.txt"
+    result = await _find("write_file").handler(
+        {"path": str(target), "content": "hello atomic"}, _ctx()
+    )
+    assert result["ok"] is True
+    assert target.read_text() == "hello atomic"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+async def test_edit_file_serializes_concurrent_edits(tmp_path: Path) -> None:
+    """并发 edit 同一文件不应彼此覆盖；每次替换都被记账。"""
+    f = tmp_path / "counter.txt"
+    f.write_text("seed")
+
+    async def one_edit(old: str, new: str) -> dict:
+        return await _find("edit_file").handler(
+            {"path": str(f), "old_string": old, "new_string": new}, _ctx()
+        )
+
+    # 串行版本仍成立：第二个 edit 等第一个写完再读，能看到 "one"
+    r1 = await one_edit("seed", "one")
+    assert r1["ok"] is True
+    r2, r3 = await asyncio.gather(
+        one_edit("one", "two"),
+        one_edit("two", "three"),
+    )
+    # 两个 edit 都应成功：锁保证串行，第二个在第一个之后读到新文本
+    assert r2["ok"] is True and r3["ok"] is True
+    assert f.read_text() == "three"

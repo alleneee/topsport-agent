@@ -7,14 +7,20 @@
 
 安全约束：
 - 所有路径必须绝对路径（避免相对路径的歧义）
-- edit_file 要求 old_string 唯一匹配（除非 replace_all=True）
+- ToolContext.workspace_root 设置时强制沙箱：路径 resolve 后必须落在根内，
+  符号链接逃逸被拒绝；未设置时保留 CLI 的宽松行为
+- edit_file 要求 old_string 唯一匹配（除非 replace_all=True），并按绝对路径串行
+- write_file / edit_file 通过临时文件 + os.replace 原子替换，避免中断留半写入
 - 单次读写有大小上限，超限截断并标注
 """
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +32,11 @@ _MAX_GREP_MATCHES = 500  # grep 最多返回 500 条命中
 _MAX_GLOB_RESULTS = 1000  # glob 最多返回 1000 条路径
 _MAX_LINE_LENGTH = 2000  # 单行超过 2000 字符截断，防止超宽二进制
 
+# edit_file 串行化：同一绝对路径的并发 edit 排队执行，避免 TOCTOU 最后写者覆盖。
+# key 是 resolve 后的字符串路径，进程级生命周期即可，无需显式清理（条目数 ≈ 活跃文件数）。
+_edit_locks: dict[str, asyncio.Lock] = {}
+_edit_locks_guard = asyncio.Lock()
+
 
 def _ensure_absolute(path_str: str) -> Path:
     """所有路径必须绝对路径 —— 相对路径在 LLM 的长对话里极易出错。"""
@@ -35,11 +46,70 @@ def _ensure_absolute(path_str: str) -> Path:
     return p
 
 
+def _check_containment(path: Path, ctx: ToolContext) -> str | None:
+    """仅在 workspace_root 被设置时生效：
+    - path resolve 后必须 is_relative_to(root)
+    - root 本身也 resolve，两边都规范化后比较
+    返回错误描述；合规返回 None。未设置 root 时不检查（保留 CLI 兼容）。
+    """
+    root = ctx.workspace_root
+    if root is None:
+        return None
+    try:
+        real_path = path.resolve(strict=False)
+        real_root = root.resolve(strict=False)
+    except OSError as exc:
+        return f"path resolution failed: {exc}"
+    if not real_path.is_relative_to(real_root):
+        return (
+            f"path escapes workspace: {path} resolves to {real_path}, "
+            f"root={real_root}"
+        )
+    return None
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """临时文件同目录 + os.replace 原子替换。
+    崩溃/掉电时要么保留旧文件要么是完整新文件，不会出现半写入。
+    """
+    parent = path.parent
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+async def _get_edit_lock(path: Path) -> asyncio.Lock:
+    """按 resolve 后的路径取同一把锁，保证同一文件的 edit 串行。"""
+    key = str(path.resolve(strict=False))
+    async with _edit_locks_guard:
+        lock = _edit_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _edit_locks[key] = lock
+        return lock
+
+
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """读文件内容。支持 offset (1-based 行号) 和 limit (行数)。"""
     path = _ensure_absolute(args["path"])
     offset = int(args.get("offset", 0) or 0)
     limit = int(args.get("limit", 0) or 0)
+
+    violation = _check_containment(path, ctx)
+    if violation is not None:
+        return {"ok": False, "error": violation}
 
     if not path.exists():
         return {"ok": False, "error": f"file not found: {path}"}
@@ -97,6 +167,10 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             "error": f"content exceeds {_MAX_WRITE_BYTES} bytes, write in chunks",
         }
 
+    violation = _check_containment(path, ctx)
+    if violation is not None:
+        return {"ok": False, "error": violation}
+
     if not path.parent.exists():
         return {
             "ok": False,
@@ -105,7 +179,7 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     try:
         existed = path.exists()
-        path.write_text(content, encoding="utf-8")
+        _atomic_write_text(path, content)
         return {
             "ok": True,
             "path": str(path),
@@ -117,7 +191,10 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """精确字符串替换。old_string 必须在文件中存在且（默认）唯一。"""
+    """精确字符串替换。old_string 必须在文件中存在且（默认）唯一。
+
+    同路径并发 edit 被 _edit_locks 串行化，避免 TOCTOU 最后写者覆盖。
+    """
     path = _ensure_absolute(args["path"])
     old_string = args["old_string"]
     new_string = args["new_string"]
@@ -128,50 +205,61 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if old_string == new_string:
         return {"ok": False, "error": "old_string equals new_string, nothing to change"}
 
+    violation = _check_containment(path, ctx)
+    if violation is not None:
+        return {"ok": False, "error": violation}
+
     if not path.exists():
         return {"ok": False, "error": f"file not found: {path}"}
     if not path.is_file():
         return {"ok": False, "error": f"not a file: {path}"}
 
-    try:
-        text = path.read_text(encoding="utf-8")
-    except Exception as exc:
-        return {"ok": False, "error": f"read failed: {type(exc).__name__}: {exc}"}
+    lock = await _get_edit_lock(path)
+    async with lock:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return {"ok": False, "error": f"read failed: {type(exc).__name__}: {exc}"}
 
-    count = text.count(old_string)
-    if count == 0:
-        return {
-            "ok": False,
-            "error": "old_string not found in file",
-            "match_count": 0,
-        }
-    if count > 1 and not replace_all:
-        return {
-            "ok": False,
-            "error": f"old_string matched {count} times; "
-                     "provide more unique context or set replace_all=true",
-            "match_count": count,
-        }
+        count = text.count(old_string)
+        if count == 0:
+            return {
+                "ok": False,
+                "error": "old_string not found in file",
+                "match_count": 0,
+            }
+        if count > 1 and not replace_all:
+            return {
+                "ok": False,
+                "error": f"old_string matched {count} times; "
+                         "provide more unique context or set replace_all=true",
+                "match_count": count,
+            }
 
-    if replace_all:
-        new_text = text.replace(old_string, new_string)
-    else:
-        new_text = text.replace(old_string, new_string, 1)
+        if replace_all:
+            new_text = text.replace(old_string, new_string)
+        else:
+            new_text = text.replace(old_string, new_string, 1)
 
-    try:
-        path.write_text(new_text, encoding="utf-8")
-        return {
-            "ok": True,
-            "path": str(path),
-            "replacements": count if replace_all else 1,
-        }
-    except Exception as exc:
-        return {"ok": False, "error": f"write failed: {type(exc).__name__}: {exc}"}
+        try:
+            _atomic_write_text(path, new_text)
+            return {
+                "ok": True,
+                "path": str(path),
+                "replacements": count if replace_all else 1,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"write failed: {type(exc).__name__}: {exc}"}
 
 
 async def _list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """列出目录内容。只返回名称和类型，不递归。"""
     path = _ensure_absolute(args["path"])
+
+    violation = _check_containment(path, ctx)
+    if violation is not None:
+        return {"ok": False, "error": violation}
+
     if not path.exists():
         return {"ok": False, "error": f"directory not found: {path}"}
     if not path.is_dir():
@@ -195,6 +283,10 @@ async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     pattern = args["pattern"]
     base = _ensure_absolute(args.get("path") or str(Path.cwd()))
 
+    violation = _check_containment(base, ctx)
+    if violation is not None:
+        return {"ok": False, "error": violation}
+
     if not base.exists():
         return {"ok": False, "error": f"base path not found: {base}"}
     if not base.is_dir():
@@ -210,6 +302,9 @@ async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             iter_ = base.glob(pattern)
         for p in iter_:
             if p.is_file():
+                # 在 workspace_root 设置时，过滤掉 resolve 后逃出根的结果（符号链接防御）
+                if _check_containment(p, ctx) is not None:
+                    continue
                 matches.append(str(p))
                 if len(matches) >= _MAX_GLOB_RESULTS:
                     break
@@ -235,6 +330,10 @@ async def _grep_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     max_results = int(args.get("max_results", _MAX_GREP_MATCHES))
     max_results = min(max_results, _MAX_GREP_MATCHES)
 
+    violation = _check_containment(base, ctx)
+    if violation is not None:
+        return {"ok": False, "error": violation}
+
     if not base.exists():
         return {"ok": False, "error": f"base path not found: {base}"}
 
@@ -251,6 +350,7 @@ async def _grep_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         files = [
             p for p in base.rglob("*")
             if p.is_file() and fnmatch.fnmatch(p.name, glob_filter)
+            and _check_containment(p, ctx) is None
         ]
 
     matches: list[dict[str, Any]] = []
