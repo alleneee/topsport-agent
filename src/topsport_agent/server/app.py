@@ -13,8 +13,10 @@ import importlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import Response
 
 from ..agent.base import Agent
 from ..agent.default import default_agent
@@ -50,6 +52,20 @@ def _build_auth_config(cfg: ServerConfig) -> AuthConfig:
     return AuthConfig(required=True, tokens={})
 
 
+def _wrap_with_metrics(
+    inner: Callable[[LLMProvider, str], Agent],
+    metrics: Any,
+) -> Callable[[LLMProvider, str], Agent]:
+    """在 agent_factory 外层装饰：把 metrics subscriber 挂到新 agent 的 engine。"""
+
+    def factory(provider: LLMProvider, model: str) -> Agent:
+        agent = inner(provider, model)
+        agent.engine._event_subscribers.append(metrics)
+        return agent
+
+    return factory
+
+
 def _default_agent_factory(cfg: ServerConfig) -> Callable[[LLMProvider, str], Agent]:
     """生产默认 Agent：按 ServerConfig 闸门决定是否开 file_ops / skills / plugins。
 
@@ -75,15 +91,24 @@ def create_app(
     provider_name: str = "anthropic",
     provider: LLMProvider | None = None,
     agent_factory: Callable[[LLMProvider, str], Agent] | None = None,
+    metrics: Any | None = None,
 ) -> FastAPI:
     """构造一个绑定好依赖的 FastAPI app。
 
     provider / agent_factory 可由测试注入 mock；生产默认从 env 加载。
+    metrics 是可选的 PrometheusMetrics 实例；传入后暴露 /metrics endpoint
+    并把它注入到每个新 session 的 agent event_subscribers。
     """
 
     cfg = config or ServerConfig.from_env()
-    factory = agent_factory or _default_agent_factory(cfg)
+    raw_factory = agent_factory or _default_agent_factory(cfg)
     auth_config = _build_auth_config(cfg)
+
+    # 若传入 metrics，把它装到每个新 session 的 agent 事件订阅里
+    if metrics is not None:
+        factory = _wrap_with_metrics(raw_factory, metrics)
+    else:
+        factory = raw_factory
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -143,6 +168,14 @@ def create_app(
         if not all(components.values()):
             raise HTTPException(status_code=503, detail={"components": components})
         return {"status": "ready", "components": components}
+
+    if metrics is not None:
+        app.state.metrics = metrics
+
+        @app.get("/metrics")
+        async def metrics_endpoint() -> Response:
+            payload, content_type = metrics.render()
+            return Response(content=payload, media_type=content_type)
 
     app.include_router(chat_router)
     app.include_router(plan_router)
