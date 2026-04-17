@@ -112,10 +112,13 @@ def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
             httpx_module = importlib.import_module(httpx_module_name)
             AsyncClient = httpx_module.AsyncClient
 
+            # H-S1: follow_redirects=False 防 SSRF/metadata 泄露。
+            # 若 MCP server 回 3xx，MCP SDK 会收到重定向响应并自行决定处理；
+            # 这杜绝 httpx 自动把 headers（含 Authorization）重放给重定向目标。
             async with AsyncClient(
                 headers=config.headers or None,
                 timeout=config.timeout,
-                follow_redirects=True,
+                follow_redirects=False,
             ) as http_client:
                 async with streamable_http_client(
                     url=config.url, http_client=http_client

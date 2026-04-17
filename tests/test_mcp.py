@@ -690,3 +690,73 @@ async def test_mcp_tool_source_integrates_with_engine():
     output = tool_result_msg.tool_results[0].output
     assert output["is_error"] is False
     assert "ran echo" in output["text"]
+
+
+# ---------------------------------------------------------------------------
+# H-S1 · MCP HTTP transport: follow_redirects=False
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_http_transport_disables_redirects(monkeypatch) -> None:
+    """httpx.AsyncClient 必须以 follow_redirects=False 构造，防跨域 Authorization 泄露。"""
+    from topsport_agent.mcp import client as client_mod
+    from topsport_agent.mcp.types import MCPServerConfig, MCPTransport
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class _FakeAsyncClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    @contextlib.asynccontextmanager
+    async def _fake_streamable_http(*, url: str, http_client: Any):
+        yield object(), object()  # (read, write) placeholders
+
+    class _FakeSession:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def initialize(self):
+            return None
+
+    def _fake_import(name: str) -> Any:
+        if name == "mcp":
+            return type("M", (), {"ClientSession": _FakeSession, "StdioServerParameters": object})
+        if name == "mcp.client.streamable_http":
+            return type("H", (), {"streamable_http_client": _fake_streamable_http})
+        if name == "httpx":
+            return type("X", (), {"AsyncClient": _FakeAsyncClient})
+        raise ImportError(name)
+
+    monkeypatch.setattr(client_mod, "importlib", type("I", (), {"import_module": staticmethod(_fake_import)}))
+
+    cfg = MCPServerConfig(
+        name="remote",
+        transport=MCPTransport.HTTP,
+        url="https://example.com/mcp",
+        headers={"Authorization": "Bearer secret"},
+        timeout=10.0,
+    )
+    factory = client_mod._make_real_session_factory(cfg)
+
+    async def _run():
+        async with factory():
+            pass
+
+    asyncio.run(_run())
+
+    assert captured_kwargs.get("follow_redirects") is False
+    assert captured_kwargs.get("headers") == {"Authorization": "Bearer secret"}
+    assert captured_kwargs.get("timeout") == 10.0
