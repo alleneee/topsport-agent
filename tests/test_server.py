@@ -555,3 +555,49 @@ def test_plan_execute_clamps_max_steps() -> None:
         # 不关心 SSE 具体内容，只要 200 且流能开起来
         assert r.status_code == 200
         assert app.state.config.max_plan_steps == 3
+
+
+# ---------------------------------------------------------------------------
+# H-S3 · .env 文件属主 + 权限校验
+# ---------------------------------------------------------------------------
+
+
+import os as _os
+
+
+def test_dotenv_loads_when_owned_and_0600(tmp_path, monkeypatch) -> None:
+    from topsport_agent.server.main import _load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text("DOTENV_TEST_VAR=hello\n")
+    _os.chmod(env, 0o600)
+    monkeypatch.delenv("DOTENV_TEST_VAR", raising=False)
+
+    _load_dotenv(env)
+    assert _os.environ["DOTENV_TEST_VAR"] == "hello"
+
+
+def test_dotenv_refuses_world_readable(tmp_path) -> None:
+    from topsport_agent.server.main import _DotenvRefused, _load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text("X=1\n")
+    _os.chmod(env, 0o644)  # group+other readable
+
+    if _os.name != "posix":
+        pytest.skip("permission check is POSIX-only")
+    with pytest.raises(_DotenvRefused, match="permissive mode"):
+        _load_dotenv(env)
+
+
+def test_dotenv_does_not_overwrite_existing_env(tmp_path, monkeypatch) -> None:
+    from topsport_agent.server.main import _load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text("DOTENV_TEST_VAR2=from-file\n")
+    _os.chmod(env, 0o600)
+    monkeypatch.setenv("DOTENV_TEST_VAR2", "from-env")
+
+    _load_dotenv(env)
+    # 已有 env 不覆盖，保持 process env 为权威
+    assert _os.environ["DOTENV_TEST_VAR2"] == "from-env"
