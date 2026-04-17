@@ -52,6 +52,9 @@ class Engine:
         self._post_step_hooks = list(post_step_hooks or [])
         self._event_subscribers = list(event_subscribers or [])
         self._cancel_event = asyncio.Event()
+        # subscriber 失败计数（按 name 分组）。critical=True 的 subscriber 失败
+        # 应该被外部健康检查消费，决定是否标记实例为 degraded。
+        self.subscriber_failures: dict[str, int] = {}
 
     def cancel(self) -> None:
         self._cancel_event.set()
@@ -68,11 +71,21 @@ class Engine:
             try:
                 await subscriber.on_event(event)
             except Exception as exc:
-                _logger.warning(
-                    "event subscriber %r failed on %s: %r",
-                    getattr(subscriber, "name", type(subscriber).__name__),
+                sub_name = getattr(
+                    subscriber, "name", type(subscriber).__name__
+                )
+                is_critical = bool(getattr(subscriber, "critical", False))
+                self.subscriber_failures[sub_name] = (
+                    self.subscriber_failures.get(sub_name, 0) + 1
+                )
+                log_level = logging.ERROR if is_critical else logging.WARNING
+                _logger.log(
+                    log_level,
+                    "event subscriber %r failed on %s: %r%s",
+                    sub_name,
                     event.type.value,
                     exc,
+                    " [CRITICAL]" if is_critical else "",
                 )
 
     async def _snapshot_tools(self) -> list[ToolSpec]:

@@ -44,7 +44,12 @@ class PostStepHook(Protocol):
 
 
 class EventSubscriber(Protocol):
-    """接收完整生命周期事件流，单个 subscriber 异常不影响引擎和其它 subscriber。"""
+    """接收完整生命周期事件流，单个 subscriber 异常不影响引擎和其它 subscriber。
+
+    critical 标记（可选，默认 False）—— True 表示该 subscriber 的失败是合规/审计
+    层面的大事：引擎仍然不中断，但失败会被计入 Engine.subscriber_failures，
+    便于外部健康检查读取、触发告警或拒绝继续接受新会话。
+    """
 
     name: str
 
