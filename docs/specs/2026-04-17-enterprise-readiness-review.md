@@ -213,3 +213,14 @@ Issues and PRs referencing this document should tag `[review-2026-04-17]` so pro
 - `deferred` with target phase.
 
 Until all Critical items are `resolved`, the service MUST NOT be exposed on a network that is not fully operator-controlled.
+
+### Status (2026-04-17, post-Phase-0)
+
+| Finding | Status     | Commit     | Notes                                                                                     |
+| ------- | ---------- | ---------- | ----------------------------------------------------------------------------------------- |
+| CR-01   | `resolved` | `b33d1e1`  | `AuthConfig` + principal namespacing + secure-by-default + `/readyz` + `max_plan_steps`   |
+| CR-02   | `resolved` | `93635e1`  | `MCPSecurityPolicy` + shell-interpreter basename block + allowlist `(name, cmd, prefix)`  |
+| CR-03   | `resolved` | `7a1ca81`  | `argv: list[str]` + `create_subprocess_exec` + `PluginSecurityPolicy`; shell-meta regression lock |
+| CR-04   | `resolved` | `df3f443`  | `ToolContext.workspace_root` + symlink rejection + `os.replace` atomic write + edit lock  |
+
+Phase 0 complete. The service is now safe to run behind an operator-controlled ingress with a bearer token. Phase 1 (H-S1..6, H-R1..8) begins next.
