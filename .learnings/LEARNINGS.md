@@ -313,3 +313,61 @@ inventing a new one. The cost is zero; the interop benefit is large.
 
 **Evidence:** `src/topsport_agent/mcp/config.py`,
 `tests/test_mcp.py::test_load_mcp_config_stdio_and_http`.
+
+---
+
+## Playwright click fails in nested iframes with "outside of the viewport"
+
+**Context:** Automating a JD merchant backend demo where target buttons live in
+a deeply nested iframe (`shop.jd.com/jdm/legacy/...` hosts `mc.jd.com/...`
+inside it). `Locator.click()` on the inner-frame button kept retrying with
+`element is visible, enabled and stable — scrolling into view if needed — done
+scrolling — element is outside of the viewport` until timeout, even after
+`scroll_into_view_if_needed`.
+
+**Learned:** Playwright's click uses the outer page's viewport to judge
+visibility. For elements inside a cross-origin child frame, the coordinate
+transform between frame and page can leave the element perpetually "outside"
+from the engine's point of view. Workaround: trigger the click inside the
+frame via raw DOM:
+
+```python
+await target_frame.evaluate("""() => {
+  const btns = [...document.querySelectorAll('button')].filter(
+    b => (b.innerText||'').trim() === '立即报名'
+  );
+  btns[0].scrollIntoView({behavior:'instant', block:'center'});
+  btns[0].click();
+}""")
+```
+
+This trades Playwright's actionability guarantees for a JS call — fine for
+exploratory automation, risky for production test suites (no auto-wait).
+
+Also important: when selecting the right child frame, **use
+`fr.url.startswith("https://mc.jd.com")` not `"mc.jd.com" in fr.url`** — the
+wrapper page's URL contains the child origin in its path, so `in` matches
+both frames and picks the wrong one.
+
+**Evidence:** `scripts/jd_demo/stage5_signup.py`,
+`.claude/skills/jd-merchant-activity-signup/SKILL.md`.
+
+---
+
+## `uv run python` silently buffers stdout when backgrounded
+
+**Context:** Launching a Playwright demo script via Bash `run_in_background=true`;
+Python `print` output never appeared in the log file, making it look like the
+script hung.
+
+**Learned:** When stdout is not a TTY (any pipe/file/background redirect),
+CPython switches to block buffering. The process was fine — its prints were
+sitting in the buffer. Fix: export `PYTHONUNBUFFERED=1` (or run `python -u`,
+or `sys.stdout.reconfigure(line_buffering=True)`). `uv run` doesn't add
+`-u` automatically.
+
+Diagnostic tell: if the file is 0 bytes but `ps` shows the process is still
+running and doing work, it's buffering, not hanging. Don't kill it.
+
+**Evidence:** `scripts/jd_demo/` (all stages use `PYTHONUNBUFFERED=1` in the
+bash invocation).
