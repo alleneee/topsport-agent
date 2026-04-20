@@ -245,12 +245,14 @@ green; optional deps `api`, `metrics`, `llm`, `mcp`, `tracing` all covered.
 | H-A3       | `resolved`    | `78ecb94`  | `Engine.tool_source_names()` / `add_event_subscriber()` / `capabilities_report()` public  |
 | H-A4       | `resolved`    | `ae24216`  | `StructuredOutputProvider` Protocol + `Planner` fallback to tool-call emulation           |
 | H-A2 (spawn_agent) | `resolved` | `b191fcd` | `Agent.spawn_child` inherits parent's context_providers / tool_sources / hooks / subscribers |
-| H-A2 (Orchestrator) | `deferred` | —          | `/v1/plan/execute` still builds bare Engine; tracked for Phase 3                          |
+| H-A2 (Orchestrator) | `resolved` | `2c064f6` | `Orchestrator(parent_agent=...)` + `_spawn_via_parent`; `/v1/plan/execute` builds & closes a per-request parent Agent |
 | H-A1       | `deferred`    | —          | `CapabilityModule` refactor of `Agent.from_config` tracked for Phase 3                    |
 
-Phase 2 key win: sub-agents spawned via the `spawn_agent` tool now see the same
-Langfuse traces, Prometheus metrics, memory state, skills, and compaction as the
-parent agent. The three-reviewer consensus item is resolved for that path. The
-orchestrator-facing half remains for Phase 3.
+Phase 2 key win: sub-agents spawned via the `spawn_agent` tool AND plan steps
+executed via `/v1/plan/execute` now see the same Langfuse traces, Prometheus
+metrics, memory state, skills, and compaction as the parent chat agent. The
+three-reviewer consensus item is fully resolved.
 
-480/480 suite green as of commit `b191fcd`.
+482/482 suite green as of commit `2c064f6`. Only H-A1 (capability module
+refactor — pure code quality, non-blocking) remains in the Architecture High
+bucket.
