@@ -79,7 +79,14 @@ async def plan_execute(
     # 服务端 clamp：客户端的 max_steps 不得越过运营预算的硬上限
     effective_max_steps = min(body.max_steps, cfg.max_plan_steps)
 
-    # 对外执行默认不带 file_tools —— 除非 operator 显式 ENABLE_FILE_TOOLS=true
+    # H-A2（Orchestrator 侧）：为这次 plan 执行专门构造一个父 Agent；每个 step 通过
+    # parent.spawn_child 继承 Agent 的全部非 tool 能力（skills / memory / compaction
+    # / tracing / metrics / plugin hooks），与 /v1/chat/completions 行为对齐。
+    agent_factory = getattr(request.app.state, "agent_factory", None)
+    parent_agent = agent_factory(provider, model) if agent_factory is not None else None
+
+    # tool 层面：enable_file_tools=False 时子代理不可见 file_tools；即便 parent_agent
+    # 的 file_ops 被某些配置打开，这里用空 tools 列表会通过 allowed_tool_names=[] 收窄。
     tools = file_tools() if cfg.enable_file_tools else []
 
     sub_config = SubAgentConfig(
@@ -88,18 +95,19 @@ async def plan_execute(
         tools=tools,
         max_steps=effective_max_steps,
     )
-    orchestrator = Orchestrator(plan, sub_config)
+    orchestrator = Orchestrator(plan, sub_config, parent_agent=parent_agent)
     _logger.info(
-        "plan.execute principal=%s plan_id=%s steps=%d max_steps=%d file_tools=%s",
+        "plan.execute principal=%s plan_id=%s steps=%d max_steps=%d file_tools=%s parent_agent=%s",
         principal,
         plan.id,
         len(plan.steps),
         effective_max_steps,
         cfg.enable_file_tools,
+        parent_agent is not None,
     )
 
     return StreamingResponse(
-        _stream_plan(orchestrator, request),
+        _stream_plan(orchestrator, request, parent_agent),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -119,7 +127,9 @@ _EVENT_NAME_MAP = {
 
 
 async def _stream_plan(
-    orchestrator: Orchestrator, request: Request
+    orchestrator: Orchestrator,
+    request: Request,
+    parent_agent: object | None = None,
 ) -> AsyncIterator[str]:
     disconnected = False
     try:
@@ -146,3 +156,11 @@ async def _stream_plan(
     finally:
         if disconnected:
             yield sse_event("cancelled", {"reason": "client_disconnected"})
+        # plan 专用的 parent Agent 本次请求用完必须关闭，释放 browser / plugins 等资源
+        if parent_agent is not None:
+            try:
+                close = getattr(parent_agent, "close", None)
+                if close is not None:
+                    await close()
+            except Exception:
+                _logger.warning("failed to close plan parent agent", exc_info=True)

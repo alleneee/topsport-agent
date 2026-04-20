@@ -133,6 +133,7 @@ def create_app(
         app.state.provider = prov
         app.state.provider_name = provider_name
         app.state.session_store = store
+        app.state.agent_factory = factory
         app.state.config = cfg
         app.state.auth_config = auth_config
         app.state.draining = False

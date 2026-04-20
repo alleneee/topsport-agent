@@ -577,3 +577,104 @@ class TestFailureHandler:
 
         assert calls == ["first"]
         assert any(e.type == EventType.PLAN_FAILED for e in events)
+
+
+# ---------------------------------------------------------------------------
+# H-A2（Orchestrator 侧）· parent_agent 能力继承
+# ---------------------------------------------------------------------------
+
+
+async def test_orchestrator_with_parent_agent_inherits_capabilities() -> None:
+    """Orchestrator 挂 parent_agent 时，每个 step 的子 Engine 带父的订阅者与 provider。"""
+    from topsport_agent.agent import Agent, AgentConfig
+    from topsport_agent.engine import Engine, EngineConfig
+    from topsport_agent.engine.orchestrator import Orchestrator, SubAgentConfig
+    from topsport_agent.llm.provider import LLMResponse
+    from topsport_agent.llm.request import LLMRequest
+    from topsport_agent.types.plan import Plan, PlanStep
+
+    class _ES:
+        name = "inherited-subscriber"
+
+        def __init__(self):
+            self.got: list[str] = []
+
+        async def on_event(self, event):
+            self.got.append(event.type.value)
+
+    class _P:
+        name = "p"
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            return LLMResponse(text="step done", finish_reason="stop")
+
+    provider = _P()
+    subscriber = _ES()
+    config = AgentConfig(
+        name="p", description="", system_prompt="", model="m",
+        enable_skills=False, enable_memory=False, enable_plugins=False,
+        enable_browser=False,
+    )
+    parent_engine = Engine(provider, tools=[], config=EngineConfig(model="m"))
+    parent_bundle = {
+        "tools": [],
+        "context_providers": [],
+        "tool_sources": [],
+        "post_step_hooks": [],
+        "event_subscribers": [subscriber],
+    }
+    parent = Agent(
+        provider=provider,
+        config=config,
+        engine=parent_engine,
+        capability_bundle=parent_bundle,
+    )
+
+    plan = Plan(
+        id="plan-a",
+        goal="g",
+        steps=[PlanStep(id="s1", title="t1", instructions="do 1")],
+    )
+    orchestrator = Orchestrator(
+        plan,
+        SubAgentConfig(provider=provider, model="m"),  # type: ignore[arg-type]
+        parent_agent=parent,
+    )
+
+    async for _ in orchestrator.execute():
+        pass
+
+    assert plan.steps[0].status.value == "done"
+    # 订阅者在子 step 执行期间被触发过（至少 run.start / run.end）
+    assert "run.start" in subscriber.got
+    assert "run.end" in subscriber.got
+
+
+async def test_orchestrator_without_parent_agent_backward_compatible() -> None:
+    """无 parent_agent 时保持旧 SubAgentConfig 路径行为。"""
+    from topsport_agent.engine.orchestrator import Orchestrator, SubAgentConfig
+    from topsport_agent.llm.provider import LLMResponse
+    from topsport_agent.llm.request import LLMRequest
+    from topsport_agent.types.plan import Plan, PlanStep
+
+    class _P:
+        name = "p"
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            return LLMResponse(text="legacy path", finish_reason="stop")
+
+    plan = Plan(
+        id="plan-b",
+        goal="g",
+        steps=[PlanStep(id="s1", title="t", instructions="x")],
+    )
+    orchestrator = Orchestrator(
+        plan,
+        SubAgentConfig(provider=_P(), model="m"),  # type: ignore[arg-type]
+    )
+
+    async for _ in orchestrator.execute():
+        pass
+
+    assert plan.steps[0].status.value == "done"
+    assert plan.steps[0].result == "legacy path"

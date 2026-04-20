@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..llm.provider import LLMProvider
 from ..types.events import Event, EventType
@@ -14,6 +14,10 @@ from ..types.session import RunState, Session
 from ..types.tool import ToolSpec
 from .hooks import ContextProvider, EventSubscriber, FailureHandler, StepConfigurator, ToolSource
 from .loop import Engine, EngineConfig
+
+if TYPE_CHECKING:
+    # 仅类型标注用；Agent 位于上层包 agent/，运行时循环依赖通过延迟引用避开。
+    from ..agent.base import Agent
 
 _logger = logging.getLogger(__name__)
 
@@ -40,9 +44,17 @@ class Orchestrator:
         step_configurators: list[StepConfigurator] | None = None,
         failure_handlers: list[FailureHandler] | None = None,
         event_subscribers: list[EventSubscriber] | None = None,
+        parent_agent: Agent | None = None,
     ) -> None:
+        """H-A2（Orchestrator 侧）：若给 parent_agent，每个 step 通过
+        parent_agent.spawn_child 继承父 Agent 的 context_providers / tool_sources /
+        post_step_hooks / event_subscribers —— plan step 自动获得 skills / memory /
+        compaction / tracing / metrics 等能力，与 /v1/chat/completions 行为对齐。
+        未传 parent_agent 时回退到 SubAgentConfig 的老路径以保持兼容。
+        """
         self._plan = plan
         self._config = agent_config
+        self._parent_agent = parent_agent
         self._step_configurators = list(step_configurators or [])
         self._failure_handlers = list(failure_handlers or [])
         self._event_subscribers = list(event_subscribers or [])
@@ -164,8 +176,12 @@ class Orchestrator:
     async def _run_step(self, step: PlanStep, config: SubAgentConfig) -> None:
         # 跑完整个子代理循环，最终把引擎结果映射回 step 状态。引擎结束后立即从存活表移除。
         try:
-            engine = self._create_engine(step, config)
-            session = self._create_session(step)
+            if self._parent_agent is not None:
+                session, engine = await self._spawn_via_parent(step, config)
+            else:
+                engine = self._create_engine(step, config)
+                session = self._create_session(step)
+            self._sub_engines[step.id] = engine
 
             async for _ in engine.run(session):
                 pass
@@ -182,6 +198,31 @@ class Orchestrator:
             step.status = StepStatus.FAILED
             step.error = f"{type(exc).__name__}: {exc}"
             self._sub_engines.pop(step.id, None)
+
+    async def _spawn_via_parent(
+        self, step: PlanStep, config: SubAgentConfig
+    ) -> tuple[Session, Engine]:
+        """走 parent_agent.spawn_child 路径：继承所有非 tool 能力。
+        config.tools 如果为空，仍然使用父 Agent 的全部工具；非空则按名字过滤（与
+        spawn_agent 的 allowed_tools 语义一致）。
+        """
+        assert self._parent_agent is not None
+        allowed = [t.name for t in config.tools] if config.tools else None
+        session, engine = await self._parent_agent.spawn_child(
+            model=config.model,
+            system_prompt=(
+                "You are a sub-agent executing one step of a larger plan. "
+                "Complete the task described below."
+            ),
+            task=f"## Task: {step.title}\n\n{step.instructions}",
+            allowed_tool_names=allowed,
+            session_id_prefix=f"{self._plan.id}:{step.id}",
+        )
+        session.goal = step.title
+        # 把 orchestrator 自己订阅者也挂到子引擎（和旧路径一致）
+        for sub in self._event_subscribers:
+            engine.add_event_subscriber(sub)
+        return session, engine
 
     async def execute(self) -> AsyncIterator[Event]:
         # 主循环：按波次推进 DAG，每波取出所有无前置依赖的 ready step 并行执行。
