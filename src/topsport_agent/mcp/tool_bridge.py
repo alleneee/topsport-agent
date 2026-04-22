@@ -35,11 +35,14 @@ class MCPToolSource:
         raw_name = getattr(mcp_tool, "name", "")
         description = getattr(mcp_tool, "description", None) or ""
         schema = getattr(mcp_tool, "inputSchema", None) or {"type": "object"}
+        # MCP 服务器来自不可信第三方（本地/远端皆然），返回内容视为 untrusted，
+        # 交给 Engine 的 sanitizer 做 prompt injection 防御。
         return ToolSpec(
             name=f"{self._prefix}{raw_name}",
             description=description,
             parameters=schema,
             handler=self._make_handler(raw_name),
+            trust_level="untrusted",
         )
 
     def _make_handler(self, raw_name: str):

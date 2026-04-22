@@ -17,6 +17,7 @@ from typing import Any
 
 from ..engine import Engine, EngineConfig
 from ..engine.hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
+from ..engine.sanitizer import ToolResultSanitizer
 from ..llm.provider import LLMProvider
 from ..memory.file_store import FileMemoryStore
 from ..memory.injector import MemoryInjector
@@ -67,6 +68,10 @@ class AgentConfig:
     extra_tool_sources: list[ToolSource] = field(default_factory=list)
     extra_post_step_hooks: list[PostStepHook] = field(default_factory=list)
     extra_event_subscribers: list[EventSubscriber] = field(default_factory=list)
+
+    # Prompt injection 防御：None 表示禁用（Engine 对 untrusted 工具结果不做消毒）。
+    # 非 None 时 Engine 对 untrusted 工具结果做消毒并注入 security guard。
+    sanitizer: ToolResultSanitizer | None = None
 
     # 其它 engine 级选项
     provider_options: dict[str, Any] | None = None
@@ -218,6 +223,7 @@ class Agent:
             tool_sources=tool_sources,
             post_step_hooks=post_step_hooks,
             event_subscribers=event_subscribers,
+            sanitizer=config.sanitizer,
         )
 
         bundle: dict[str, Any] = {
@@ -226,6 +232,7 @@ class Agent:
             "tool_sources": list(tool_sources),
             "post_step_hooks": list(post_step_hooks),
             "event_subscribers": list(event_subscribers),
+            "sanitizer": config.sanitizer,
         }
 
         agent = cls(
@@ -289,6 +296,7 @@ class Agent:
             event_subscribers=list(
                 self._capability_bundle.get("event_subscribers", [])
             ),
+            sanitizer=self._capability_bundle.get("sanitizer"),
         )
         sub_session = Session(
             id=f"{session_id_prefix}:{uuid.uuid4().hex[:8]}",

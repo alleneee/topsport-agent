@@ -170,7 +170,17 @@ async def _stream_chat(
             entry.agent.cancel()
             raise
         except Exception as exc:
-            _logger.exception("chat stream failed")
+            _logger.exception(
+                "chat stream failed",
+                extra={
+                    "event": "chat_stream_failed",
+                    "session_id": entry.session.id,
+                    "tenant_id": entry.session.tenant_id,
+                    "principal": entry.session.principal,
+                    "chat_id": chat_id,
+                    "model": model,
+                },
+            )
             yield sse_data({"error": {"message": str(exc), "type": type(exc).__name__}})
 
         # provider 不支持流式时没有 delta，补发本轮新增的 assistant 文本

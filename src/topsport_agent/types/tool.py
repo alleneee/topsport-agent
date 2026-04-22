@@ -29,8 +29,13 @@ class ToolSpec:
     """ToolSpec 是工具的完整描述：名称、JSON Schema 参数定义、异步 handler。
 
     引擎每步通过 _snapshot_tools 快照当前工具列表，不跨步缓存，保证动态工具源的实时性。
+
+    trust_level: "trusted"（默认）对结果不做修改；"untrusted" 表示工具返回内容来自
+    外部不可信源（浏览器网页、第三方 MCP 服务器等），Engine 若配了 sanitizer 会在
+    结果落入 session.messages 前做注入防御处理。
     """
     name: str
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
+    trust_level: str = "trusted"

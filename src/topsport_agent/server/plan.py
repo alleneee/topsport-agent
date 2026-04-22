@@ -104,6 +104,15 @@ async def plan_execute(
         effective_max_steps,
         cfg.enable_file_tools,
         parent_agent is not None,
+        extra={
+            "event": "plan_execute",
+            "principal": principal,
+            "plan_id": plan.id,
+            "step_count": len(plan.steps),
+            "max_steps": effective_max_steps,
+            "file_tools_enabled": cfg.enable_file_tools,
+            "parent_agent": parent_agent is not None,
+        },
     )
 
     # 如果启用 sandbox，plan 的所有子 step session id 都以 f"{plan_id}:" 开头
@@ -176,7 +185,13 @@ async def _stream_plan(
     except Exception as exc:
         # SEC-005 防御：对外只返回异常类型 + 通用消息，完整 exc 只写服务端日志。
         # 避免 provider 异常 / 栈信息中的 URL、headers、API key 片段外泄给客户端。
-        _logger.exception("plan stream failed")
+        _logger.exception(
+            "plan stream failed",
+            extra={
+                "event": "plan_stream_failed",
+                "plan_id": getattr(getattr(orchestrator, "plan", None), "id", None),
+            },
+        )
         yield sse_event("error", {
             "type": type(exc).__name__,
             "message": "plan execution failed",

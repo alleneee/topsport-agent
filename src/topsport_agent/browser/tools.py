@@ -57,6 +57,7 @@ class BrowserToolSource:
                 "required": ["url"],
             },
             handler=handler,
+            trust_level="untrusted",
         )
 
     def _snapshot_spec(self) -> ToolSpec:
@@ -81,6 +82,7 @@ class BrowserToolSource:
             ),
             parameters={"type": "object", "properties": {}},
             handler=handler,
+            trust_level="untrusted",
         )
 
     def _click_spec(self) -> ToolSpec:
@@ -186,4 +188,5 @@ class BrowserToolSource:
                 },
             },
             handler=handler,
+            trust_level="untrusted",
         )

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from typing import Any
+
 from ..engine.hooks import ToolSource
+from ..engine.sanitizer import DefaultSanitizer, ToolResultSanitizer
 from ..llm.provider import LLMProvider
 from ..tools import file_tools
 from ..types.tool import ToolSpec
 from .base import Agent, AgentConfig
+
+# sentinel：区分"未传 sanitizer"和"显式传 None 关闭"。
+_DEFAULT = object()
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are topsport-agent, a versatile assistant with access to skills, "
@@ -40,15 +46,23 @@ def default_agent(
     local_skill_dirs: list[Path] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_tool_sources: list[ToolSource] | None = None,
+    sanitizer: Any = _DEFAULT,
 ) -> Agent:
     """标准 Agent 配置：skills + memory + plugins + file_ops + 可选 browser。
 
     extra_tool_sources: 运行时扩展工具源（如 MCP / OpenSandbox）；透传给 AgentConfig。
+    sanitizer: 省略则默认启用 DefaultSanitizer（对 untrusted 工具结果做 prompt
+        injection 防御）；显式传 None 则关闭。
     """
     tools: list[ToolSpec] = list(extra_tools or [])
     if enable_file_ops:
         # 文件工具放最前：优先级高，且用户自定义的 extra_tools 不会覆盖名称冲突
         tools = file_tools() + tools
+    effective_sanitizer: ToolResultSanitizer | None
+    if sanitizer is _DEFAULT:
+        effective_sanitizer = DefaultSanitizer()
+    else:
+        effective_sanitizer = sanitizer
     config = AgentConfig(
         name=name,
         description=description,
@@ -63,5 +77,6 @@ def default_agent(
         local_skill_dirs=local_skill_dirs or [Path.home() / ".claude" / "skills"],
         extra_tools=tools,
         extra_tool_sources=list(extra_tool_sources or []),
+        sanitizer=effective_sanitizer,
     )
     return Agent.from_config(provider, config)

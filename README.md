@@ -527,6 +527,49 @@ Lifecycle:
   context manager that yields a session-shaped object, so tests run without the
   real `mcp` package installed.
 
+## Structured Logging
+
+Stdlib `logging` output can be switched to single-line JSON for log aggregation
+platforms (ELK, Loki, Datadog). No extra dependency.
+
+Enable at the server boot:
+
+```bash
+LOG_FORMAT=json LOG_LEVEL=INFO uv run topsport-agent-serve
+```
+
+Or programmatically:
+
+```python
+import logging
+from topsport_agent.observability.logging import configure_json_logging
+
+configure_json_logging(level=logging.INFO)
+
+_logger = logging.getLogger("topsport_agent.app")
+_logger.warning(
+    "session closed",
+    extra={"session_id": sid, "tenant_id": tid, "principal": user},
+)
+```
+
+Output:
+
+```json
+{"ts":"2026-04-22T09:18:22+00:00","level":"WARNING","logger":"topsport_agent.app","msg":"session closed","session_id":"sess-abc","tenant_id":"t1","principal":"niko"}
+```
+
+Reserved fields: `ts`, `level`, `logger`, `msg`. Any keys passed via `extra={}`
+are merged alongside the reserved fields. Exceptions render as `exc` with the
+full traceback string.
+
+The hot server paths (`chat_stream_failed`, `plan_stream_failed`,
+`session_create_hook_failed`, `session_close_hook_failed`, `plan_execute`) emit
+`event` + `session_id` / `tenant_id` / `principal` / `plan_id` via `extra={}`
+so log filters can scope by tenant or session without regex parsing.
+
+`configure_json_logging` is idempotent — repeated calls do not stack handlers.
+
 ## Tracing with Langfuse
 
 Install the optional dependency group:
@@ -656,6 +699,62 @@ async for event in orch.execute():
 | `plan.waiting` | Orchestrator paused, waiting for user decision |
 | `plan.done` | All steps completed or skipped |
 | `plan.failed` | Plan aborted or no ready steps remain |
+
+## Security — Prompt Injection Guard
+
+`browser_*` and `mcp.<server>.<tool>` return content from external, untrusted
+sources (web pages, third-party MCP servers). Without defense, an attacker can
+embed directives like `IGNORE PREVIOUS INSTRUCTIONS...` in a page or an MCP
+response and hijack the next LLM turn.
+
+The engine ships a defense-in-depth guard with two layers:
+
+1. **Content sanitizer** (`engine.sanitizer.DefaultSanitizer`)
+   - `ToolSpec.trust_level = "untrusted"` (set on `browser_navigate`,
+     `browser_snapshot`, `browser_get_text`, and every bridged MCP tool) flags a
+     tool as an untrusted source.
+   - Results from untrusted tools are stripped of zero-width characters and
+     HTML/XML comments, and common injection patterns
+     (`ignore previous instructions`, `SYSTEM:`, `you are now`, `<system>`,
+     `[admin mode]`, `bypass safety`, etc.) are replaced by
+     `[filtered:prompt-injection-guard]`.
+   - The payload is wrapped in
+     `<tool_output trust="untrusted">...</tool_output>` fences so the LLM can
+     syntactically distinguish data from instructions.
+
+2. **System prompt guard** — when a sanitizer is attached, the engine injects a
+   `<security>` section into the system prompt explaining the fence semantics
+   and telling the model to treat fenced content as data, never as commands.
+
+### Defaults
+
+- `default_agent()` enables `DefaultSanitizer` unless `sanitizer=None` is passed.
+- HTTP server: `PROMPT_INJECTION_GUARD=true` (env) / `prompt_injection_guard: True`
+  (config) — the server factory wires a `DefaultSanitizer` into every agent it
+  creates.
+- Trusted tools (`ToolSpec.trust_level = "trusted"`, the default) always pass
+  through unmodified.
+
+### Disabling
+
+```python
+agent = default_agent(provider=..., model=..., sanitizer=None)
+```
+
+or
+
+```bash
+PROMPT_INJECTION_GUARD=false uv run topsport-agent-serve
+```
+
+### Caveats
+
+The guard is defense-in-depth, not a silver bullet:
+
+- A sufficiently disguised instruction may bypass the regex set.
+- LLMs can still be confused; the `<security>` guidance is advisory.
+- Do **not** remove human-in-the-loop for high-privilege tools because a
+  sanitizer is enabled. Layer approvals for destructive actions.
 
 ## Verified invariants
 

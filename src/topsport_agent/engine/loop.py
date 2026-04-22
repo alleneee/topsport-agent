@@ -15,6 +15,7 @@ from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
 from .prompt import PromptBuilder, SectionPriority
+from .sanitizer import SECURITY_GUARD_CONTENT, SECURITY_GUARD_TAG, ToolResultSanitizer
 
 _logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ class Engine:
         tool_sources: list[ToolSource] | None = None,
         post_step_hooks: list[PostStepHook] | None = None,
         event_subscribers: list[EventSubscriber] | None = None,
+        sanitizer: ToolResultSanitizer | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -73,6 +75,10 @@ class Engine:
         self._tool_sources = list(tool_sources or [])
         self._post_step_hooks = list(post_step_hooks or [])
         self._event_subscribers = list(event_subscribers or [])
+        # sanitizer 为 None 时 Engine 行为与加入该字段前完全一致（向后兼容）。
+        # 非 None 时对 untrusted 工具结果做 prompt injection 防御，并在 system
+        # prompt 里注入 security guard section 告知 LLM 围栏语义。
+        self._sanitizer = sanitizer
         self._cancel_event = asyncio.Event()
         # subscriber 失败计数（按 name 分组）。critical=True 的 subscriber 失败
         # 应该被外部健康检查消费，决定是否标记实例为 degraded。
@@ -174,6 +180,15 @@ class Engine:
         # session.system_prompt 是最高优先级的 section
         if session.system_prompt:
             builder.add("system-prompt", session.system_prompt, SectionPriority.SYSTEM_PROMPT)
+
+        # sanitizer 开启时注入 security guard，解释 <tool_output> 围栏语义给 LLM。
+        # 放在 INSTRUCTIONS 优先级附近，确保处于 system prompt 较显著位置。
+        if self._sanitizer is not None:
+            builder.add(
+                SECURITY_GUARD_TAG,
+                SECURITY_GUARD_CONTENT,
+                SectionPriority.INSTRUCTIONS,
+            )
 
         non_system: list[Message] = []
         for msg in ephemeral:
@@ -485,7 +500,9 @@ class Engine:
                     output=f"tool '{call.name}' not registered",
                     is_error=True,
                 )
+                trust_level = "trusted"
             else:
+                trust_level = getattr(tool, "trust_level", "trusted")
                 try:
                     # 工具上下文把取消信号和调用元信息一起传给 handler。
                     ctx = ToolContext(
@@ -502,6 +519,23 @@ class Engine:
                         call_id=call.id,
                         output=f"{type(exc).__name__}: {exc}",
                         is_error=True,
+                    )
+
+            # Prompt injection 防御：untrusted 工具结果在落入 session.messages 前消毒。
+            # sanitizer 为 None 时直通，保证向后兼容。
+            if self._sanitizer is not None:
+                try:
+                    result = self._sanitizer.sanitize(result, trust_level=trust_level)
+                except Exception:
+                    _logger.warning(
+                        "sanitizer failed for tool %s, passing through",
+                        call.name,
+                        extra={
+                            "session_id": session.id,
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                        },
+                        exc_info=True,
                     )
 
             # 工具结果也写回会话，供下一轮 LLM 继续读取和推理。

@@ -118,6 +118,13 @@ class SessionStore:
                     _logger.warning(
                         "session create hook %r failed for sid=%s: %r",
                         getattr(hook, "__qualname__", hook), sid, exc,
+                        extra={
+                            "event": "session_create_hook_failed",
+                            "session_id": sid,
+                            "tenant_id": tenant_id,
+                            "principal": principal,
+                            "hook": getattr(hook, "__qualname__", str(hook)),
+                        },
                     )
             return sid, entry, True
 
@@ -146,6 +153,11 @@ class SessionStore:
                 _logger.warning(
                     "session close hook %r failed for sid=%s: %r",
                     getattr(hook, "__qualname__", hook), sid, exc,
+                    extra={
+                        "event": "session_close_hook_failed",
+                        "session_id": sid,
+                        "hook": getattr(hook, "__qualname__", str(hook)),
+                    },
                 )
         try:
             await entry.agent.close()

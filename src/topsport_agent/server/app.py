@@ -23,7 +23,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..agent.base import Agent
 from ..agent.default import default_agent
+from ..engine.sanitizer import DefaultSanitizer
 from ..llm.provider import LLMProvider
+from ..observability.logging import configure_json_logging
 from .auth import AuthConfig
 from .chat import router as chat_router
 from .config import ServerConfig
@@ -87,6 +89,8 @@ def _default_agent_factory(
     """
     # sandbox 启用时本地 file_ops 必须关，避免两条路径并存的逃逸风险
     file_ops_enabled = cfg.enable_file_tools and sandbox_pool is None
+    # Prompt injection guard：按 config 决定是否给新 agent 配 sanitizer。
+    sanitizer = DefaultSanitizer() if cfg.prompt_injection_guard else None
 
     def factory(provider: LLMProvider, model: str) -> Agent:
         extra_tool_sources: list[Any] = []
@@ -103,6 +107,7 @@ def _default_agent_factory(
             enable_browser=False,
             enable_file_ops=file_ops_enabled,
             extra_tool_sources=extra_tool_sources or None,
+            sanitizer=sanitizer,
         )
 
     return factory
@@ -143,6 +148,10 @@ def create_app(
     """
 
     cfg = config or ServerConfig.from_env()
+    # 结构化日志：进程级一次性配置，幂等可重入（重复 create_app 不重复挂 handler）。
+    if cfg.log_format == "json":
+        level = getattr(logging, cfg.log_level, logging.INFO)
+        configure_json_logging(level=level)
     auth_config = _build_auth_config(cfg)
 
     # sandbox pool：测试注入优先；否则按 cfg.sandbox_enabled 构造
