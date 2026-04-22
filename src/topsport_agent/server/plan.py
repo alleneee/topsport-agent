@@ -106,8 +106,28 @@ async def plan_execute(
         parent_agent is not None,
     )
 
+    # 如果启用 sandbox，plan 的所有子 step session id 都以 f"{plan_id}:" 开头
+    # （见 orchestrator._create_session / _spawn_via_parent 的 session_id_prefix），
+    # 传给 _stream_plan 以便 finally 时统一 release。
+    sandbox_pool = getattr(request.app.state, "sandbox_pool", None)
+    sandbox_prefix = f"{plan.id}:" if sandbox_pool is not None else None
+    # tenant = principal（与 chat 路径对齐）：预绑定 prefix → tenant，让 plan 子 step
+    # 的首次 acquire 走 per_tenant_max_sandboxes 配额，而不是绕过去。
+    if sandbox_pool is not None and sandbox_prefix is not None:
+        try:
+            sandbox_pool.bind_tenant_prefix(sandbox_prefix, principal)
+        except Exception:
+            _logger.warning(
+                "plan.sandbox bind_tenant_prefix failed prefix=%s",
+                sandbox_prefix, exc_info=True,
+            )
+
     return StreamingResponse(
-        _stream_plan(orchestrator, request, parent_agent),
+        _stream_plan(
+            orchestrator, request, parent_agent,
+            sandbox_pool=sandbox_pool,
+            sandbox_prefix=sandbox_prefix,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -130,6 +150,9 @@ async def _stream_plan(
     orchestrator: Orchestrator,
     request: Request,
     parent_agent: object | None = None,
+    *,
+    sandbox_pool: object | None = None,
+    sandbox_prefix: str | None = None,
 ) -> AsyncIterator[str]:
     disconnected = False
     try:
@@ -151,11 +174,31 @@ async def _stream_plan(
         orchestrator.cancel()
         raise
     except Exception as exc:
+        # SEC-005 防御：对外只返回异常类型 + 通用消息，完整 exc 只写服务端日志。
+        # 避免 provider 异常 / 栈信息中的 URL、headers、API key 片段外泄给客户端。
         _logger.exception("plan stream failed")
-        yield sse_event("error", {"message": str(exc), "type": type(exc).__name__})
+        yield sse_event("error", {
+            "type": type(exc).__name__,
+            "message": "plan execution failed",
+        })
     finally:
         if disconnected:
             yield sse_event("cancelled", {"reason": "client_disconnected"})
+        # Plan 子 step 创建的沙箱要显式回收，否则要等 sandbox_timeout（30min）
+        # 才被 OpenSandbox server 自然清理；多租户下这会长期占用配额。
+        if sandbox_pool is not None and sandbox_prefix:
+            try:
+                released = await sandbox_pool.release_by_prefix(sandbox_prefix)  # type: ignore[attr-defined]
+                if released:
+                    _logger.info(
+                        "plan.sandbox cleanup prefix=%s released=%d",
+                        sandbox_prefix, released,
+                    )
+            except Exception:
+                _logger.warning(
+                    "plan sandbox cleanup failed prefix=%s", sandbox_prefix,
+                    exc_info=True,
+                )
         # plan 专用的 parent Agent 本次请求用完必须关闭，释放 browser / plugins 等资源
         if parent_agent is not None:
             try:

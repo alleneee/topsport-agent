@@ -36,6 +36,17 @@ class ServerConfig:
     # 进程收到 SIGTERM 后等待 in-flight 请求的最大秒数（H-R5 graceful drain）
     drain_timeout_seconds: float = 25.0
 
+    # OpenSandbox 集成（可选）
+    # 启用时：tool_source 注入 sandbox_shell/read_file/write_file；
+    # 启用时自动禁用本地 file_ops（避免 SEC-001：LLM 越过沙箱读宿主文件系统）
+    sandbox_enabled: bool = False
+    sandbox_domain: str = "localhost:8090"
+    sandbox_image: str = "ubuntu"
+    sandbox_per_tenant_max: int | None = None  # None = 不限
+    sandbox_per_tenant_timeout_seconds: float | None = None  # None = 阻塞到有空位
+    sandbox_idle_pause_seconds: float | None = 300.0  # None = 禁用 idle pause
+    sandbox_use_server_proxy: bool = True  # 对 Docker bridge 部署必须 True
+
     @classmethod
     def from_env(cls) -> ServerConfig:
         return cls(
@@ -58,6 +69,23 @@ class ServerConfig:
             drain_timeout_seconds=float(
                 os.environ.get("DRAIN_TIMEOUT_SECONDS", "25")
             ),
+            sandbox_enabled=_parse_bool(
+                os.environ.get("SANDBOX_ENABLED"), default=False
+            ),
+            sandbox_domain=os.environ.get("SANDBOX_DOMAIN", "localhost:8090"),
+            sandbox_image=os.environ.get("SANDBOX_IMAGE", "ubuntu"),
+            sandbox_per_tenant_max=_parse_optional_int(
+                os.environ.get("SANDBOX_PER_TENANT_MAX")
+            ),
+            sandbox_per_tenant_timeout_seconds=_parse_optional_float(
+                os.environ.get("SANDBOX_PER_TENANT_TIMEOUT_SECONDS")
+            ),
+            sandbox_idle_pause_seconds=_parse_optional_float(
+                os.environ.get("SANDBOX_IDLE_PAUSE_SECONDS"), default=300.0
+            ),
+            sandbox_use_server_proxy=_parse_bool(
+                os.environ.get("SANDBOX_USE_SERVER_PROXY"), default=True
+            ),
         )
 
 
@@ -65,3 +93,18 @@ def _parse_bool(raw: str | None, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_optional_int(raw: str | None) -> int | None:
+    if raw is None or not raw.strip():
+        return None
+    return int(raw)
+
+
+def _parse_optional_float(raw: str | None, *, default: float | None = None) -> float | None:
+    if raw is None or not raw.strip():
+        return default
+    s = raw.strip().lower()
+    if s in {"none", "null", "off", "false", "disable", "disabled"}:
+        return None
+    return float(raw)

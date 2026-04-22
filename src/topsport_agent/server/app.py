@@ -15,7 +15,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -30,6 +30,9 @@ from .config import ServerConfig
 from .plan import router as plan_router
 from .sessions import SessionStore
 from .sessions_api import router as sessions_router
+
+if TYPE_CHECKING:
+    from ..sandbox import OpenSandboxPool
 
 _logger = logging.getLogger(__name__)
 
@@ -70,23 +73,55 @@ def _wrap_with_metrics(
     return factory
 
 
-def _default_agent_factory(cfg: ServerConfig) -> Callable[[LLMProvider, str], Agent]:
-    """生产默认 Agent：按 ServerConfig 闸门决定是否开 file_ops / skills / plugins。
+def _default_agent_factory(
+    cfg: ServerConfig,
+    sandbox_pool: "OpenSandboxPool | None" = None,
+) -> Callable[[LLMProvider, str], Agent]:
+    """生产默认 Agent：按 ServerConfig 闸门决定 file_ops / skills / plugins / sandbox。
 
-    默认关文件 / 技能 / 插件 —— 对外暴露必须显式 opt-in（ENABLE_* env）。
-    开 file_tools 时会把 workspace_root 注入到 agent 所有工具调用（由 session-level 实现）。
+    默认关文件 / 技能 / 插件；对外暴露必须显式 opt-in（ENABLE_* env）。
+    当 sandbox_pool 存在（SANDBOX_ENABLED=true）：
+      - 注入 OpenSandboxToolSource（sandbox_shell/read_file/write_file）
+      - 强制关闭本地 file_ops（即便 ENABLE_FILE_TOOLS=true 也不生效）
+        —— 避免 LLM 越过沙箱直接读写宿主文件系统（SEC-001）
     """
+    # sandbox 启用时本地 file_ops 必须关，避免两条路径并存的逃逸风险
+    file_ops_enabled = cfg.enable_file_tools and sandbox_pool is None
 
     def factory(provider: LLMProvider, model: str) -> Agent:
+        extra_tool_sources: list[Any] = []
+        if sandbox_pool is not None:
+            # 延迟 import 避免未装 opensandbox 时拉起 module 报错
+            from ..sandbox import OpenSandboxToolSource
+
+            extra_tool_sources.append(OpenSandboxToolSource(sandbox_pool))
+
         return default_agent(
             provider=provider,
             model=model,
             stream=True,
             enable_browser=False,
-            enable_file_ops=cfg.enable_file_tools,
+            enable_file_ops=file_ops_enabled,
+            extra_tool_sources=extra_tool_sources or None,
         )
 
     return factory
+
+
+def _build_sandbox_pool(cfg: ServerConfig) -> "OpenSandboxPool | None":
+    """按 cfg.sandbox_enabled 构造 OpenSandboxPool；失败则抛（阻塞启动）。"""
+    if not cfg.sandbox_enabled:
+        return None
+    from ..sandbox import OpenSandboxPool
+
+    return OpenSandboxPool.from_config(
+        domain=cfg.sandbox_domain,
+        image=cfg.sandbox_image,
+        use_server_proxy=cfg.sandbox_use_server_proxy,
+        per_tenant_max_sandboxes=cfg.sandbox_per_tenant_max,
+        per_tenant_acquire_timeout=cfg.sandbox_per_tenant_timeout_seconds,
+        idle_pause_seconds=cfg.sandbox_idle_pause_seconds,
+    )
 
 
 def create_app(
@@ -96,17 +131,25 @@ def create_app(
     provider: LLMProvider | None = None,
     agent_factory: Callable[[LLMProvider, str], Agent] | None = None,
     metrics: Any | None = None,
+    sandbox_pool: "OpenSandboxPool | None" = None,
 ) -> FastAPI:
     """构造一个绑定好依赖的 FastAPI app。
 
     provider / agent_factory 可由测试注入 mock；生产默认从 env 加载。
     metrics 是可选的 PrometheusMetrics 实例；传入后暴露 /metrics endpoint
     并把它注入到每个新 session 的 agent event_subscribers。
+    sandbox_pool：测试注入用，跳过真实 OpenSandbox 调用。生产从 cfg.sandbox_enabled
+    自动构造。
     """
 
     cfg = config or ServerConfig.from_env()
-    raw_factory = agent_factory or _default_agent_factory(cfg)
     auth_config = _build_auth_config(cfg)
+
+    # sandbox pool：测试注入优先；否则按 cfg.sandbox_enabled 构造
+    pool = sandbox_pool if sandbox_pool is not None else _build_sandbox_pool(cfg)
+
+    # 未显式注入 agent_factory 时，default factory 带上 sandbox tool_source
+    raw_factory = agent_factory or _default_agent_factory(cfg, sandbox_pool=pool)
 
     # 若传入 metrics，把它装到每个新 session 的 agent 事件订阅里
     if metrics is not None:
@@ -124,11 +167,23 @@ def create_app(
                 )
             prov = _make_provider(provider_name, cfg.api_key, cfg.base_url)
 
+        # sandbox 生命周期挂到 SessionStore
+        create_hooks: list = []
+        close_hooks: list = []
+        if pool is not None:
+            from ..sandbox import SessionSandboxBinding
+
+            binding = SessionSandboxBinding(pool)
+            create_hooks.append(binding.on_session_created)
+            close_hooks.append(binding.on_session_closed)
+
         store = SessionStore(
             agent_factory=factory,
             provider=prov,
             max_sessions=cfg.max_sessions,
             ttl_seconds=cfg.session_ttl_seconds,
+            on_session_created=create_hooks or None,
+            on_session_closed=close_hooks or None,
         )
         app.state.provider = prov
         app.state.provider_name = provider_name
@@ -136,6 +191,7 @@ def create_app(
         app.state.agent_factory = factory
         app.state.config = cfg
         app.state.auth_config = auth_config
+        app.state.sandbox_pool = pool
         app.state.draining = False
         app.state.inflight = 0
         if not auth_config.required:
@@ -157,6 +213,11 @@ def create_app(
                     app.state.inflight,
                 )
             await store.close_all()
+            if pool is not None:
+                try:
+                    await pool.close_all()
+                except Exception as exc:
+                    _logger.warning("sandbox pool close failed: %r", exc)
 
     app = FastAPI(
         title="topsport-agent",

@@ -80,7 +80,10 @@ async def chat_completions(
 
     # principal 前缀隔离：不同 principal 即便传同一个 body.user 也命中不同 session
     session_key = namespace_session_id(principal, body.user)
-    _, entry, _ = await store.get_or_create(session_key, model_name)
+    # tenant = principal（最简映射）：sandbox / per-tenant quota / 审计都按 principal 维度做。
+    _, entry, _ = await store.get_or_create(
+        session_key, model_name, tenant_id=principal, principal=principal,
+    )
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 

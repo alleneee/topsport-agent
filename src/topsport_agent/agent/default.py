@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..engine.hooks import ToolSource
 from ..llm.provider import LLMProvider
 from ..tools import file_tools
 from ..types.tool import ToolSpec
@@ -38,8 +39,12 @@ def default_agent(
     memory_base_path: Path | None = None,
     local_skill_dirs: list[Path] | None = None,
     extra_tools: list[ToolSpec] | None = None,
+    extra_tool_sources: list[ToolSource] | None = None,
 ) -> Agent:
-    """标准 Agent 配置：skills + memory + plugins + file_ops + 可选 browser。"""
+    """标准 Agent 配置：skills + memory + plugins + file_ops + 可选 browser。
+
+    extra_tool_sources: 运行时扩展工具源（如 MCP / OpenSandbox）；透传给 AgentConfig。
+    """
     tools: list[ToolSpec] = list(extra_tools or [])
     if enable_file_ops:
         # 文件工具放最前：优先级高，且用户自定义的 extra_tools 不会覆盖名称冲突
@@ -57,5 +62,6 @@ def default_agent(
         memory_base_path=memory_base_path,
         local_skill_dirs=local_skill_dirs or [Path.home() / ".claude" / "skills"],
         extra_tools=tools,
+        extra_tool_sources=list(extra_tool_sources or []),
     )
     return Agent.from_config(provider, config)
