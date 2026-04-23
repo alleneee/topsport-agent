@@ -1,30 +1,36 @@
-"""Tool permission 决策模型。对标 claude-code 的 PermissionBehavior/Result。
+"""Capability-based permission model for enterprise internal AI platform.
 
-核心模型：
-- PermissionBehavior：allow / deny / ask
-- PermissionDecision：behavior + 可选 reason + 可选 updated_input（可改写 LLM 传的参数）
-- PermissionChecker：Engine 在 handler 前询问"本次调用是否允许"的 Protocol
-- PermissionAsker：checker 返回 ask 时由 Engine 调用，让外部（CLI 终端、server
-  SSE 提示、pentest-style 自动化脚本）决定最终 allow/deny
+Design: tools declare `required_permissions`; sessions carry `granted_permissions`
+populated from a Persona. Runtime enforcement is a static frozenset subset check
+executed once per `Engine._snapshot_tools` via `ToolVisibilityFilter`.
 
-最小可用版（本轮只做）：
-1. 全部是运行时注入，Engine 不感知具体实现
-2. 默认 checker 基于 ToolSpec 字段：destructive=True → ask；其它 → allow
-3. 不支持规则持久化、不读 settings.json、不跨 session 记住选择——这些留给调用方
+Legacy symbols (`PermissionBehavior`, `PermissionDecision`, `PermissionChecker`,
+`PermissionAsker`, `allow`, `deny`, `ask`) from the previous runtime-decision
+design are retained for one minor release with a DeprecationWarning on import
+and will be removed in the next release.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from .message import ToolCall
     from .tool import ToolContext, ToolSpec
 
 __all__ = [
+    # Core v2 model
+    "AuditEntry",
+    "Permission",
+    "Persona",
+    "PersonaAssignment",
+    "Role",
+    # Deprecated v1 symbols
     "PermissionAsker",
     "PermissionBehavior",
     "PermissionChecker",
@@ -35,47 +41,119 @@ __all__ = [
 ]
 
 
-class PermissionBehavior(StrEnum):
+# ---------------------------------------------------------------------------
+# Core v2: capability model
+# ---------------------------------------------------------------------------
+
+
+class Permission(StrEnum):
+    """Predefined capability set. New permissions are added by extending this
+    enum or by passing plain strings; the filter treats any string that
+    satisfies the StrEnum contract as a permission identifier."""
+
+    # Filesystem
+    FS_READ = "fs.read"
+    FS_WRITE = "fs.write"
+    # Shell (sandbox-confined)
+    SHELL_SAFE = "shell.safe"
+    SHELL_FULL = "shell.full"
+    # Network
+    NETWORK_OUT = "network.out"
+    # MCP servers — extend as platform grows
+    MCP_GITHUB = "mcp.github"
+    MCP_JIRA = "mcp.jira"
+    MCP_ZENDESK = "mcp.zendesk"
+    MCP_SNOWFLAKE = "mcp.snowflake"
+    MCP_SAP = "mcp.sap"
+    # Meta
+    MEMORY_WRITE = "memory.write"
+    AGENT_SPAWN = "agent.spawn"
+
+
+class Role(StrEnum):
+    """HTTP admin API access roles. Separate from session end-user identity."""
+
+    ADMIN = "admin"
+    OPERATOR = "operator"
+    AUDITOR = "auditor"
+    AGENT = "agent"
+
+
+@dataclass(frozen=True, slots=True)
+class Persona:
+    id: str
+    display_name: str
+    description: str
+    permissions: frozenset[Permission]
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class PersonaAssignment:
+    tenant_id: str
+    persona_ids: frozenset[str]
+    default_persona_id: str | None
+    user_id: str | None = None
+    group_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEntry:
+    id: str
+    tenant_id: str
+    session_id: str
+    user_id: str | None
+    persona_id: str | None
+    tool_name: str
+    tool_required: frozenset[Permission]
+    subject_granted: frozenset[Permission]
+    outcome: Literal["allowed", "filtered_out", "error", "killed"]
+    args_preview: dict[str, Any]
+    reason: str | None
+    timestamp: datetime
+    # Reserved for future quota / cost tracking; populated as 0 / None in v1.
+    cost_tokens: int = 0
+    cost_latency_ms: int = 0
+    group_id: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED v1 symbols — removed in next minor release
+#
+# Implementation note: legacy symbols are defined with a leading underscore
+# and exposed via module `__getattr__` so that every `from ... import X`
+# access emits a DeprecationWarning (module-level `warnings.warn` would fire
+# only once per process — too early if the module is imported transitively
+# before any consumer sees the warning).
+# ---------------------------------------------------------------------------
+
+
+class _PermissionBehavior(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
 
 
 @dataclass(slots=True, frozen=True)
-class PermissionDecision:
-    """Permission 决策结果。
-
-    - `behavior`: ALLOW / DENY / ASK
-    - `reason`: DENY/ASK 时给 LLM 看的解释，也可作为 asker 的上下文
-    - `updated_input`: ALLOW 时可非空——checker 可以改写 LLM 原参数
-      （例：把相对路径展开为绝对、注入额外安全标志）。None 表示沿用原参数。
-    """
-
-    behavior: PermissionBehavior
+class _PermissionDecision:
+    behavior: _PermissionBehavior
     reason: str | None = None
     updated_input: dict[str, Any] | None = None
 
 
-# 三个 helper 让调用代码读起来像 DSL：`return allow()` / `return deny("...")`
-def allow(updated_input: dict[str, Any] | None = None) -> PermissionDecision:
-    return PermissionDecision(PermissionBehavior.ALLOW, updated_input=updated_input)
+def _allow(updated_input: dict[str, Any] | None = None) -> _PermissionDecision:
+    return _PermissionDecision(_PermissionBehavior.ALLOW, updated_input=updated_input)
 
 
-def deny(reason: str) -> PermissionDecision:
-    return PermissionDecision(PermissionBehavior.DENY, reason=reason)
+def _deny(reason: str) -> _PermissionDecision:
+    return _PermissionDecision(_PermissionBehavior.DENY, reason=reason)
 
 
-def ask(reason: str | None = None) -> PermissionDecision:
-    return PermissionDecision(PermissionBehavior.ASK, reason=reason)
+def _ask(reason: str | None = None) -> _PermissionDecision:
+    return _PermissionDecision(_PermissionBehavior.ASK, reason=reason)
 
 
-class PermissionChecker(Protocol):
-    """同步决策接口：Engine 在工具 handler 前调用。
-
-    返回 PermissionBehavior.ASK 时 Engine 会转给 PermissionAsker；没有 asker
-    时默认按 DENY 处理（保守——宁可错杀不可放行 destructive 工具）。
-    """
-
+class _PermissionChecker(Protocol):
     name: str
 
     async def check(
@@ -83,15 +161,10 @@ class PermissionChecker(Protocol):
         tool: "ToolSpec",
         call: "ToolCall",
         context: "ToolContext",
-    ) -> PermissionDecision: ...
+    ) -> _PermissionDecision: ...
 
 
-class PermissionAsker(Protocol):
-    """交互式最终裁决接口。CLI 实现读 stdin，server 实现走 SSE prompt。
-
-    必须返回 ALLOW 或 DENY；asker 再返回 ASK 是逻辑错误，Engine 当 DENY 处理。
-    """
-
+class _PermissionAsker(Protocol):
     name: str
 
     async def ask(
@@ -100,10 +173,35 @@ class PermissionAsker(Protocol):
         call: "ToolCall",
         context: "ToolContext",
         reason: str | None,
-    ) -> PermissionDecision: ...
+    ) -> _PermissionDecision: ...
 
 
-# 便捷类型别名：允许直接传 callable（不强制类化）
 PermissionCheckFn = Callable[
-    ["ToolSpec", "ToolCall", "ToolContext"], Awaitable[PermissionDecision]
+    ["ToolSpec", "ToolCall", "ToolContext"], Awaitable[_PermissionDecision]
 ]
+
+
+_LEGACY_ALIASES: dict[str, Any] = {
+    "PermissionBehavior": _PermissionBehavior,
+    "PermissionDecision": _PermissionDecision,
+    "PermissionChecker": _PermissionChecker,
+    "PermissionAsker": _PermissionAsker,
+    "allow": _allow,
+    "deny": _deny,
+    "ask": _ask,
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LEGACY_ALIASES:
+        warnings.warn(
+            "topsport_agent.types.permission: PermissionBehavior/Checker/Asker/"
+            "Decision and allow/deny/ask helpers are deprecated; migrate to the "
+            "capability-based Permission / Persona / PersonaAssignment model. "
+            "See docs/superpowers/specs/2026-04-23-permission-capability-acl-"
+            "design.md.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _LEGACY_ALIASES[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
