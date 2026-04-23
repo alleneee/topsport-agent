@@ -99,6 +99,14 @@ class MockAriaLocator:
         return self
 
 
+class MockKeyboard:
+    def __init__(self, page: MockPage) -> None:
+        self._page = page
+
+    async def press(self, key: str) -> None:
+        self._page.press_log.append(("page", key))
+
+
 class MockPage:
     """Mock Playwright Page for testing BrowserClient without Playwright."""
 
@@ -108,18 +116,31 @@ class MockPage:
         url: str = "https://example.com",
         page_title: str = "Example",
         aria_yaml: str = "",
+        frame_yamls: dict[str, str] | None = None,
     ) -> None:
         self.url = url
         self._title = page_title
         self._aria_yaml = aria_yaml
+        self._frame_yamls = frame_yamls or {}
         self.click_log: list[str] = []
         self.fill_log: list[tuple[str, str]] = []
+        self.press_log: list[tuple[str, str]] = []
+        self.select_log: list[tuple[str, list[str]]] = []
+        self.wait_log: list[tuple[str, str]] = []
+        self._history: list[str] = []
+        self.keyboard = MockKeyboard(self)
 
     async def title(self) -> str:
         return self._title
 
     async def goto(self, url: str, **kwargs: Any) -> None:
+        if self.url and self.url != url:
+            self._history.append(self.url)
         self.url = url
+
+    async def go_back(self) -> None:
+        if self._history:
+            self.url = self._history.pop()
 
     def locator(self, selector: str) -> MockAriaLocator | MockInteractionLocator:
         if selector == "body":
@@ -128,6 +149,9 @@ class MockPage:
 
     def get_by_role(self, role: str, *, name: str = "") -> MockInteractionLocator:
         return MockInteractionLocator(self, role, name)
+
+    def frame_locator(self, selector: str) -> MockFrameLocator:
+        return MockFrameLocator(self, selector)
 
     async def screenshot(self, *, path: str = "", **kwargs: Any) -> bytes:
         if path:
@@ -138,18 +162,61 @@ class MockPage:
         return "Full page text content"
 
 
+class MockFrameLocator:
+    """Mock of Playwright FrameLocator: proxies locator/get_by_role to the page."""
+
+    def __init__(self, page: MockPage, frame_selector: str) -> None:
+        self._page = page
+        self._frame = frame_selector
+        self._aria_yaml = page._frame_yamls.get(frame_selector, "")
+
+    def locator(self, selector: str) -> MockAriaLocator | MockInteractionLocator:
+        if selector == "body":
+            return MockAriaLocator(self._aria_yaml)
+        return MockInteractionLocator(self._page, "css", selector, frame=self._frame)
+
+    def get_by_role(self, role: str, *, name: str = "") -> MockInteractionLocator:
+        return MockInteractionLocator(self._page, role, name, frame=self._frame)
+
+
 class MockInteractionLocator:
-    def __init__(self, page: MockPage, role: str, name: str) -> None:
+    def __init__(
+        self,
+        page: MockPage,
+        role: str,
+        name: str,
+        *,
+        frame: str = "",
+        nth: int | None = None,
+    ) -> None:
         self._page = page
         self._role = role
         self._name = name
+        self._frame = frame
+        self._nth = nth
         self._mock_count = 0  # default: element not found (for content selectors)
 
+    def _tag(self) -> str:
+        frame_part = f"[{self._frame}]" if self._frame else ""
+        nth_part = f"#{self._nth}" if self._nth is not None else ""
+        return f"{frame_part}{self._role}:{self._name}{nth_part}"
+
     async def click(self, **kwargs: Any) -> None:
-        self._page.click_log.append(f"{self._role}:{self._name}")
+        self._page.click_log.append(self._tag())
 
     async def fill(self, text: str, **kwargs: Any) -> None:
-        self._page.fill_log.append((f"{self._role}:{self._name}", text))
+        self._page.fill_log.append((self._tag(), text))
+
+    async def press(self, key: str, **kwargs: Any) -> None:
+        self._page.press_log.append((self._tag(), key))
+
+    async def select_option(self, values: Any, **kwargs: Any) -> list[str]:
+        out = [values] if isinstance(values, str) else list(values)
+        self._page.select_log.append((self._tag(), out))
+        return out
+
+    async def wait_for(self, *, state: str = "visible", **kwargs: Any) -> None:
+        self._page.wait_log.append((self._tag(), state))
 
     async def text_content(self) -> str:
         return f"text of {self._role}:{self._name}"
@@ -157,6 +224,9 @@ class MockInteractionLocator:
     @property
     def first(self) -> MockInteractionLocator:
         return self
+
+    def nth(self, n: int) -> MockInteractionLocator:
+        return MockInteractionLocator(self._page, self._role, self._name, frame=self._frame, nth=n)
 
     async def count(self) -> int:
         return self._mock_count
@@ -238,6 +308,45 @@ class TestParseAriaYaml:
         assert entries[0].role == "checkbox"
         assert entries[0].name == "Agree"
 
+    def test_inline_ref_and_nth_attributes_still_parse(self):
+        # QwenPaw-style enriched aria output with embedded [ref=...] / [nth=...]
+        yaml = _make_aria_yaml(
+            '- button "Save" [ref=e1] [nth=0]',
+            '- button "Save" [ref=e2] [nth=1]:',
+        )
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 2
+        assert entries[0].role == "button"
+        assert entries[0].name == "Save"
+
+    def test_closing_slash_role_ignored(self):
+        yaml = _make_aria_yaml(
+            '- button "Go"',
+            '- /button',
+        )
+        entries = _parse_aria_yaml(yaml)
+        assert len(entries) == 1
+        assert entries[0].name == "Go"
+
+    def test_duplicates_get_sequential_nth(self):
+        yaml = _make_aria_yaml(
+            '- button "Save"',
+            '- textbox "Name"',
+            '- button "Save"',
+            '- button "Save"',
+        )
+        entries = _parse_aria_yaml(yaml)
+        by_ref = {e.ref: e for e in entries}
+        assert by_ref["@e1"].role == "button" and by_ref["@e1"].nth == 0
+        assert by_ref["@e2"].role == "textbox" and by_ref["@e2"].nth is None
+        assert by_ref["@e3"].nth == 1
+        assert by_ref["@e4"].nth == 2
+
+    def test_unique_entry_has_no_nth(self):
+        yaml = _make_aria_yaml('- button "Only"')
+        entries = _parse_aria_yaml(yaml)
+        assert entries[0].nth is None
+
 
 class TestTakeSnapshot:
     async def test_extracts_from_page(self):
@@ -270,8 +379,22 @@ class TestBuildRefMap:
         )
         ref_map = build_ref_map(snap)
         assert ref_map == {
-            "@e1": ("button", "Submit"),
-            "@e2": ("textbox", "Email"),
+            "@e1": ("button", "Submit", None),
+            "@e2": ("textbox", "Email", None),
+        }
+
+    def test_preserves_nth_for_duplicates(self):
+        snap = PageSnapshot(
+            url="https://x",
+            title="X",
+            entries=[
+                SnapshotEntry(ref="@e1", role="button", name="Save", nth=0),
+                SnapshotEntry(ref="@e2", role="button", name="Save", nth=1),
+            ],
+        )
+        assert build_ref_map(snap) == {
+            "@e1": ("button", "Save", 0),
+            "@e2": ("button", "Save", 1),
         }
 
 
@@ -389,6 +512,110 @@ class TestBrowserClient:
         with pytest.raises(RuntimeError, match="page_factory"):
             await client.navigate("https://example.com")
 
+    async def test_click_duplicate_uses_nth(self):
+        # 同 role + name 重复 → ref 带上 nth，click 必须走 .nth(n) 分支
+        yaml = _make_aria_yaml(
+            '- button "Save"',
+            '- button "Save"',
+            '- button "Save"',
+        )
+        page = MockPage(aria_yaml=yaml)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+        await client.click("@e2")  # 第二个 "Save"
+        assert page.click_log == ["button:Save#1"]
+
+    async def test_click_unique_ref_still_uses_first(self):
+        yaml = _make_aria_yaml('- button "Only"')
+        page = MockPage(aria_yaml=yaml)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+        await client.click("@e1")
+        # nth 为 None 时不应带 "#n"
+        assert page.click_log == ["button:Only"]
+
+    async def test_snapshot_with_frame_selector_scopes_refs(self):
+        frame_yaml = _make_aria_yaml('- button "Signup"')
+        page = MockPage(aria_yaml="", frame_yamls={"iframe#mc": frame_yaml})
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+
+        snap = await client.snapshot(frame_selector="iframe#mc")
+        assert snap.frame_selector == "iframe#mc"
+        assert [e.name for e in snap.entries] == ["Signup"]
+
+    async def test_click_inherits_frame_from_snapshot(self):
+        frame_yaml = _make_aria_yaml('- button "Signup"')
+        page = MockPage(aria_yaml="", frame_yamls={"iframe#mc": frame_yaml})
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://example.com")
+        await client.snapshot(frame_selector="iframe#mc")
+        await client.click("@e1")
+        assert page.click_log == ["[iframe#mc]button:Signup"]
+
+    async def test_navigate_clears_frame_scope(self):
+        frame_yaml = _make_aria_yaml('- button "Signup"')
+        page = MockPage(aria_yaml="", frame_yamls={"iframe#mc": frame_yaml})
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://a")
+        await client.snapshot(frame_selector="iframe#mc")
+        assert client._snapshot_frame == "iframe#mc"
+        await client.navigate("https://b")
+        assert client._snapshot_frame == ""
+
+    async def test_navigate_back_restores_previous_url(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://a")
+        await client.navigate("https://b")
+        snap = await client.navigate_back()
+        assert snap.url == "https://a"
+
+    async def test_press_key_page_level(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://x")
+        await client.press_key("Escape")
+        assert page.press_log == [("page", "Escape")]
+
+    async def test_press_key_with_target(self):
+        yaml = _make_aria_yaml('- textbox "Q"')
+        page = MockPage(aria_yaml=yaml)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://x")
+        await client.press_key("Enter", target="@e1")
+        assert page.press_log == [("textbox:Q", "Enter")]
+
+    async def test_select_option_returns_selected(self):
+        yaml = _make_aria_yaml('- combobox "Country"')
+        page = MockPage(aria_yaml=yaml)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://x")
+        selected = await client.select_option("@e1", ["cn", "jp"])
+        assert selected == ["cn", "jp"]
+        assert page.select_log == [("combobox:Country", ["cn", "jp"])]
+
+    async def test_wait_for_requires_selector_or_seconds(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://x")
+        with pytest.raises(ValueError, match="selector"):
+            await client.wait_for()
+
+    async def test_wait_for_selector(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://x")
+        await client.wait_for(selector=".banner", state="hidden")
+        assert page.wait_log == [("css:.banner", "hidden")]
+
+    async def test_wait_for_seconds_sleeps(self):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        await client.navigate("https://x")
+        # 非常短的 sleep，主要验证不抛异常；selector 留空
+        await client.wait_for(seconds=0.001)
+
 
 # --- ToolSource Tests ---
 
@@ -403,22 +630,26 @@ def _tool_ctx(cancel_event: asyncio.Event) -> ToolContext:
 
 
 class TestBrowserToolSource:
-    async def test_list_tools_returns_six(self):
+    async def test_list_tools_returns_full_set(self):
         page = MockPage()
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         source = BrowserToolSource(client)
 
         tools = await source.list_tools()
-        assert len(tools) == 6
         names = {t.name for t in tools}
         assert names == {
             "browser_navigate",
+            "browser_back",
             "browser_snapshot",
             "browser_click",
             "browser_type",
+            "browser_press_key",
+            "browser_select_option",
+            "browser_wait_for",
             "browser_screenshot",
             "browser_get_text",
         }
+        assert len(tools) == len(names)
 
     async def test_all_tools_are_valid_toolspecs(self):
         page = MockPage()
@@ -507,6 +738,84 @@ class TestBrowserToolSource:
         client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
         source = BrowserToolSource(client)
         assert source.name == "browser"
+
+    async def test_back_handler(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://a")
+        await client.navigate("https://b")
+        tools = await source.list_tools()
+        back = next(t for t in tools if t.name == "browser_back")
+        result = await back.handler({}, _tool_ctx(cancel_event))
+        assert result["url"] == "https://a"
+
+    async def test_snapshot_handler_with_frame_selector(self, cancel_event: asyncio.Event):
+        frame_yaml = _make_aria_yaml('- button "Signup"')
+        page = MockPage(aria_yaml="", frame_yamls={"iframe#mc": frame_yaml})
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        snap = next(t for t in tools if t.name == "browser_snapshot")
+        result = await snap.handler(
+            {"frame_selector": "iframe#mc"}, _tool_ctx(cancel_event)
+        )
+        assert result["frame_selector"] == "iframe#mc"
+        assert '@e1 [button] "Signup"' in result["elements"]
+
+    async def test_press_key_handler(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        pk = next(t for t in tools if t.name == "browser_press_key")
+        result = await pk.handler({"key": "Escape"}, _tool_ctx(cancel_event))
+        assert result == {"pressed": "Escape", "target": "page"}
+        assert page.press_log == [("page", "Escape")]
+
+    async def test_select_option_handler_accepts_string(self, cancel_event: asyncio.Event):
+        yaml = _make_aria_yaml('- combobox "C"')
+        page = MockPage(aria_yaml=yaml)
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        so = next(t for t in tools if t.name == "browser_select_option")
+        result = await so.handler(
+            {"target": "@e1", "values": "cn"}, _tool_ctx(cancel_event)
+        )
+        assert result["selected"] == ["cn"]
+
+    async def test_wait_for_handler(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        wf = next(t for t in tools if t.name == "browser_wait_for")
+        result = await wf.handler(
+            {"selector": ".loader", "state": "hidden"}, _tool_ctx(cancel_event)
+        )
+        assert result == {"waited": True}
+        assert page.wait_log == [("css:.loader", "hidden")]
+
+    async def test_wait_for_handler_missing_args_returns_error(self, cancel_event: asyncio.Event):
+        page = MockPage()
+        client = BrowserClient(BrowserConfig(), page_factory=_mock_page_factory(page))
+        source = BrowserToolSource(client)
+
+        await client.navigate("https://example.com")
+        tools = await source.list_tools()
+        wf = next(t for t in tools if t.name == "browser_wait_for")
+        result = await wf.handler({}, _tool_ctx(cancel_event))
+        assert result["is_error"] is True
 
 
 class TestBrowserPublicAPI:

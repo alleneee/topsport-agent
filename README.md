@@ -64,7 +64,7 @@ await agent.close()
 | `enable_skills` | `True` | Load skills from `local_skill_dirs` + plugin skill dirs; mount `load_skill`/`unload_skill`/`list_skills` tools |
 | `enable_memory` | `True` | `FileMemoryStore` under `memory_base_path`; mount `save_memory`/`recall_memory`/`forget_memory` |
 | `enable_plugins` | `True` | Full Claude plugin ecosystem loaded; expose `list_agents`/`spawn_agent`; hooks wired |
-| `enable_browser` | `False` | Playwright-backed browser control with 6 `browser_*` tools |
+| `enable_browser` | `False` | Playwright-backed browser control with 10 `browser_*` tools (snapshot/ref model + iframe scope) |
 
 ### Available Presets
 
@@ -421,7 +421,7 @@ uv sync --group browser
 playwright install chromium
 ```
 
-The browser module provides a `BrowserToolSource` that exposes 6 tools for web
+The browser module provides a `BrowserToolSource` that exposes 10 tools for web
 page interaction, using a snapshot/ref model where the LLM references elements
 by `@e1`, `@e2` etc. instead of CSS selectors.
 
@@ -448,16 +448,37 @@ Available tools:
 | Tool | Description |
 | --- | --- |
 | `browser_navigate` | Navigate to URL, return snapshot of interactive elements |
-| `browser_snapshot` | Refresh the interactive element list with @refs |
+| `browser_back` | Go back one step in history and return a fresh snapshot |
+| `browser_snapshot` | Refresh the @ref list; pass `frame_selector` to scope into an iframe |
 | `browser_click` | Click by @ref or CSS selector, auto-snapshot on navigation |
 | `browser_type` | Type text into input by @ref or CSS selector |
+| `browser_press_key` | Dispatch a key / chord (`Enter`, `Control+A`) at page or element level |
+| `browser_select_option` | Select one or more options in a `<select>` element |
+| `browser_wait_for` | Wait for selector state (visible/hidden/attached/detached) and/or sleep |
 | `browser_screenshot` | Take screenshot, return file path |
 | `browser_get_text` | Get text content from page or element |
 
+**Ref disambiguation**: when the same `(role, name)` repeats on one page (e.g.
+multiple "Save" buttons), entries are auto-assigned `nth=0,1,2...` and the
+client resolves via `get_by_role(...).nth(n)`; unique elements keep `nth=None`
+and retain the `.first` fast-path.
+
+**iframe scope**: `browser_snapshot(frame_selector="iframe#main")` switches the
+snapshot scope into that iframe and marks it sticky — subsequent `click` /
+`type` / `get_text` / `press_key` / `select_option` inherit the frame until the
+next navigation (explicit `navigate` / `back`, or a `click` that triggers one)
+automatically clears it.
+
+**URL policy**: `BrowserURLPolicy` (default-on) blocks non-http(s) schemes,
+loopback, RFC1918 private ranges, link-local, and known cloud metadata
+endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`).
+Pass `url_policy=BrowserURLPolicy(allow_private=True, ...)` to loosen for
+controlled environments; loopback and metadata remain blocked.
+
 Architecture follows the MCP module pattern: `BrowserClient` accepts an
-injectable `page_factory` (like `MCPClient`'s `session_factory`), so all 34
-tests run without Playwright installed. The browser is lazily initialized on
-first use and scoped to the session lifetime.
+injectable `page_factory` (like `MCPClient`'s `session_factory`), so the full
+75-test browser suite runs without Playwright installed. The browser is lazily
+initialized on first use and scoped to the session lifetime.
 
 ## MCP (Model Context Protocol)
 
