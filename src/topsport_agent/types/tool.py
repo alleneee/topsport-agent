@@ -89,6 +89,10 @@ class ToolSpec:
     # 设置后，from_model 会自动导出 parameters 并在 handler 外层包一层 pydantic 校验。
     # 订阅者可以通过 input_schema 做类型推断 / 文档生成 / 自动补全。
     input_schema: "type[BaseModel] | None" = field(default=None)
+    # Capability requirements for this tool. Empty = visible to any session.
+    # Populated either statically by tool authors or by MCP bridge from
+    # server config. Runtime filtering is done by ToolVisibilityFilter.
+    required_permissions: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_model(

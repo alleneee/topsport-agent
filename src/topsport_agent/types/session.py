@@ -39,3 +39,8 @@ class Session:
     token_spent: int = 0
     tenant_id: str | None = None
     principal: str | None = None
+    # Capability grants resolved from Persona at session creation.
+    # Immutable for session lifetime; enforced by ToolVisibilityFilter.
+    granted_permissions: frozenset[str] = field(default_factory=frozenset)
+    # Persona id that populated granted_permissions (audit trail).
+    persona_id: str | None = None
