@@ -11,14 +11,14 @@ PermissionChecker Protocol 替换即可；不要在这里加业务逻辑。
 
 from __future__ import annotations
 
-from ..types.permission import (
+from ...types.permission import (
     PermissionAsker,
     PermissionDecision,
     allow,
     ask,
 )
-from ..types.message import ToolCall
-from ..types.tool import ToolContext, ToolSpec
+from ...types.message import ToolCall
+from ...types.tool import ToolContext, ToolSpec
 
 __all__ = ["AlwaysAskAsker", "AlwaysDenyAsker", "DefaultPermissionChecker"]
 
@@ -53,7 +53,7 @@ class AlwaysDenyAsker:
         reason: str | None,
     ) -> PermissionDecision:
         del call, context
-        from ..types.permission import deny
+        from ...types.permission import deny
 
         return deny(reason or f"destructive tool '{tool.name}' denied by default")
 
