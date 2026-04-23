@@ -13,7 +13,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..engine import Engine, EngineConfig
 from ..engine.hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
@@ -36,6 +36,10 @@ from ..types.message import Message, Role
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 
+if TYPE_CHECKING:
+    from ..engine.permission.persona_registry import PersonaRegistry
+    from ..types.permission import Persona
+
 
 @dataclass(slots=True)
 class AgentConfig:
@@ -44,10 +48,10 @@ class AgentConfig:
     name/description 区分不同 Agent；能力开关决定初始化时挂载哪些子系统。
     """
 
-    name: str
-    description: str
-    system_prompt: str
-    model: str
+    name: str = ""
+    description: str = ""
+    system_prompt: str = ""
+    model: str = ""
     max_steps: int = 20
 
     # 能力开关
@@ -75,6 +79,12 @@ class AgentConfig:
 
     # 其它 engine 级选项
     provider_options: dict[str, Any] | None = None
+
+    # Permission wiring (optional). When `persona` is set, Agent.new_session_async
+    # resolves it and copies permissions into the new Session.
+    persona: "Persona | str | None" = None
+    persona_registry: "PersonaRegistry | None" = None
+    tenant_id: str | None = None
 
 
 class Agent:
@@ -123,6 +133,32 @@ class Agent:
             id=session_id or str(uuid.uuid4()),
             system_prompt=self._config.system_prompt,
         )
+
+    async def new_session_async(
+        self, session_id: str | None = None,
+    ) -> Session:
+        """Async session factory that resolves persona → granted_permissions.
+
+        Use this when AgentConfig.persona is set. The synchronous new_session
+        still works for callers that don't need permission wiring.
+        """
+        # Runtime import for isinstance check; TYPE_CHECKING import above only
+        # covers type hints.
+        from ..types.permission import Persona as _Persona
+
+        session = self.new_session(session_id)
+        cfg = self._config
+        if cfg.tenant_id is not None:
+            session.tenant_id = cfg.tenant_id
+        persona_obj: _Persona | None = None
+        if isinstance(cfg.persona, _Persona):
+            persona_obj = cfg.persona
+        elif isinstance(cfg.persona, str) and cfg.persona_registry is not None:
+            persona_obj = await cfg.persona_registry.get(cfg.persona)
+        if persona_obj is not None:
+            session.granted_permissions = persona_obj.permissions
+            session.persona_id = persona_obj.id
+        return session
 
     async def run(
         self, user_input: str, session: Session
