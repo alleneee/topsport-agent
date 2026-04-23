@@ -411,119 +411,122 @@ class Engine:
         # 0-arg 测试替身覆盖时仍能看到当前 session（capability filter 需要 session
         # 的 granted_permissions / tenant_id）。run 结束后 finally 中清零避免跨会话泄漏。
         self._current_session = session
-        yield self._transition(session, RunState.RUNNING)
-
         try:
-            for step in range(self._config.max_steps):
-                self._raise_if_cancelled()
-                yield self._event(EventType.STEP_START, session, {"step": step})
+            yield self._transition(session, RunState.RUNNING)
 
-                # 先冻结本步用到的上下文和工具集，避免一步内前后视图不一致。
-                ephemeral = await self._collect_ephemeral_context(session)
-                # 不传 session 位置参数：允许测试替身以 0-arg spy 覆盖本方法。
-                # 默认参数分支从 self._current_session 读取当前 session。
-                tools_snapshot = await self._snapshot_tools()
-                call_messages = self._build_call_messages(session, ephemeral)
+            try:
+                for step in range(self._config.max_steps):
+                    self._raise_if_cancelled()
+                    yield self._event(EventType.STEP_START, session, {"step": step})
 
-                use_stream = (
-                    self._config.stream
-                    and isinstance(self._provider, StreamingLLMProvider)
-                )
-                yield self._event(
-                    EventType.LLM_CALL_START,
-                    session,
-                    {
-                        "step": step,
-                        "model": self._config.model,
-                        "tool_count": len(tools_snapshot),
-                        "ephemeral_msg_count": len(ephemeral),
-                        "call_msg_count": len(call_messages),
-                        "stream": use_stream,
-                    },
-                )
-                if use_stream:
-                    final_holder: list[LLMResponse] = []
-                    async for evt in self._stream_llm_events(
-                        call_messages, tools_snapshot, session, step, final_holder,
+                    # 先冻结本步用到的上下文和工具集，避免一步内前后视图不一致。
+                    ephemeral = await self._collect_ephemeral_context(session)
+                    # 不传 session 位置参数：允许测试替身以 0-arg spy 覆盖本方法。
+                    # 默认参数分支从 self._current_session 读取当前 session。
+                    tools_snapshot = await self._snapshot_tools()
+                    call_messages = self._build_call_messages(session, ephemeral)
+
+                    use_stream = (
+                        self._config.stream
+                        and isinstance(self._provider, StreamingLLMProvider)
+                    )
+                    yield self._event(
+                        EventType.LLM_CALL_START,
+                        session,
+                        {
+                            "step": step,
+                            "model": self._config.model,
+                            "tool_count": len(tools_snapshot),
+                            "ephemeral_msg_count": len(ephemeral),
+                            "call_msg_count": len(call_messages),
+                            "stream": use_stream,
+                        },
+                    )
+                    if use_stream:
+                        final_holder: list[LLMResponse] = []
+                        async for evt in self._stream_llm_events(
+                            call_messages, tools_snapshot, session, step, final_holder,
+                        ):
+                            yield evt
+                        response = final_holder[0]
+                    else:
+                        response = await self._call_llm_with_cancel(
+                            call_messages, tools_snapshot
+                        )
+                    yield self._event(
+                        EventType.LLM_CALL_END,
+                        session,
+                        {
+                            "step": step,
+                            "tool_call_count": len(response.tool_calls),
+                            "finish_reason": response.finish_reason,
+                            "usage": response.usage,
+                        },
+                    )
+
+                    # H-R2 token budget 计费与强制
+                    _accumulate_usage(session, response.usage)
+                    if (
+                        session.token_budget is not None
+                        and session.token_spent > session.token_budget
                     ):
-                        yield evt
-                    response = final_holder[0]
-                else:
-                    response = await self._call_llm_with_cancel(
-                        call_messages, tools_snapshot
-                    )
-                yield self._event(
-                    EventType.LLM_CALL_END,
-                    session,
-                    {
-                        "step": step,
-                        "tool_call_count": len(response.tool_calls),
-                        "finish_reason": response.finish_reason,
-                        "usage": response.usage,
-                    },
-                )
+                        raise BudgetExceeded(
+                            f"session {session.id} token budget exceeded: "
+                            f"{session.token_spent} > {session.token_budget}"
+                        )
 
-                # H-R2 token budget 计费与强制
-                _accumulate_usage(session, response.usage)
-                if (
-                    session.token_budget is not None
-                    and session.token_spent > session.token_budget
-                ):
-                    raise BudgetExceeded(
-                        f"session {session.id} token budget exceeded: "
-                        f"{session.token_spent} > {session.token_budget}"
+                    self._raise_if_cancelled()
+
+                    # 无论后面是否要调工具，模型这一步的 assistant 输出都先落到会话里。
+                    assistant_msg = Message(
+                        role=Role.ASSISTANT,
+                        content=response.text,
+                        tool_calls=list(response.tool_calls),
+                        extra=wrap_response_metadata(response.response_metadata),
+                    )
+                    session.messages.append(assistant_msg)
+                    yield self._event(
+                        EventType.MESSAGE_APPENDED,
+                        session,
+                        {
+                            "role": Role.ASSISTANT.value,
+                            "tool_call_count": len(response.tool_calls),
+                        },
                     )
 
-                self._raise_if_cancelled()
+                    if not response.tool_calls:
+                        # 没有工具调用就说明本轮推理结束，直接进入完成态。
+                        await self._run_post_step_hooks(session, step)
+                        yield self._transition(session, RunState.DONE)
+                        return
 
-                # 无论后面是否要调工具，模型这一步的 assistant 输出都先落到会话里。
-                assistant_msg = Message(
-                    role=Role.ASSISTANT,
-                    content=response.text,
-                    tool_calls=list(response.tool_calls),
-                    extra=wrap_response_metadata(response.response_metadata),
-                )
-                session.messages.append(assistant_msg)
-                yield self._event(
-                    EventType.MESSAGE_APPENDED,
-                    session,
-                    {
-                        "role": Role.ASSISTANT.value,
-                        "tool_call_count": len(response.tool_calls),
-                    },
-                )
+                    async for event in self._execute_tool_calls(
+                        session, response.tool_calls, tools_snapshot
+                    ):
+                        yield event
 
-                if not response.tool_calls:
-                    # 没有工具调用就说明本轮推理结束，直接进入完成态。
                     await self._run_post_step_hooks(session, step)
-                    yield self._transition(session, RunState.DONE)
-                    return
+                    yield self._event(EventType.STEP_END, session, {"step": step})
 
-                async for event in self._execute_tool_calls(
-                    session, response.tool_calls, tools_snapshot
-                ):
-                    yield event
+                yield self._event(
+                    EventType.STEP_END,
+                    session,
+                    {"reason": "max_steps_reached"},
+                )
+                yield self._transition(session, RunState.DONE)
 
-                await self._run_post_step_hooks(session, step)
-                yield self._event(EventType.STEP_END, session, {"step": step})
-
-            yield self._event(
-                EventType.STEP_END,
-                session,
-                {"reason": "max_steps_reached"},
-            )
-            yield self._transition(session, RunState.DONE)
-
-        except Cancelled:
-            yield self._event(EventType.CANCELLED, session, {})
-            yield self._transition(session, RunState.WAITING_USER)
-        except Exception as exc:
-            yield self._event(
-                EventType.ERROR,
-                session,
-                {"kind": type(exc).__name__, "message": str(exc)},
-            )
-            yield self._transition(session, RunState.ERROR)
+            except Cancelled:
+                yield self._event(EventType.CANCELLED, session, {})
+                yield self._transition(session, RunState.WAITING_USER)
+            except Exception as exc:
+                yield self._event(
+                    EventType.ERROR,
+                    session,
+                    {"kind": type(exc).__name__, "message": str(exc)},
+                )
+                yield self._transition(session, RunState.ERROR)
+        finally:
+            self._current_session = None
 
     async def _invoke_tool(
         self,
