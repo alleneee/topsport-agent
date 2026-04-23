@@ -27,9 +27,13 @@ class ServerConfig:
     auth_required: bool = True
     auth_token: str = ""  # 单 token 简易模式，principal 恒为 "default"
     auth_tokens_file: str = ""  # 多租户：JSON {token: principal}
-    # 对外服务的 Agent 能力闸门 —— 默认全关，避免 CR-01 默认暴露文件/插件能力
+    # 对外服务的 Agent 能力闸门 —— 默认全关，避免 CR-01 默认暴露文件/插件能力。
+    # enable_memory 从 default_agent 的硬编码 True 迁移过来：server 部署默认关，
+    # 因为 memory 会把上下文写入 FileMemoryStore（host 文件系统），多租户场景
+    # 必须通过 persona+assignment 明确授权（memory.write 能力）才打开。
     enable_file_tools: bool = False
     enable_skills: bool = False
+    enable_memory: bool = False
     enable_plugins: bool = False
     # Plan 执行的硬上限，防止客户端提交超大 max_steps 绕过运营预算
     max_plan_steps: int = 20
@@ -71,6 +75,7 @@ class ServerConfig:
                 os.environ.get("ENABLE_FILE_TOOLS"), default=False
             ),
             enable_skills=_parse_bool(os.environ.get("ENABLE_SKILLS"), default=False),
+            enable_memory=_parse_bool(os.environ.get("ENABLE_MEMORY"), default=False),
             enable_plugins=_parse_bool(os.environ.get("ENABLE_PLUGINS"), default=False),
             prompt_injection_guard=_parse_bool(
                 os.environ.get("PROMPT_INJECTION_GUARD"), default=True

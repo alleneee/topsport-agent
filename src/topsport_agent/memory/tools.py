@@ -6,6 +6,11 @@ from ..types.tool import ToolContext, ToolSpec
 from .store import MemoryStore
 from .types import MemoryEntry, MemoryType
 
+# Mutation on memory state requires explicit capability. Read is free
+# (recall_memory has no required_permissions) because memory is session-scoped
+# and reading your own memory is always safe.
+_MEMORY_WRITE_PERMS = frozenset({"memory.write"})
+
 
 def build_memory_tools(store: MemoryStore) -> list[ToolSpec]:
     """闭包工厂：通过 store 参数注入具体存储实现，返回的 ToolSpec 列表可直接交给 Engine。"""
@@ -82,6 +87,7 @@ def build_memory_tools(store: MemoryStore) -> list[ToolSpec]:
             "required": ["key", "content"],
         },
         handler=save_memory,
+        required_permissions=_MEMORY_WRITE_PERMS,
     )
 
     recall_spec = ToolSpec(
@@ -92,6 +98,8 @@ def build_memory_tools(store: MemoryStore) -> list[ToolSpec]:
             "properties": {"key": {"type": "string"}},
         },
         handler=recall_memory,
+        read_only=True,
+        concurrency_safe=True,
     )
 
     forget_spec = ToolSpec(

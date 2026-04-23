@@ -1,5 +1,71 @@
 # Project Learnings
 
+## "Enterprise ACL" can look complete per-module and still be functionally disconnected
+
+**Context:** After landing the capability-ACL subsystem
+(`PermissionFilter / Persona / Assignment / AuditLogger / KillSwitch`),
+every unit test passed and each module looked correct in isolation. An
+external code reviewer (codex) still called the system "假的" (not real)
+and backed the claim with a punch-list of integration gaps. Every gap
+was real on inspection; none were caught by the existing test suite.
+
+**Learned:** Retrofit ACLs onto an existing framework fail at **boundaries**,
+not at the enforcement logic. Audit these four planes every time:
+
+1. **Control plane → execution plane (binding):** Admin CRUD for Personas
+   existed; Assignments (tenant/user/group → persona) had no HTTP path.
+   Operators had no way to actually *grant* capabilities. Lesson: any
+   runtime enforcement target (`session.granted_permissions`) must have a
+   corresponding HTTP/admin write path that hits the same field.
+
+2. **Default session factory:** `SessionStore.get_or_create` called
+   `agent.new_session()` (sync). Persona resolution only happened in
+   `new_session_async()`. So in the production server path, the ACL was
+   never invoked even when fully configured. Lesson: multiple session
+   factories = multiple places to get the ACL wrong. Fold them all
+   through one path, or pick the async one as canonical.
+
+3. **Delegation plane:** `Agent.spawn_child` forwarded `context_providers /
+   tool_sources / post_step_hooks / event_subscribers / sanitizer` but
+   dropped `permission_filter / audit_logger / permission_checker /
+   permission_asker` and the session's `granted_permissions / tenant_id /
+   principal / persona_id`. The parent agent was ACL-gated; the child
+   bypassed everything. Lesson: delegation inherits code-path intent,
+   which means **all** capabilities, not just the ones the original
+   author remembered.
+
+4. **Default config bypass:** `default_agent()` hardcoded
+   `enable_skills=True, enable_memory=True, enable_plugins=True` even
+   though `ServerConfig` had gates for them. The server's config never
+   reached the agent factory. Lesson: a config field that exists but
+   isn't threaded into the factory is worse than a missing field —
+   operators *think* they've closed a door that's still open.
+
+There's also a time-bomb subpattern: **public identifier shapes colliding
+with internal validators**. `namespace_session_id(principal, hint)`
+produced `principal::hint`; `FileMemoryStore._SAFE_ID_RE = ^[a-zA-Z0-9._-]+$`
+rejected the colon. Default chain enabled memory injection every step.
+Bomb triggers on first session with a non-empty hint. Lesson: every
+public-facing identifier producer must be cross-referenced against every
+internal consumer's format check, and the cross-check belongs in a test.
+
+**How to spot these gaps without an external reviewer:**
+- Grep for every place where `granted_permissions / permission_filter /
+  audit_logger` is read — each must have a populator or be assert-covered
+  as explicitly defaulted.
+- For every `ServerConfig` flag, grep forward to the factory that should
+  respect it; if the flag doesn't appear there, it's dead config.
+- For every identifier transformer (`namespace_*`, `quote_*`), grep
+  forward to every format validator it feeds; mismatches are bombs.
+
+**Evidence:** `tests/test_permission_holistic_wiring.py` (15 tests
+covering all 6 gaps), fix sweep landed 2026-04-23 covering
+`server/app.py`, `server/sessions.py`, `server/permission_api.py`,
+`agent/base.py`, `agent/default.py`, `memory/file_store.py`,
+`tools/file_ops.py`, `memory/tools.py`, `plugins/agent_registry.py`.
+
+---
+
 ## Capability-based ACL beats runtime decision engines for enterprise agent platforms
 
 **Context:** Designing the permission subsystem for an enterprise internal

@@ -41,6 +41,9 @@ def default_agent(
     system_prompt: str | None = None,
     enable_browser: bool = True,
     enable_file_ops: bool = True,
+    enable_skills: bool = True,
+    enable_memory: bool = True,
+    enable_plugins: bool = True,
     stream: bool = False,
     memory_base_path: Path | None = None,
     local_skill_dirs: list[Path] | None = None,
@@ -50,6 +53,9 @@ def default_agent(
 ) -> Agent:
     """标准 Agent 配置：skills + memory + plugins + file_ops + 可选 browser。
 
+    enable_skills / enable_memory / enable_plugins: 单独可关的能力闸门。
+        CLI 默认全开；server 默认全关（secure by default，由 ServerConfig
+        控制）。之前版本这三个硬编码为 True，绕过了 ServerConfig 的闸门。
     extra_tool_sources: 运行时扩展工具源（如 MCP / OpenSandbox）；透传给 AgentConfig。
     sanitizer: 省略则默认启用 DefaultSanitizer（对 untrusted 工具结果做 prompt
         injection 防御）；显式传 None 则关闭。
@@ -68,9 +74,9 @@ def default_agent(
         description=description,
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
         model=model,
-        enable_skills=True,
-        enable_memory=True,
-        enable_plugins=True,
+        enable_skills=enable_skills,
+        enable_memory=enable_memory,
+        enable_plugins=enable_plugins,
         enable_browser=enable_browser,
         stream=stream,
         memory_base_path=memory_base_path,

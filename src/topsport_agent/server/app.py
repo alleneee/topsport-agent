@@ -34,10 +34,12 @@ from .sessions import SessionStore
 from .sessions_api import router as sessions_router
 
 if TYPE_CHECKING:
+    from ..engine.permission.assignment import AssignmentStore
     from ..engine.permission.audit import AuditStore
     from ..engine.permission.killswitch import KillSwitchGate
     from ..engine.permission.persona_registry import PersonaRegistry
     from ..sandbox import OpenSandboxPool
+    from .sessions import SessionEntry
 
 _logger = logging.getLogger(__name__)
 
@@ -82,9 +84,13 @@ def _default_agent_factory(
     cfg: ServerConfig,
     sandbox_pool: "OpenSandboxPool | None" = None,
 ) -> Callable[[LLMProvider, str], Agent]:
-    """生产默认 Agent：按 ServerConfig 闸门决定 file_ops / skills / plugins / sandbox。
+    """生产默认 Agent：按 ServerConfig 闸门决定 file_ops / skills / memory /
+    plugins / sandbox。
 
-    默认关文件 / 技能 / 插件；对外暴露必须显式 opt-in（ENABLE_* env）。
+    默认全关；对外暴露必须显式 opt-in（ENABLE_* env）。此前版本只尊重
+    enable_file_tools，其它三个被 default_agent 硬编码为 True —— 在
+    server 链路里实际 bypass 了 ServerConfig 的闸门。现已全部透传。
+
     当 sandbox_pool 存在（SANDBOX_ENABLED=true）：
       - 注入 OpenSandboxToolSource（sandbox_shell/read_file/write_file）
       - 强制关闭本地 file_ops（即便 ENABLE_FILE_TOOLS=true 也不生效）
@@ -109,6 +115,9 @@ def _default_agent_factory(
             stream=True,
             enable_browser=False,
             enable_file_ops=file_ops_enabled,
+            enable_skills=cfg.enable_skills,
+            enable_memory=cfg.enable_memory,
+            enable_plugins=cfg.enable_plugins,
             extra_tool_sources=extra_tool_sources or None,
             sanitizer=sanitizer,
         )
@@ -143,6 +152,7 @@ def create_app(
     persona_registry: "PersonaRegistry | None" = None,
     audit_store: "AuditStore | None" = None,
     kill_switch: "KillSwitchGate | None" = None,
+    assignment_store: "AssignmentStore | None" = None,
 ) -> FastAPI:
     """构造一个绑定好依赖的 FastAPI app。
 
@@ -191,6 +201,17 @@ def create_app(
             binding = SessionSandboxBinding(pool)
             create_hooks.append(binding.on_session_created)
             close_hooks.append(binding.on_session_closed)
+
+        # Capability-ACL control/execution plane bridge: if the operator wired
+        # a persona_registry + assignment_store, resolve the session's persona
+        # at creation time and copy the permissions into session.granted_permissions.
+        # Without this hook, Assignment CRUD lives in isolation and never reaches
+        # a running session — the exact bifurcation codex flagged.
+        if persona_registry is not None and assignment_store is not None:
+            persona_hook = _build_persona_resolver_hook(
+                persona_registry, assignment_store,
+            )
+            create_hooks.append(persona_hook)
 
         store = SessionStore(
             agent_factory=factory,
@@ -304,6 +325,7 @@ def create_app(
 
     # Permission admin API 可选挂载：三件依赖都齐才暴露 /v1/admin/* 路由，
     # 缺任一（典型 CLI/测试场景）保持不变。
+    # assignment_store 可选：缺它时 /assignments 路由也挂，但调用返回 501。
     if persona_registry is not None and audit_store is not None and kill_switch is not None:
         from .permission_api import build_permission_router
 
@@ -312,10 +334,56 @@ def create_app(
                 persona_registry=persona_registry,
                 audit_store=audit_store,
                 kill_switch=kill_switch,
+                assignment_store=assignment_store,
             ),
             prefix="/v1/admin",
         )
     return app
+
+
+def _build_persona_resolver_hook(
+    persona_registry: "PersonaRegistry",
+    assignment_store: "AssignmentStore",
+) -> Callable[[str, "SessionEntry"], Any]:
+    """Construct a SessionStore create-hook that populates
+    `session.granted_permissions` from the first applicable PersonaAssignment.
+
+    Resolution order (matches engine.permission.assignment.resolve_persona_ids):
+        1. (tenant_id, user_id) — per-user override
+        2. (tenant_id, group_id) — group default (not used by server layer today
+           because user→group mapping is out of scope for v1; kept for future)
+        3. (tenant_id, None, None) — tenant-wide default
+
+    When no assignment matches, leave granted_permissions=frozenset() — the
+    ToolVisibilityFilter will filter every tagged tool. This is fail-closed:
+    secure-by-default for enterprise deployments.
+    """
+    from ..engine.permission.assignment import resolve_persona_ids
+
+    async def hook(session_id: str, entry: "SessionEntry") -> None:
+        session = entry.session
+        # server.chat.py maps tenant_id = principal (simplest case). If the
+        # mapping changes, the resolver still just uses whatever tenant_id
+        # the session carries.
+        tenant = session.tenant_id
+        if not tenant:
+            return
+        user_id = session.principal
+        resolved = await resolve_persona_ids(
+            assignment_store, tenant_id=tenant, user_id=user_id,
+        )
+        if resolved is None:
+            return
+        _persona_ids, default_persona_id = resolved
+        if default_persona_id is None:
+            return
+        persona = await persona_registry.get(default_persona_id)
+        if persona is None:
+            return
+        session.granted_permissions = persona.permissions
+        session.persona_id = persona.id
+
+    return hook
 
 
 __all__ = ["create_app"]

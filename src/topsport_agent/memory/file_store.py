@@ -8,14 +8,24 @@ from pathlib import Path
 
 from .types import MemoryEntry, MemoryType
 
-# 路径组件白名单：阻止 session_id 携带 ../ 或特殊字符实现路径穿越
-_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+# 路径组件白名单：阻止 session_id 携带 ../ 或特殊字符实现路径穿越。
+# 容纳 ':' 是为了兼容 server.auth.namespace_session_id 的 "principal::hint" 形式 ——
+# 否则默认 server 链路里 MemoryInjector 每步都会抛 ValueError（定时炸弹）。
+# ':' 在 POSIX 路径里合法；本项目 memory 落盘只支持 POSIX（Linux/macOS），
+# Windows 部署需要走沙箱或远端存储而非本地 FileMemoryStore。
+_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._:-]+$")
+# 额外防穿越：即便白名单通过，禁止值等于 '.' / '..' 或含有 '..' 子串。
+_TRAVERSAL_TOKENS = ("..",)
 
 
 def _validate_path_component(value: str, label: str) -> str:
     if not value or not _SAFE_ID_RE.match(value):
         raise ValueError(
-            f"{label} must be non-empty and contain only [a-zA-Z0-9._-], got: {value!r}"
+            f"{label} must be non-empty and contain only [a-zA-Z0-9._:-], got: {value!r}"
+        )
+    if value in {".", ".."} or any(tok in value for tok in _TRAVERSAL_TOKENS):
+        raise ValueError(
+            f"{label} must not contain path-traversal tokens, got: {value!r}"
         )
     return value
 

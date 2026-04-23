@@ -15,7 +15,12 @@ extended `ToolSpec` metadata, automatic blob offload for large tool outputs,
 pydantic-driven input schemas. Capability-based ACL permission system
 (tools declare `required_permissions`, sessions carry preset
 `granted_permissions` from a `Persona`, filter at snapshot time; audit +
-kill-switch + PII redaction + RBAC admin API). 777 tests passing.
+kill-switch + PII redaction + RBAC admin API). Holistic ACL wiring:
+server default factory honors every `ENABLE_*` gate, session creation
+always goes through async persona-resolution path, sub-agents inherit
+permission hooks + grants, Assignment CRUD endpoints bind personas to
+tenant/user/group, and built-in file/memory/plugin tools declare their
+required capabilities. 793 tests passing.
 
 | Module | Location | State |
 | --- | --- | --- |
@@ -35,7 +40,7 @@ kill-switch + PII redaction + RBAC admin API). 777 tests passing.
 | agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
 | server | `src/topsport_agent/server/` | HTTP + SSE chat & plan endpoints, RBAC middleware, admin permission API |
-| tests | `tests/` | 777 passing |
+| tests | `tests/` | 793 passing |
 
 ## Quickstart
 

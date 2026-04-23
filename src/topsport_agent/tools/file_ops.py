@@ -28,6 +28,13 @@ from ..types.tool import ToolContext, ToolSpec
 
 _MAX_READ_BYTES = 1_000_000  # 单次 read_file 最多 1MB
 _MAX_WRITE_BYTES = 5_000_000  # 单次 write_file 最多 5MB
+
+# Capability tags for builtin file tools. Empty granted_permissions (= any
+# session without a persona) keeps these invisible when a ToolVisibilityFilter
+# is configured — secure-by-default for enterprise deployments. CLI / legacy
+# paths without a filter are not affected (filter is opt-in).
+_READ_PERMS = frozenset({"fs.read"})
+_WRITE_PERMS = frozenset({"fs.write"})
 _MAX_GREP_MATCHES = 500  # grep 最多返回 500 条命中
 _MAX_GLOB_RESULTS = 1000  # glob 最多返回 1000 条路径
 _MAX_LINE_LENGTH = 2000  # 单行超过 2000 字符截断，防止超宽二进制
@@ -403,6 +410,9 @@ def file_tools() -> list[ToolSpec]:
                 "required": ["path"],
             },
             handler=_read_file,
+            read_only=True,
+            concurrency_safe=True,
+            required_permissions=_READ_PERMS,
         ),
         ToolSpec(
             name="write_file",
@@ -416,6 +426,8 @@ def file_tools() -> list[ToolSpec]:
                 "required": ["path", "content"],
             },
             handler=_write_file,
+            destructive=True,
+            required_permissions=_WRITE_PERMS,
         ),
         ToolSpec(
             name="edit_file",
@@ -435,6 +447,8 @@ def file_tools() -> list[ToolSpec]:
                 "required": ["path", "old_string", "new_string"],
             },
             handler=_edit_file,
+            destructive=True,
+            required_permissions=_WRITE_PERMS,
         ),
         ToolSpec(
             name="list_dir",
@@ -447,6 +461,9 @@ def file_tools() -> list[ToolSpec]:
                 "required": ["path"],
             },
             handler=_list_dir,
+            read_only=True,
+            concurrency_safe=True,
+            required_permissions=_READ_PERMS,
         ),
         ToolSpec(
             name="glob_files",
@@ -460,6 +477,9 @@ def file_tools() -> list[ToolSpec]:
                 "required": ["pattern"],
             },
             handler=_glob_files,
+            read_only=True,
+            concurrency_safe=True,
+            required_permissions=_READ_PERMS,
         ),
         ToolSpec(
             name="grep_files",
@@ -479,5 +499,8 @@ def file_tools() -> list[ToolSpec]:
                 "required": ["pattern"],
             },
             handler=_grep_files,
+            read_only=True,
+            concurrency_safe=True,
+            required_permissions=_READ_PERMS,
         ),
     ]

@@ -200,6 +200,7 @@ def build_agent_tools(
             "required": ["name", "task"],
         },
         handler=spawn_agent,
+        required_permissions=frozenset({"agent.spawn"}),
     )
 
     return [list_spec, spawn_spec]

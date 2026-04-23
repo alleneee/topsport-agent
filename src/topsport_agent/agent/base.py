@@ -286,6 +286,13 @@ class Agent:
             "post_step_hooks": list(post_step_hooks),
             "event_subscribers": list(event_subscribers),
             "sanitizer": config.sanitizer,
+            # v2 capability-ACL: sub-agents must inherit the parent's permission
+            # surface. Missing any of these would let delegation paths bypass
+            # the ACL — which is exactly the scenario enterprise ACLs must cover.
+            "permission_filter": config.permission_filter,
+            "audit_logger": config.audit_logger,
+            "permission_checker": config.permission_checker,
+            "permission_asker": config.permission_asker,
         }
 
         agent = cls(
@@ -313,6 +320,7 @@ class Agent:
         task: str,
         allowed_tool_names: list[str] | None = None,
         session_id_prefix: str = "sub",
+        parent_session: Session | None = None,
     ) -> tuple[Session, Engine]:
         """构造一个继承父 Agent 全部能力的子代理 Engine + Session。
 
@@ -321,6 +329,13 @@ class Agent:
         - tool_sources（MCP 桥接 / browser）
         - post_step_hooks（compaction 等）
         - event_subscribers（Langfuse / metrics / plugin hooks）
+        - permission_filter / audit_logger / permission_checker / permission_asker
+
+        parent_session：若提供，子 session 继承其 tenant_id / principal /
+        granted_permissions / persona_id。未提供则回退到父 engine 的当前运行
+        session（spawn_agent 工具在父 engine.run 里调用时始终可用）。
+        无父 session 时子代理的 granted_permissions=∅，若父侧配了 filter 会
+        filter 空工具集 —— 这是安全的 fail-closed 语义。
 
         仅 tools 可按 allowed_tool_names 收窄；model 可覆盖；system_prompt 子代理自定。
         调用方自行驱动 engine.run(session) 并收集事件。
@@ -350,11 +365,27 @@ class Agent:
                 self._capability_bundle.get("event_subscribers", [])
             ),
             sanitizer=self._capability_bundle.get("sanitizer"),
+            # v2 capability-ACL parity：permission filter + audit + checker/asker
+            # 必须和父代理一致，否则 delegation 路径可以绕过企业 ACL。
+            permission_filter=self._capability_bundle.get("permission_filter"),
+            audit_logger=self._capability_bundle.get("audit_logger"),
+            permission_checker=self._capability_bundle.get("permission_checker"),
+            permission_asker=self._capability_bundle.get("permission_asker"),
         )
         sub_session = Session(
             id=f"{session_id_prefix}:{uuid.uuid4().hex[:8]}",
             system_prompt=system_prompt,
         )
+        # Capability / tenant inheritance. Fall back to parent engine's current
+        # running session (set by Engine._run_inner) when caller didn't pass one
+        # — e.g. the default spawn_agent executor invokes spawn_child from
+        # within the parent run, where self._engine._current_session is live.
+        inherited_from = parent_session or self._engine._current_session
+        if inherited_from is not None:
+            sub_session.tenant_id = inherited_from.tenant_id
+            sub_session.principal = inherited_from.principal
+            sub_session.granted_permissions = inherited_from.granted_permissions
+            sub_session.persona_id = inherited_from.persona_id
         sub_session.messages.append(Message(role=Role.USER, content=task))
         return sub_session, sub_engine
 

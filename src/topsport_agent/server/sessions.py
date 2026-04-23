@@ -97,7 +97,18 @@ class SessionStore:
 
             await self._evict_if_full_locked()
             agent = self._agent_factory(self._provider, model)
-            session = agent.new_session(sid)
+            # Async path：agent.new_session_async 解析 persona → granted_permissions，
+            # 是 capability-ACL 的唯一正确入口。此前版本走 sync new_session，persona
+            # 配置永远不生效（即 codex 指出的 P0-1 "断路" 问题）。
+            # 兼容鸭子类型的测试 FakeAgent（仅实现 new_session）：缺 async 方法
+            # 时退化到 sync 路径，保证 server 之外的集成点不破。
+            new_async = getattr(agent, "new_session_async", None)
+            if new_async is not None:
+                session = await new_async(sid)
+            else:
+                session = agent.new_session(sid)
+            # Server-provided tenant/principal always overrides whatever
+            # AgentConfig.tenant_id seeded — server 明确传入的优先级更高。
             session.tenant_id = tenant_id
             session.principal = principal
             now = time.monotonic()
