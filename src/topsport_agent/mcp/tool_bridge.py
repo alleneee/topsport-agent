@@ -43,6 +43,7 @@ class MCPToolSource:
             parameters=schema,
             handler=self._make_handler(raw_name),
             trust_level="untrusted",
+            required_permissions=self._client.permissions,
         )
 
     def _make_handler(self, raw_name: str):

@@ -16,9 +16,16 @@ class MCPClient:
 
     因此每次调用都新建一个短生命周期的 session，只缓存不可变的列表结果。
     """
-    def __init__(self, name: str, session_factory: SessionFactory) -> None:
+    def __init__(
+        self,
+        name: str,
+        session_factory: SessionFactory,
+        *,
+        permissions: frozenset[str] = frozenset(),
+    ) -> None:
         self._name = name
         self._session_factory = session_factory
+        self.permissions = permissions
         self._cached_tools: list[Any] | None = None
         self._cached_prompts: list[Any] | None = None
         self._cached_resources: list[Any] | None = None
@@ -30,7 +37,11 @@ class MCPClient:
     @classmethod
     def from_config(cls, config: MCPServerConfig) -> MCPClient:
         """生产入口；测试走 __init__ 直接注入 mock factory，不触碰真实 MCP 依赖。"""
-        return cls(config.name, _make_real_session_factory(config))
+        return cls(
+            config.name,
+            _make_real_session_factory(config),
+            permissions=config.permissions,
+        )
 
     async def list_tools(self, *, force_refresh: bool = False) -> list[Any]:
         if self._cached_tools is None or force_refresh:

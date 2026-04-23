@@ -47,6 +47,7 @@ def load_mcp_config(
             url=raw.get("url"),
             headers=dict(raw.get("headers", {})),
             timeout=float(raw.get("timeout", 30.0)),
+            permissions=frozenset(raw.get("permissions", [])),
         )
         _validate(config)
         if config.transport == MCPTransport.STDIO:
