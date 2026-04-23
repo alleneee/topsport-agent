@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from topsport_agent.types.permission import (
@@ -22,7 +24,7 @@ def test_persona_is_frozen():
         id="dev", display_name="Developer", description="d",
         permissions=frozenset({Permission.FS_READ}),
     )
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         p.id = "other"  # type: ignore[misc]
 
 
@@ -60,7 +62,7 @@ def test_audit_entry_frozen_and_reserved_fields():
     assert e.cost_tokens == 0
     assert e.cost_latency_ms == 0
     assert e.group_id is None
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         e.outcome = "error"  # type: ignore[misc]
 
 
@@ -71,9 +73,31 @@ def test_role_enum():
     assert Role.AGENT == "agent"
 
 
-def test_legacy_symbols_still_importable_but_warn():
+@pytest.mark.parametrize("symbol_name", [
+    "PermissionBehavior",
+    "PermissionDecision",
+    "PermissionChecker",
+    "PermissionAsker",
+    "allow",
+    "deny",
+    "ask",
+    "PermissionCheckFn",
+])
+def test_legacy_symbols_emit_deprecation_warning(symbol_name):
+    import importlib
     import warnings
+    mod = importlib.import_module("topsport_agent.types.permission")
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        from topsport_agent.types.permission import PermissionBehavior  # noqa: F401
-        assert any("deprecated" in str(x.message).lower() for x in w)
+        getattr(mod, symbol_name)
+        assert any(
+            isinstance(x.message, DeprecationWarning)
+            and "deprecated" in str(x.message).lower()
+            for x in w
+        ), f"{symbol_name} did not emit DeprecationWarning"
+
+
+def test_unknown_attribute_raises_attribute_error():
+    import topsport_agent.types.permission as mod
+    with pytest.raises(AttributeError, match="has no attribute"):
+        mod.ThisSymbolDoesNotExist  # noqa: B018

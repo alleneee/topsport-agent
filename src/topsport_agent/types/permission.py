@@ -176,7 +176,7 @@ class _PermissionAsker(Protocol):
     ) -> _PermissionDecision: ...
 
 
-PermissionCheckFn = Callable[
+_PermissionCheckFn = Callable[
     ["ToolSpec", "ToolCall", "ToolContext"], Awaitable[_PermissionDecision]
 ]
 
@@ -189,6 +189,7 @@ _LEGACY_ALIASES: dict[str, Any] = {
     "allow": _allow,
     "deny": _deny,
     "ask": _ask,
+    "PermissionCheckFn": _PermissionCheckFn,
 }
 
 
