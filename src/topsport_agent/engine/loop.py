@@ -9,8 +9,11 @@ from typing import Any
 from ..llm.provider import LLMProvider, LLMResponse, StreamingLLMProvider
 from ..llm.request import LLMRequest
 from ..llm.response import wrap_response_metadata
+from ..tools.blob_store import BlobStore
+from ..tools.output_cap import enforce_cap
 from ..types.events import Event, EventType
 from ..types.message import Message, Role, ToolCall, ToolResult
+from ..types.permission import PermissionAsker, PermissionBehavior, PermissionChecker
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
@@ -67,6 +70,10 @@ class Engine:
         post_step_hooks: list[PostStepHook] | None = None,
         event_subscribers: list[EventSubscriber] | None = None,
         sanitizer: ToolResultSanitizer | None = None,
+        blob_store: BlobStore | None = None,
+        default_max_result_chars: int | None = None,
+        permission_checker: PermissionChecker | None = None,
+        permission_asker: PermissionAsker | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -79,6 +86,16 @@ class Engine:
         # 非 None 时对 untrusted 工具结果做 prompt injection 防御，并在 system
         # prompt 里注入 security guard section 告知 LLM 围栏语义。
         self._sanitizer = sanitizer
+        # blob_store 为 None 时 Engine 不做 output cap（或仅切片但不落盘）——向后兼容。
+        # 非 None 时，工具结果超过 ToolSpec.max_result_chars（或 default_max_result_chars）
+        # 自动落盘，返回 {preview, blob_ref, original_size} 给 LLM，避免 context 爆炸。
+        self._blob_store = blob_store
+        self._default_max_result_chars = default_max_result_chars
+        # permission_checker 为 None 时引擎行为与以前完全一致（不做任何权限检查）。
+        # 注入 DefaultPermissionChecker 可启用基于 ToolSpec 字段的默认策略；
+        # 具体 asker 由调用方实现（CLI 终端 / server SSE / CI 环境等）。
+        self._permission_checker = permission_checker
+        self._permission_asker = permission_asker
         self._cancel_event = asyncio.Event()
         # subscriber 失败计数（按 name 分组）。critical=True 的 subscriber 失败
         # 应该被外部健康检查消费，决定是否标记实例为 degraded。
@@ -103,6 +120,11 @@ class Engine:
     def add_event_subscriber(self, subscriber: EventSubscriber) -> None:
         """追加一个 EventSubscriber。Engine 构造后的能力装配（如 metrics）走此接口。"""
         self._event_subscribers.append(subscriber)
+
+    def add_tool_source(self, source: ToolSource) -> None:
+        """追加一个 ToolSource。Engine 构造后按需注入动态工具（如 orchestrator 的
+        plan_context bridge）。每步 _snapshot_tools 会看到新源。"""
+        self._tool_sources.append(source)
 
     def capabilities_report(self) -> dict[str, list[str]]:
         """一站式能力快照：工具 / 工具源 / 上下文提供者 / 订阅者名字。
@@ -474,13 +496,175 @@ class Engine:
             )
             yield self._transition(session, RunState.ERROR)
 
+    async def _invoke_tool(
+        self,
+        call: ToolCall,
+        tool: ToolSpec | None,
+        session: Session,
+    ) -> tuple[ToolResult, str]:
+        """执行单个 tool_call：validate_input → handler → 异常 → 返回 (result, trust_level)。
+
+        独立成方法是为了让并发组（concurrency_safe）可预先 asyncio.create_task 本方法，
+        外层 yield 事件时 await 已完成的 task，事件顺序保持和 calls 列表一致。
+        """
+        if tool is None:
+            return (
+                ToolResult(
+                    call_id=call.id,
+                    output=f"tool '{call.name}' not registered",
+                    is_error=True,
+                ),
+                "trusted",
+            )
+        trust_level = getattr(tool, "trust_level", "trusted")
+        # Pre-flight 参数校验：返回错误字符串则跳过 handler，直接回 LLM 自我修正。
+        # 对标 CC 的 validateInput() -> ValidationResult。
+        validator = getattr(tool, "validate_input", None)
+        if validator is not None:
+            try:
+                err = await validator(call.arguments)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                return (
+                    ToolResult(
+                        call_id=call.id,
+                        output=f"validate_input raised {type(exc).__name__}: {exc}",
+                        is_error=True,
+                    ),
+                    trust_level,
+                )
+            if err is not None:
+                return (
+                    ToolResult(call_id=call.id, output=err, is_error=True),
+                    trust_level,
+                )
+
+        ctx = ToolContext(
+            session_id=session.id,
+            call_id=call.id,
+            cancel_event=self._cancel_event,
+        )
+
+        # Permission check：checker 返回 DENY/ASK→(asker→)→ 最终决策。
+        # checker 为 None 完全跳过（兼容现有行为）。
+        effective_args = call.arguments
+        if self._permission_checker is not None:
+            try:
+                decision = await self._permission_checker.check(tool, call, ctx)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                _logger.warning(
+                    "permission_checker %r raised %r for %s; treating as DENY",
+                    getattr(self._permission_checker, "name", "?"),
+                    exc,
+                    call.name,
+                    exc_info=True,
+                )
+                return (
+                    ToolResult(
+                        call_id=call.id,
+                        output=f"permission_checker error: {type(exc).__name__}: {exc}",
+                        is_error=True,
+                    ),
+                    trust_level,
+                )
+            if decision.behavior == PermissionBehavior.ASK:
+                if self._permission_asker is None:
+                    # 无 asker 的保守默认：直接拒绝。日志里记一下，便于排查。
+                    _logger.info(
+                        "no PermissionAsker configured; denying %s (reason=%r)",
+                        call.name, decision.reason,
+                    )
+                    return (
+                        ToolResult(
+                            call_id=call.id,
+                            output=decision.reason or "permission ask without asker; denied",
+                            is_error=True,
+                        ),
+                        trust_level,
+                    )
+                try:
+                    decision = await self._permission_asker.ask(
+                        tool, call, ctx, decision.reason,
+                    )
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    _logger.warning(
+                        "permission_asker %r raised %r for %s; treating as DENY",
+                        getattr(self._permission_asker, "name", "?"),
+                        exc,
+                        call.name,
+                        exc_info=True,
+                    )
+                    return (
+                        ToolResult(
+                            call_id=call.id,
+                            output=f"permission_asker error: {type(exc).__name__}: {exc}",
+                            is_error=True,
+                        ),
+                        trust_level,
+                    )
+                # asker 再返回 ASK 是契约违反，保守按 DENY 处理
+                if decision.behavior == PermissionBehavior.ASK:
+                    decision = decision.__class__(
+                        PermissionBehavior.DENY,
+                        reason="asker returned ASK; contract violation",
+                    )
+            if decision.behavior == PermissionBehavior.DENY:
+                return (
+                    ToolResult(
+                        call_id=call.id,
+                        output=decision.reason or f"tool '{call.name}' denied",
+                        is_error=True,
+                    ),
+                    trust_level,
+                )
+            # ALLOW：允许 checker/asker 改写入参（如安全路径重写）
+            if decision.updated_input is not None:
+                effective_args = decision.updated_input
+
+        try:
+            output = await tool.handler(effective_args, ctx)
+            # 自动 blob offload：超过 ToolSpec.max_result_chars 时全量落盘 + 预览回传。
+            # 无 blob_store 或 cap 未设置时 enforce_cap 行为退化（仅切片或直通）。
+            cap = tool.max_result_chars if tool.max_result_chars is not None else self._default_max_result_chars
+            if cap is not None:
+                cap_result = enforce_cap(output, cap, self._blob_store)
+                output = cap_result.output
+            return ToolResult(call_id=call.id, output=output), trust_level
+        except Cancelled:
+            raise
+        except Exception as exc:
+            return (
+                ToolResult(
+                    call_id=call.id,
+                    output=f"{type(exc).__name__}: {exc}",
+                    is_error=True,
+                ),
+                trust_level,
+            )
+
     async def _execute_tool_calls(
         self,
         session: Session,
         calls: list[ToolCall],
         pool: list[ToolSpec],
     ) -> AsyncIterator[Event]:
-        for call in calls:
+        # 并发分组策略：concurrency_safe 的 handler 预先 create_task 后台跑，事件仍按
+        # calls 原顺序 yield（测试可预期）。unsafe 的走原地串行。连续多个 read_only
+        # browser_get_text / search 这种一次能省大量 wall-clock。
+        scheduled: dict[int, asyncio.Task[tuple[ToolResult, str]]] = {}
+        for idx, call in enumerate(calls):
+            tool = self._find_tool(call.name, pool)
+            if tool is not None and getattr(tool, "concurrency_safe", False):
+                scheduled[idx] = asyncio.create_task(
+                    self._invoke_tool(call, tool, session)
+                )
+
+        for idx, call in enumerate(calls):
             self._raise_if_cancelled()
 
             tool = self._find_tool(call.name, pool)
@@ -494,32 +678,18 @@ class Engine:
                 },
             )
 
-            if tool is None:
-                result = ToolResult(
-                    call_id=call.id,
-                    output=f"tool '{call.name}' not registered",
-                    is_error=True,
-                )
-                trust_level = "trusted"
-            else:
-                trust_level = getattr(tool, "trust_level", "trusted")
+            if idx in scheduled:
+                # 并发已调度——要么已完成、要么很快完成；await 拿结果即可。
                 try:
-                    # 工具上下文把取消信号和调用元信息一起传给 handler。
-                    ctx = ToolContext(
-                        session_id=session.id,
-                        call_id=call.id,
-                        cancel_event=self._cancel_event,
-                    )
-                    output = await tool.handler(call.arguments, ctx)
-                    result = ToolResult(call_id=call.id, output=output)
+                    result, trust_level = await scheduled[idx]
                 except Cancelled:
+                    # 取消其他未完成的并发 task，避免资源泄漏
+                    for other_idx, task in scheduled.items():
+                        if other_idx != idx and not task.done():
+                            task.cancel()
                     raise
-                except Exception as exc:
-                    result = ToolResult(
-                        call_id=call.id,
-                        output=f"{type(exc).__name__}: {exc}",
-                        is_error=True,
-                    )
+            else:
+                result, trust_level = await self._invoke_tool(call, tool, session)
 
             # Prompt injection 防御：untrusted 工具结果在落入 session.messages 前消毒。
             # sanitizer 为 None 时直通，保证向后兼容。

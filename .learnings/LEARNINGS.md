@@ -1,5 +1,189 @@
 # Project Learnings
 
+## TypeVar bound to `BaseModel` preserves type inference in factory classmethods
+
+**Context:** `ToolSpec.from_model(input_model=MyInput, handler=my_handler)` was
+initially typed as `handler: Callable[[BaseModel, ToolContext], Awaitable[Any]]`.
+Pyright rejected every call site because concrete subclasses (`_SearchInput`)
+are not parameter-level substitutable for `BaseModel` — callable parameters are
+contravariant.
+
+**Learned:** Use a bounded TypeVar so the factory binds `T = MyInput` for that
+specific call:
+
+```python
+from typing import TypeVar
+_BM = TypeVar("_BM", bound="BaseModel")
+
+@classmethod
+def from_model(
+    cls, *,
+    input_model: type[_BM],
+    handler: Callable[[_BM, ToolContext], Awaitable[Any]],
+    **kwargs,
+) -> "ToolSpec": ...
+```
+
+Now `input_model=MySearchInput` forces `_BM=MySearchInput`, and the handler
+parameter type flows through — IDE completion and mypy/Pyright work. Without
+the TypeVar, every caller has to annotate their handler as `BaseModel` and
+lose field-level types in the body.
+
+**Evidence:** `src/topsport_agent/types/tool.py::ToolSpec.from_model`,
+`tests/test_toolspec_pydantic.py::test_handler_receives_typed_pydantic_instance`.
+
+---
+
+## Fail-closed is the only safe default for permission machinery
+
+**Context:** Designing the permission subsystem (`types/permission.py` +
+`engine/permission.py`). Four failure modes exist: checker not configured,
+checker raises, asker not configured, asker returns ASK (contract violation).
+
+**Learned:** Every single non-ALLOW path must default to DENY. Dropping any
+one of these gates opens a "permissive by accident" hole:
+
+| Failure mode | Wrong default | Right default |
+|---|---|---|
+| `permission_checker=None` | block everything | **let it through** (opt-in API: no checker means no policy, back-compat) |
+| checker raises exception | retry / allow | **DENY** with "checker error: ..." |
+| checker returns ASK, no asker | treat as ALLOW | **DENY** "no asker configured" |
+| asker raises exception | allow | **DENY** with "asker error: ..." |
+| asker returns ASK | loop | **DENY** "contract violation" |
+
+The first row is the only "allow by default" — and only because the checker
+itself is explicitly opt-in. Once the user has configured a checker, ALL
+other failure modes deny.
+
+Also: `PermissionDecision` must be `frozen=True`. Non-frozen decisions let a
+rogue subscriber mutate `decision.behavior` from ALLOW to DENY (or vice versa)
+between the checker and the handler call.
+
+**Evidence:** `src/topsport_agent/engine/loop.py::_invoke_tool` (permission block),
+`tests/test_permission.py::test_checker_exception_treated_as_deny`,
+`tests/test_permission.py::test_destructive_denied_when_no_asker`.
+
+---
+
+## `dataclasses.replace` is the correct tool for ToolSpec decorators
+
+**Context:** `tools/executor.py::ToolExecutor.wrap` was hand-constructing a new
+`ToolSpec(name=..., description=..., parameters=..., handler=...)` to wrap the
+handler. This silently dropped every field not listed in that constructor call —
+the original bug was dropping `trust_level`. When we added `read_only`,
+`destructive`, `concurrency_safe`, `max_result_chars`, `validate_input`, a hand-
+constructed wrapper would have dropped all five.
+
+**Learned:** Always use `dataclasses.replace(spec, handler=new_handler)` for
+decorator-style wrappers over dataclasses. It copies every field by default,
+so future field additions to `ToolSpec` flow through wrappers automatically.
+Hand-constructing is fragile: every new field is a landmine for every
+pre-existing wrapper.
+
+Write a regression test that asserts all metadata fields survive wrapping —
+we caught the trust_level loss only after noticing sanitizer was suddenly
+direct-passing untrusted results, which took longer than it should have.
+
+**Evidence:** `src/topsport_agent/tools/executor.py:wrap`,
+`tests/test_toolspec_extended.py::test_tool_executor_wrap_preserves_all_fields`.
+
+---
+
+## Pre-scheduling with asyncio.create_task inside an async generator
+
+**Context:** Engine's `_execute_tool_calls` is an async generator that yields
+`TOOL_CALL_START/END` events in `calls`-list order — tests and tracers depend
+on this order. But we also wanted concurrent execution for `concurrency_safe`
+tools. Running `asyncio.gather` would break the event ordering guarantee.
+
+**Learned:** The clean pattern is **pre-schedule as tasks, await in order**:
+
+```python
+# Phase 1: pre-schedule all concurrency_safe handlers as background tasks
+scheduled: dict[int, asyncio.Task] = {}
+for idx, call in enumerate(calls):
+    tool = _find_tool(call.name, pool)
+    if tool and tool.concurrency_safe:
+        scheduled[idx] = asyncio.create_task(_invoke_tool(call, tool, session))
+
+# Phase 2: iterate in original order, yielding events; await if pre-scheduled
+for idx, call in enumerate(calls):
+    yield TOOL_CALL_START_event(...)
+    result = await scheduled[idx] if idx in scheduled else await _invoke_tool(...)
+    yield TOOL_CALL_END_event(...)
+```
+
+Handlers run in parallel (wall-clock win), but events still emit in the original
+call order (observability invariant preserved). Cancellation in the middle of
+the loop must `task.cancel()` the remaining scheduled tasks or they leak into
+the event loop.
+
+Never let yourself reorder events by completion time "for performance" —
+subscribers (tracer, metrics, server SSE) rely on the causal order, and
+debugging out-of-order event streams is far worse than losing a few ms.
+
+**Evidence:** `src/topsport_agent/engine/loop.py::_execute_tool_calls`,
+`tests/test_toolspec_extended.py::test_concurrency_safe_tools_run_in_parallel`,
+`tests/test_toolspec_extended.py::test_mixed_safe_and_unsafe_in_same_batch`.
+
+---
+
+## Parallel schema layer: pydantic `extra="ignore"` for backwards-compatible typing
+
+**Context:** Borrowing claude-code's Zod `discriminatedUnion` pattern for `Event.payload`
+in `types/event_payloads.py`. 20+ call sites already read `event.payload.get(...)` as
+untyped dict; a one-shot migration to strict types was too risky.
+
+**Learned:** Pydantic's `ConfigDict(extra="ignore", frozen=True)` is the right escape
+hatch for adding a typed access layer to an existing dict payload without breaking
+existing consumers:
+
+- `extra="ignore"` silently drops fields the schema doesn't declare → publishers can
+  keep adding debug/telemetry fields without coordinating with every subscriber
+- `frozen=True` prevents cross-subscriber mutation after validation
+- The original `payload: dict[str, Any]` stays untouched — old code paths continue
+  to work, new code paths opt in via `event.typed_payload()`
+
+Key design choice: **don't** use `extra="forbid"` here. Forbid surfaces publisher
+drift as validation errors in every subscriber, which breaks the gradual-adoption
+story. `ignore` makes the schema a **minimum contract** for subscribers rather than
+a maximum contract for publishers.
+
+Strictness is preserved where it matters: required fields missing → `ValidationError`,
+type coercion failures (e.g. `"not-a-bool"` for `is_error`) → `ValidationError`.
+Assignment on returned model → `ValidationError` due to `frozen=True`.
+
+**Evidence:** `src/topsport_agent/types/event_payloads.py`, `src/topsport_agent/types/events.py:55-73`,
+`tests/test_event_payloads.py`.
+
+---
+
+## Don't inherit `Protocol` in test doubles — duck-type instead
+
+**Context:** Writing a `_ScriptedProvider` test fixture that satisfies `LLMProvider`.
+
+**Learned:** Python's `typing.Protocol` is structural by design — implementers should
+**not** `class Foo(LLMProvider)` inherit it. Pyright treats fields declared on the
+Protocol (like `name: str`) as abstract when you inherit, and reports
+`reportAbstractUsage` unless every Protocol attribute is explicitly implemented.
+
+Duck-type instead:
+
+```python
+class _ScriptedProvider:            # no inheritance
+    name = "scripted"               # plain class attr satisfies the Protocol
+    async def complete(self, request): ...
+```
+
+Engine code only sees `LLMProvider` through structural checks
+(`isinstance(provider, StreamingLLMProvider)` with `@runtime_checkable`), so
+duck-typed classes pass at runtime and at type-check time.
+
+**Evidence:** `tests/test_event_payloads.py::_ScriptedProvider`,
+`src/topsport_agent/llm/provider.py:11-16`.
+
+---
+
 ## Langfuse Python SDK v3 has a non-context-manager API
 
 **Context:** Wiring LangfuseTracer as an EventSubscriber in `observability/langfuse_tracer.py`.

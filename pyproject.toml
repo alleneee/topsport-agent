@@ -5,6 +5,7 @@ description = "Agent runtime with ReAct loop, multi-provider LLM abstraction, an
 requires-python = ">=3.11"
 dependencies = [
     "prompt_toolkit>=3.0.0",
+    "pydantic>=2.0",
     "rich>=13.0.0",
 ]
 

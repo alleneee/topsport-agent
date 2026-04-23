@@ -8,17 +8,21 @@ and session-scoped working memory.
 Multi-agent plan mode landed. Browser control module added. Claude plugin
 ecosystem integration added. Tagged prompt section system added. Agent
 abstraction layer with default/browser presets. File operation tool suite.
-Real sub-agent execution via spawn_agent. LLM streaming output. 383 tests
-passing.
+Real sub-agent execution via spawn_agent. LLM streaming output. Conditional
+plan DAG with shared `PlanContext`, post-condition refine loops, and
+plan-level checkpointing. Claude-Code schema parity: typed event payloads,
+extended `ToolSpec` metadata, automatic blob offload for large tool outputs,
+pydantic-driven input schemas, and an injectable permission system
+(checker + asker, fail-closed). 705 tests passing.
 
 | Module | Location | State |
 | --- | --- | --- |
-| types | `src/topsport_agent/types/` | message, tool, session, events (incl. RUN_START/RUN_END) |
+| types | `src/topsport_agent/types/` | message, tool (+metadata / `from_model`), session, events, event_payloads, plan, plan_context, permission |
 | llm | `src/topsport_agent/llm/` | `LLMRequest` / `LLMResponse` contract + provider Protocol |
 | llm.clients | `src/topsport_agent/llm/clients/` | SDK client construction, env resolution, transport calls, transient retry |
 | llm.providers | `src/topsport_agent/llm/providers/` | provider orchestration around SDK clients |
 | llm.adapters | `src/topsport_agent/llm/adapters/` | provider-specific payload/response codecs |
-| engine | `src/topsport_agent/engine/` | ReAct loop, cancel, hooks, event dispatch, planner, orchestrator |
+| engine | `src/topsport_agent/engine/` | ReAct loop, cancel, hooks, planner, orchestrator, checkpoint, plan_context_tools, permission |
 | memory | `src/topsport_agent/memory/` | file store, injector, save/recall/forget tools |
 | skills | `src/topsport_agent/skills/` | registry, loader, matcher, injector, load/unload/list tools |
 | browser | `src/topsport_agent/browser/` | Playwright-based browser control with snapshot/ref interaction model |
@@ -28,7 +32,7 @@ passing.
 | plugins | `src/topsport_agent/plugins/` | Claude Code plugin ecosystem: discovery, skills, agents, hooks |
 | agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
-| tests | `tests/` | 341 passing |
+| tests | `tests/` | 705 passing |
 
 ## Quickstart
 
@@ -265,7 +269,9 @@ Providers without section metadata default to tag `"context"`, priority 500.
 
 ## Engine hooks
 
-`Engine.__init__` accepts four optional hook collections:
+`Engine.__init__` accepts these optional injection points:
+
+### Capability hooks
 
 - `context_providers` — return extra `Message` objects merged into the LLM call
   without being persisted into `session.messages`. Memory, skill, and MCP prompt
@@ -278,6 +284,169 @@ Providers without section metadata default to tag `"context"`, priority 500.
   `LLM_CALL_*`, `TOOL_CALL_*`, `STATE_CHANGED`, `ERROR`, `CANCELLED`, `RUN_END`) in
   order. Exceptions in one subscriber do not affect the engine or other subscribers.
   Tracers and loggers attach here.
+
+### Safety / resource hooks
+
+- `sanitizer` — prompt-injection defense applied to `untrusted` tool results
+  before they land in `session.messages`.
+- `blob_store` + `default_max_result_chars` — automatic offload of oversized tool
+  outputs: full payload goes to blob storage, preview + `blob_ref` returned to
+  LLM. See [Tool Metadata & Concurrency](#tool-metadata--concurrency).
+- `permission_checker` + `permission_asker` — gate tool handler execution
+  behind a two-stage ALLOW/DENY/ASK decision. See
+  [Permission System](#permission-system).
+
+## Typed Event Payloads
+
+Each `EventType` has a declared pydantic payload schema in
+`types/event_payloads.py`. Subscribers keep the existing
+`event.payload.get(...)` dict access for back-compat; new code can call
+`event.typed_payload()` for a validated, strongly-typed model instance:
+
+```python
+async def on_event(self, event: Event) -> None:
+    if event.type == EventType.LLM_CALL_END:
+        # dict access still works
+        tokens = event.payload.get("usage", {})
+        # typed access gives IDE autocomplete and runtime validation
+        typed = event.typed_payload()  # LLMCallEndPayload
+        assert typed.tool_call_count >= 0
+```
+
+Design choices (parallel schema, not replacement):
+
+- `Event.payload: dict[str, Any]` is untouched — 20+ existing consumers (CLI,
+  server SSE, tracer, metrics, hook runner) keep working.
+- Each payload model uses `extra="ignore"` so publishers can add debug fields
+  without breaking subscribers. The schema is the **minimum contract** for
+  subscribers, not the maximum contract for publishers.
+- `frozen=True` prevents one subscriber from mutating the model before the
+  next subscriber sees it.
+- Module load asserts every `EventType` has a registered schema — forgetting
+  to register a new event fails fast.
+
+## Tool Metadata & Concurrency
+
+`ToolSpec` carries declarative metadata that drives permission, concurrency,
+and result-size policies:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `trust_level` | `"trusted"` | `"untrusted"` routes through `sanitizer` before landing in session |
+| `read_only` | `False` | No side effects (pure query); default permission allow |
+| `destructive` | `False` | Irreversible (delete/overwrite/send); default permission asks |
+| `concurrency_safe` | `False` | Engine may run with other safe tools via `asyncio.create_task` |
+| `max_result_chars` | `None` | Trigger blob offload when result exceeds cap |
+| `validate_input` | `None` | Async pre-flight; returning a string skips handler and sends the error to the LLM |
+| `input_schema` | `None` | Pydantic `BaseModel` class; `ToolSpec.from_model(...)` auto-exports `parameters` |
+
+### Concurrent tool execution
+
+When an assistant turn produces multiple `tool_calls`, the engine pre-schedules
+every `concurrency_safe` handler via `asyncio.create_task` while still yielding
+`TOOL_CALL_START/END` events in the original call order. Unsafe tools run
+synchronously in their turn. Observability is preserved; wall-clock wins are
+real (three 50 ms safe calls → ~55 ms total instead of 150 ms).
+
+### Pydantic input schemas
+
+```python
+from pydantic import BaseModel, Field
+from topsport_agent.types.tool import ToolSpec, ToolContext
+
+class SearchInput(BaseModel):
+    query: str = Field(min_length=1)
+    limit: int = Field(default=10, ge=1, le=100)
+
+async def search(inp: SearchInput, ctx: ToolContext) -> list[str]:
+    return do_search(inp.query, inp.limit)
+
+spec = ToolSpec.from_model(
+    name="search",
+    description="Search the knowledge base",
+    input_model=SearchInput,
+    handler=search,          # typed handler signature
+    read_only=True,
+    concurrency_safe=True,
+)
+# spec.parameters is auto-generated from SearchInput.model_json_schema()
+```
+
+Validation errors are caught automatically and returned as
+`{"error": "invalid_input", "detail": [...]}` so the LLM can self-correct.
+
+### Blob offload
+
+```python
+from topsport_agent.tools.blob_store import FileBlobStore
+from topsport_agent.engine.loop import Engine, EngineConfig
+
+engine = Engine(
+    provider, tools, EngineConfig(model="..."),
+    blob_store=FileBlobStore("/tmp/blobs"),
+    default_max_result_chars=20_000,  # per-tool override via ToolSpec.max_result_chars
+)
+```
+
+When a tool returns more than the cap, the LLM sees
+`{"truncated": True, "original_size": N, "cap": C, "blob_ref": "blob://...", "preview": "..."}`
+while the full payload lives on disk.
+
+## Permission System
+
+Two-stage injectable decision flow modeled after the Claude-Code permission
+layer, minus the persisted rule set (that's a separate concern for deployment
+configuration):
+
+```python
+from topsport_agent.engine.permission import (
+    DefaultPermissionChecker,
+    AlwaysDenyAsker,
+)
+
+engine = Engine(
+    provider, tools, EngineConfig(model="..."),
+    permission_checker=DefaultPermissionChecker(),
+    permission_asker=AlwaysDenyAsker(),  # or your interactive CLI/server asker
+)
+```
+
+### Decision flow
+
+1. `permission_checker.check(tool, call, ctx)` returns `ALLOW` / `DENY` / `ASK`.
+2. On `ASK`, `permission_asker.ask(tool, call, ctx, reason)` gives the final
+   `ALLOW` / `DENY`.
+3. `ALLOW` may include `updated_input` — the handler receives the rewritten
+   arguments instead of the LLM's original (path normalization, safety
+   injection, etc.).
+4. `DENY` short-circuits the handler; the reason becomes the `ToolResult`
+   error content the LLM sees.
+
+### Fail-closed defaults
+
+Every non-ALLOW branch denies when something goes wrong:
+
+| Failure | Behavior |
+| --- | --- |
+| `permission_checker=None` | No checks (opt-in API; back-compat) |
+| Checker raises | `DENY` with `"checker error: ..."` |
+| Checker returns `ASK`, no asker configured | `DENY` |
+| Asker raises | `DENY` with `"asker error: ..."` |
+| Asker returns `ASK` (contract violation) | `DENY` |
+
+`PermissionDecision` is `frozen=True` so subscribers cannot mutate a decision
+between the checker and the handler.
+
+### Default checker policy
+
+`DefaultPermissionChecker` consumes `ToolSpec` metadata:
+
+- `destructive=True` → `ASK` (require asker approval)
+- `read_only=True` → `ALLOW`
+- Otherwise → `ALLOW` (back-compat with tools that predate metadata)
+
+Custom policies (tenant blacklists, regex-on-args, cached "always allow this
+command" state) implement the `PermissionChecker` Protocol directly.
 
 ## Skills
 
@@ -714,12 +883,115 @@ async for event in orch.execute():
 | --- | --- |
 | `plan.created` | Plan generated by planner |
 | `plan.approved` | Orchestrator begins execution |
-| `plan.step.start` | Sub-agent launched for a step |
-| `plan.step.end` | Sub-agent completed (success or failure) |
+| `plan.step.start` | Sub-agent launched for a step (payload includes `iteration`) |
+| `plan.step.end` | Sub-agent completed (success or failure); payload includes `iterations` |
+| `plan.step.skipped` | Step pre-condition returned False or raised |
+| `plan.step.loop` | Post-condition returned False; step looped back, downstream reset |
 | `plan.step.failed` | One or more steps in a wave failed |
 | `plan.waiting` | Orchestrator paused, waiting for user decision |
 | `plan.done` | All steps completed or skipped |
 | `plan.failed` | Plan aborted or no ready steps remain |
+
+### Conditional DAG — `condition`, `post_condition`, `max_iterations`
+
+`PlanStep` accepts two callables that read a shared `PlanContext` and a
+bounded loop counter:
+
+- `condition(ctx) -> bool` — evaluated at the start of every wave for each
+  ready step. Returning `False` marks the step `SKIPPED` and emits
+  `plan.step.skipped`. Raising is treated as "not satisfied" and recorded in
+  `step.error`.
+- `post_condition(ctx) -> bool` — evaluated after a step's sub-agent
+  finishes. Returning `False` sends the step back to `PENDING` and resets all
+  transitive downstream steps via `Plan.reset_dependents_of()` (DONE/FAILED
+  → PENDING, RUNNING/SKIPPED preserved, `iterations` counter preserved so
+  `max_iterations` is a hard ceiling). Exhausting `max_iterations` flips the
+  step to `FAILED` and enters the normal failure-handler flow.
+- `max_iterations: int = 1` — default is 1 (no looping). Set higher to
+  enable reflect-revise style loops with a guaranteed ceiling.
+
+Evaluation timing: both conditions run on an **immutable context snapshot
+taken at wave start**, so steps in the same wave see the same context and
+their order of completion does not affect each other's gating.
+
+### Shared State — `PlanContext`
+
+`PlanContext` is a pydantic `BaseModel` subclass users extend to declare the
+shared fields a plan needs. Merge semantics are declared per-field via
+`Annotated[..., Reducer(fn)]`:
+
+```python
+from typing import Annotated
+import operator
+from topsport_agent.types.plan_context import PlanContext, Reducer
+
+class MyCtx(PlanContext):
+    findings: Annotated[list[str], Reducer(operator.add)] = []  # append
+    attempts: Annotated[int, Reducer(lambda a, b: a + b)] = 0   # sum
+    mode: str = "exploring"                                      # override
+```
+
+Rules enforced at construction time:
+
+- `extra="forbid"` — typos in field names raise immediately; LLM-driven
+  writes cannot silently create junk fields.
+- `validate_assignment=True` — `Field(ge=..., le=...)` constraints still fire
+  on merge, so invalid values are rejected at write time.
+- Declaring two `Reducer` instances on one field raises `ValueError` at the
+  first merge — forces ambiguous merge semantics to be written as one
+  function instead of being implicit.
+
+### Sub-agent Tools: `plan_context_read` / `plan_context_merge`
+
+When a `Plan` is constructed with a `context=` value, the orchestrator
+auto-mounts two tools onto every sub-agent's Engine via a
+`PlanContextToolSource`:
+
+- `plan_context_read()` — returns the current context snapshot (JSON).
+- `plan_context_merge(key, value)` — applies the declared reducer for `key`
+  (or overwrites if none) and returns the new snapshot.
+
+Concurrency: all merges funnel through an `asyncio.Lock` inside
+`PlanContextBridge`, so concurrent sub-agents in the same wave cannot lose
+updates.
+
+Omitting `context` (`Plan(..., context=None)`) leaves these tools
+unregistered, so sub-agents of context-less plans have a clean tool surface.
+
+### Checkpointing
+
+Every plan-level event boundary (APPROVED, end-of-wave, SKIPPED, LOOP,
+terminal) writes a `PlanSnapshot` via the configured `Checkpointer`:
+
+```python
+from topsport_agent.engine.checkpoint import FileCheckpointer, PlanSnapshot
+
+ckpt = FileCheckpointer("./checkpoints")
+orch = Orchestrator(plan, config, checkpointer=ckpt)
+async for event in orch.execute():
+    ...
+
+# Crash recovery — build the same Plan skeleton, then apply saved state:
+plan2 = build_same_plan_skeleton()
+snap = await ckpt.load("review-job-42")
+if snap:
+    snap.apply_to(plan2, context_cls=MyCtx)
+orch2 = Orchestrator(plan2, config, checkpointer=ckpt)
+```
+
+Snapshots carry only mutable state (`status`, `result`, `error`,
+`iterations`, `context_data`) — `condition`, `post_condition`, and
+`depends_on` are code-level and must be rebuilt by the caller. Built-in
+backends:
+
+- `MemoryCheckpointer` — process-local dict (testing, single-run).
+- `FileCheckpointer(base_dir)` — one JSON per `plan_id`, atomic `tmp + rename`.
+  Rejects plan ids containing `/`, `..`, or NUL.
+
+Custom backends implement the `Checkpointer` Protocol
+(`async save(snapshot) -> None` / `async load(plan_id) -> PlanSnapshot | None`).
+Checkpoint write failures are logged as warnings and never block plan
+execution.
 
 ## Security — Prompt Injection Guard
 

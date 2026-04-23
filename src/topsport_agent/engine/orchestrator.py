@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -12,14 +12,21 @@ from ..types.message import Message, Role
 from ..types.plan import Plan, PlanStep, StepDecision, StepStatus
 from ..types.session import RunState, Session
 from ..types.tool import ToolSpec
+from .checkpoint import Checkpointer, build_checkpoint_hook
 from .hooks import ContextProvider, EventSubscriber, FailureHandler, StepConfigurator, ToolSource
 from .loop import Engine, EngineConfig
+from .plan_context_tools import PlanContextBridge, PlanContextToolSource
 
 if TYPE_CHECKING:
     # 仅类型标注用；Agent 位于上层包 agent/，运行时循环依赖通过延迟引用避开。
     from ..agent.base import Agent
 
 _logger = logging.getLogger(__name__)
+
+
+async def _noop_async() -> None:
+    """无 checkpointer 时的占位 hook。"""
+    return None
 
 
 @dataclass(slots=True)
@@ -45,12 +52,16 @@ class Orchestrator:
         failure_handlers: list[FailureHandler] | None = None,
         event_subscribers: list[EventSubscriber] | None = None,
         parent_agent: Agent | None = None,
+        checkpointer: Checkpointer | None = None,
     ) -> None:
         """H-A2（Orchestrator 侧）：若给 parent_agent，每个 step 通过
         parent_agent.spawn_child 继承父 Agent 的 context_providers / tool_sources /
         post_step_hooks / event_subscribers —— plan step 自动获得 skills / memory /
         compaction / tracing / metrics 等能力，与 /v1/chat/completions 行为对齐。
         未传 parent_agent 时回退到 SubAgentConfig 的老路径以保持兼容。
+
+        Phase 2c: `checkpointer` 给定后，在每个 step 边界事件后整体快照 plan。
+        None 时退化为 noop（与现有行为完全一致）。
         """
         self._plan = plan
         self._config = agent_config
@@ -64,6 +75,16 @@ class Orchestrator:
         self._pending_decision: StepDecision | None = None
         # 追踪存活的子引擎，cancel 时需要逐个传播。
         self._sub_engines: dict[str, Engine] = {}
+        # 无 checkpointer → noop；不在 execute() 里做 if ckpt is None 分支，保持调用点干净。
+        self._checkpoint: Callable[[], Awaitable[None]] = (
+            build_checkpoint_hook(checkpointer, plan) if checkpointer else _noop_async
+        )
+        # Plan 层共享 context 存在时，给 sub-agent 挂上 plan_context_read / plan_context_merge 工具
+        # 让 LLM 能显式读写共享状态（post_condition 判定就靠这些写入）。未配 context 则不注入，
+        # 避免 sub-agent 误用空工具。
+        self._context_bridge: PlanContextBridge | None = (
+            PlanContextBridge(plan) if plan.context is not None else None
+        )
 
     @property
     def plan(self) -> Plan:
@@ -119,6 +140,9 @@ class Orchestrator:
     def _create_engine(self, step: PlanStep, config: SubAgentConfig) -> Engine:
         # 每个 step 拿到完全隔离的 Engine+Session，不共享任何可变状态。
         # 事件订阅者直接透传给子引擎，子引擎事件不经过编排器中转。
+        sources: list[ToolSource] = list(config.tool_sources or [])
+        if self._context_bridge is not None:
+            sources.append(PlanContextToolSource(self._context_bridge))
         engine = Engine(
             provider=config.provider,
             tools=list(config.tools),
@@ -128,7 +152,7 @@ class Orchestrator:
                 provider_options=config.provider_options,
             ),
             context_providers=list(config.context_providers or []),
-            tool_sources=list(config.tool_sources or []),
+            tool_sources=sources,
             event_subscribers=list(self._event_subscribers),
         )
         self._sub_engines[step.id] = engine
@@ -175,6 +199,8 @@ class Orchestrator:
 
     async def _run_step(self, step: PlanStep, config: SubAgentConfig) -> None:
         # 跑完整个子代理循环，最终把引擎结果映射回 step 状态。引擎结束后立即从存活表移除。
+        # iterations 在执行前 +=1：哪怕 sub-agent 异常也算一次尝试，避免异常路径绕过 max_iterations。
+        step.iterations += 1
         try:
             if self._parent_agent is not None:
                 session, engine = await self._spawn_via_parent(step, config)
@@ -222,6 +248,9 @@ class Orchestrator:
         # 把 orchestrator 自己订阅者也挂到子引擎（和旧路径一致）
         for sub in self._event_subscribers:
             engine.add_event_subscriber(sub)
+        # plan_context bridge 走 add_tool_source（spawn_child 已构造完 engine，无法走构造参数）
+        if self._context_bridge is not None:
+            engine.add_tool_source(PlanContextToolSource(self._context_bridge))
         return session, engine
 
     async def execute(self) -> AsyncIterator[Event]:
@@ -239,6 +268,8 @@ class Orchestrator:
         )
         await self._emit(ev)
         yield ev
+        # Phase 2c: 起点快照，让 load() 能拿到"已批准但未开跑"的初始态
+        await self._checkpoint()
 
         while not self._plan.is_complete():
             if self._cancel_event.is_set():
@@ -251,13 +282,67 @@ class Orchestrator:
             if not ready:
                 break
 
+            # Phase 2b: condition 过滤。波次开始时对本波 ready step 统一求值（context 快照），
+            # 同波并发 step 互不影响彼此的 condition 输入——可预测、调试友好。
+            # condition False → 标 SKIPPED，不进入本波执行。
+            filtered_ready: list[PlanStep] = []
+            ctx = self._plan.context
+            for step in ready:
+                if step.condition is not None and ctx is not None:
+                    try:
+                        passed = bool(step.condition(ctx))
+                    except Exception as exc:
+                        # condition 抛错按"未满足"处理，标 SKIPPED 并记录 error，避免整个 plan 崩。
+                        step.status = StepStatus.SKIPPED
+                        step.error = f"condition raised {type(exc).__name__}: {exc}"
+                        skip_ev = self._event(
+                            EventType.PLAN_STEP_SKIPPED,
+                            {
+                                "plan_id": self._plan.id,
+                                "step_id": step.id,
+                                "reason": "condition_error",
+                                "error": step.error,
+                            },
+                        )
+                        await self._emit(skip_ev)
+                        yield skip_ev
+                        await self._checkpoint()
+                        continue
+                    if not passed:
+                        step.status = StepStatus.SKIPPED
+                        skip_ev = self._event(
+                            EventType.PLAN_STEP_SKIPPED,
+                            {
+                                "plan_id": self._plan.id,
+                                "step_id": step.id,
+                                "reason": "condition_false",
+                            },
+                        )
+                        await self._emit(skip_ev)
+                        yield skip_ev
+                        await self._checkpoint()
+                        continue
+                filtered_ready.append(step)
+
+            # 整波都被 condition 过滤掉：下一轮 while 会重新检查完成态；若所有剩余 pending
+            # 都被 condition 过滤，is_complete() 为 true（SKIPPED 计入终态），正常结束。
+            if not filtered_ready:
+                continue
+
+            ready = filtered_ready
+
             step_configs: dict[str, SubAgentConfig] = {}
             for step in ready:
                 step_configs[step.id] = await self._configure_step(step)
                 step.status = StepStatus.RUNNING
                 ev = self._event(
                     EventType.PLAN_STEP_START,
-                    {"plan_id": self._plan.id, "step_id": step.id, "title": step.title},
+                    {
+                        "plan_id": self._plan.id,
+                        "step_id": step.id,
+                        "title": step.title,
+                        "iteration": step.iterations + 1,  # _run_step 里会 +=1
+                    },
                 )
                 await self._emit(ev)
                 yield ev
@@ -274,7 +359,55 @@ class Orchestrator:
                 yield ev
                 return
 
+            # Phase 2b: post_condition 回跳判定。只对本波 DONE 且带 post_condition 的 step 求值。
+            # 返回 False → 本 step 标回 PENDING、重置下游、发 PLAN_STEP_LOOP；
+            # 达到 max_iterations 仍 False → 标 FAILED（走现有失败决策流程）。
+            if ctx is not None:
+                for step in ready:
+                    if step.status != StepStatus.DONE or step.post_condition is None:
+                        continue
+                    try:
+                        satisfied = bool(step.post_condition(ctx))
+                    except Exception as exc:
+                        step.status = StepStatus.FAILED
+                        step.error = (
+                            f"post_condition raised {type(exc).__name__}: {exc}"
+                        )
+                        continue
+                    if satisfied:
+                        continue
+                    # 不满足 → 判是否还能再跑
+                    if step.iterations >= step.max_iterations:
+                        step.status = StepStatus.FAILED
+                        step.error = (
+                            f"post_condition not satisfied after "
+                            f"{step.iterations} iteration(s) (max={step.max_iterations})"
+                        )
+                        continue
+                    # 回跳：本 step 回 PENDING + 重置传递下游，下轮 while 再次 ready
+                    reset_ids = self._plan.reset_dependents_of(step.id)
+                    step.status = StepStatus.PENDING
+                    step.result = None
+                    step.error = None
+                    loop_ev = self._event(
+                        EventType.PLAN_STEP_LOOP,
+                        {
+                            "plan_id": self._plan.id,
+                            "step_id": step.id,
+                            "iteration": step.iterations,
+                            "max_iterations": step.max_iterations,
+                            "reset_dependents": reset_ids,
+                        },
+                    )
+                    await self._emit(loop_ev)
+                    yield loop_ev
+                    await self._checkpoint()
+
             for step in ready:
+                # 被 LOOP 重置回 PENDING 的 step 不发 PLAN_STEP_END（它还没 "end"），
+                # 其它状态（DONE/FAILED/SKIPPED）都要发一次 END 让订阅者记账。
+                if step.status == StepStatus.PENDING:
+                    continue
                 ev = self._event(
                     EventType.PLAN_STEP_END,
                     {
@@ -283,10 +416,14 @@ class Orchestrator:
                         "status": step.status.value,
                         "result": step.result,
                         "error": step.error,
+                        "iterations": step.iterations,
                     },
                 )
                 await self._emit(ev)
                 yield ev
+
+            # 每波 step 全部 END 后做一次波次级快照（比 per-step 少写放大，仍足够细粒度）
+            await self._checkpoint()
 
             failed = [s for s in ready if s.status == StepStatus.FAILED]
             if failed:
@@ -329,6 +466,7 @@ class Orchestrator:
                     )
                     await self._emit(ev)
                     yield ev
+                    await self._checkpoint()
                     return
                 elif decision == StepDecision.SKIP:
                     for s in failed:
@@ -360,3 +498,5 @@ class Orchestrator:
             )
             await self._emit(ev)
             yield ev
+        # 终态快照：无论 DONE / FAILED / no_ready_steps，存一份给下游 observer 消费。
+        await self._checkpoint()
