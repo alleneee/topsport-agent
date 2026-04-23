@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..llm.provider import LLMProvider, LLMResponse, StreamingLLMProvider
 from ..llm.request import LLMRequest
@@ -19,6 +19,10 @@ from ..types.tool import ToolContext, ToolSpec
 from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
 from .prompt import PromptBuilder, SectionPriority
 from .sanitizer import SECURITY_GUARD_CONTENT, SECURITY_GUARD_TAG, ToolResultSanitizer
+
+if TYPE_CHECKING:
+    from .permission.audit import AuditLogger
+    from .permission.filter import ToolVisibilityFilter
 
 _logger = logging.getLogger(__name__)
 
@@ -74,6 +78,8 @@ class Engine:
         default_max_result_chars: int | None = None,
         permission_checker: PermissionChecker | None = None,
         permission_asker: PermissionAsker | None = None,
+        permission_filter: "ToolVisibilityFilter | None" = None,
+        audit_logger: "AuditLogger | None" = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -96,6 +102,14 @@ class Engine:
         # 具体 asker 由调用方实现（CLI 终端 / server SSE / CI 环境等）。
         self._permission_checker = permission_checker
         self._permission_asker = permission_asker
+        # v2 capability-ACL hot-path hooks. permission_filter 为 None 时 _snapshot_tools
+        # 直通（向后兼容）；非 None 时在每步快照末尾做 required_permissions ⊆ granted
+        # 过滤 + 可选 kill-switch。audit_logger 为 None 时 _invoke_tool 不产生 AuditEntry。
+        self._permission_filter = permission_filter
+        self._audit_logger = audit_logger
+        # v2 hot path：_run_inner 开始时把 session 注入到这里，供 _snapshot_tools
+        # 默认参数回退使用。外部 patch 0-arg spy 也能正确读取当前 session。
+        self._current_session: Session | None = None
         self._cancel_event = asyncio.Event()
         # subscriber 失败计数（按 name 分组）。critical=True 的 subscriber 失败
         # 应该被外部健康检查消费，决定是否标记实例为 degraded。
@@ -173,7 +187,12 @@ class Engine:
                     " [CRITICAL]" if is_critical else "",
                 )
 
-    async def _snapshot_tools(self) -> list[ToolSpec]:
+    async def _snapshot_tools(self, session: Session | None = None) -> list[ToolSpec]:
+        # session 参数在 v2 capability-ACL 后被引擎内部通过 self._current_session
+        # 注入（见 _run_inner 的 try/finally 段）；显式传参也能覆盖，便于上层直接调用。
+        # 默认 None 是为了让老测试 / 外部 patch 无需关心签名差异。
+        if session is None:
+            session = self._current_session
         tools = list(self._tools)
         seen = {tool.name for tool in tools}
         for source in self._tool_sources:
@@ -185,6 +204,10 @@ class Engine:
                     continue
                 seen.add(tool.name)
                 tools.append(tool)
+        # v2 capability-ACL：静态能力过滤 + kill-switch 由 filter 统一处理。
+        # 未注入 filter 时完全跳过，保持旧行为（granted_permissions 不强制）。
+        if self._permission_filter is not None and session is not None:
+            tools = self._permission_filter.filter(tools, session)
         return tools
 
     async def _collect_ephemeral_context(self, session: Session) -> list[Message]:
@@ -384,6 +407,10 @@ class Engine:
         yield run_end
 
     async def _run_inner(self, session: Session) -> AsyncIterator[Event]:
+        # 把 session 挂到 self，确保 _snapshot_tools / 其他 hot-path 方法在被外部
+        # 0-arg 测试替身覆盖时仍能看到当前 session（capability filter 需要 session
+        # 的 granted_permissions / tenant_id）。run 结束后 finally 中清零避免跨会话泄漏。
+        self._current_session = session
         yield self._transition(session, RunState.RUNNING)
 
         try:
@@ -393,6 +420,8 @@ class Engine:
 
                 # 先冻结本步用到的上下文和工具集，避免一步内前后视图不一致。
                 ephemeral = await self._collect_ephemeral_context(session)
+                # 不传 session 位置参数：允许测试替身以 0-arg spy 覆盖本方法。
+                # 默认参数分支从 self._current_session 读取当前 session。
                 tools_snapshot = await self._snapshot_tools()
                 call_messages = self._build_call_messages(session, ephemeral)
 
@@ -508,14 +537,13 @@ class Engine:
         外层 yield 事件时 await 已完成的 task，事件顺序保持和 calls 列表一致。
         """
         if tool is None:
-            return (
-                ToolResult(
-                    call_id=call.id,
-                    output=f"tool '{call.name}' not registered",
-                    is_error=True,
-                ),
-                "trusted",
+            result = ToolResult(
+                call_id=call.id,
+                output=f"tool '{call.name}' not registered",
+                is_error=True,
             )
+            await self._audit_call(session, tool, call.arguments, result)
+            return result, "trusted"
         trust_level = getattr(tool, "trust_level", "trusted")
         # Pre-flight 参数校验：返回错误字符串则跳过 handler，直接回 LLM 自我修正。
         # 对标 CC 的 validateInput() -> ValidationResult。
@@ -526,19 +554,19 @@ class Engine:
             except Cancelled:
                 raise
             except Exception as exc:
-                return (
-                    ToolResult(
-                        call_id=call.id,
-                        output=f"validate_input raised {type(exc).__name__}: {exc}",
-                        is_error=True,
-                    ),
-                    trust_level,
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"validate_input raised {type(exc).__name__}: {exc}",
+                    is_error=True,
                 )
+                await self._audit_call(session, tool, call.arguments, result)
+                return result, trust_level
             if err is not None:
-                return (
-                    ToolResult(call_id=call.id, output=err, is_error=True),
-                    trust_level,
+                result = ToolResult(
+                    call_id=call.id, output=err, is_error=True,
                 )
+                await self._audit_call(session, tool, call.arguments, result)
+                return result, trust_level
 
         ctx = ToolContext(
             session_id=session.id,
@@ -562,14 +590,13 @@ class Engine:
                     call.name,
                     exc_info=True,
                 )
-                return (
-                    ToolResult(
-                        call_id=call.id,
-                        output=f"permission_checker error: {type(exc).__name__}: {exc}",
-                        is_error=True,
-                    ),
-                    trust_level,
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"permission_checker error: {type(exc).__name__}: {exc}",
+                    is_error=True,
                 )
+                await self._audit_call(session, tool, call.arguments, result)
+                return result, trust_level
             if decision.behavior == PermissionBehavior.ASK:
                 if self._permission_asker is None:
                     # 无 asker 的保守默认：直接拒绝。日志里记一下，便于排查。
@@ -577,14 +604,13 @@ class Engine:
                         "no PermissionAsker configured; denying %s (reason=%r)",
                         call.name, decision.reason,
                     )
-                    return (
-                        ToolResult(
-                            call_id=call.id,
-                            output=decision.reason or "permission ask without asker; denied",
-                            is_error=True,
-                        ),
-                        trust_level,
+                    result = ToolResult(
+                        call_id=call.id,
+                        output=decision.reason or "permission ask without asker; denied",
+                        is_error=True,
                     )
+                    await self._audit_call(session, tool, call.arguments, result)
+                    return result, trust_level
                 try:
                     decision = await self._permission_asker.ask(
                         tool, call, ctx, decision.reason,
@@ -599,14 +625,13 @@ class Engine:
                         call.name,
                         exc_info=True,
                     )
-                    return (
-                        ToolResult(
-                            call_id=call.id,
-                            output=f"permission_asker error: {type(exc).__name__}: {exc}",
-                            is_error=True,
-                        ),
-                        trust_level,
+                    result = ToolResult(
+                        call_id=call.id,
+                        output=f"permission_asker error: {type(exc).__name__}: {exc}",
+                        is_error=True,
                     )
+                    await self._audit_call(session, tool, call.arguments, result)
+                    return result, trust_level
                 # asker 再返回 ASK 是契约违反，保守按 DENY 处理
                 if decision.behavior == PermissionBehavior.ASK:
                     decision = decision.__class__(
@@ -614,14 +639,13 @@ class Engine:
                         reason="asker returned ASK; contract violation",
                     )
             if decision.behavior == PermissionBehavior.DENY:
-                return (
-                    ToolResult(
-                        call_id=call.id,
-                        output=decision.reason or f"tool '{call.name}' denied",
-                        is_error=True,
-                    ),
-                    trust_level,
+                result = ToolResult(
+                    call_id=call.id,
+                    output=decision.reason or f"tool '{call.name}' denied",
+                    is_error=True,
                 )
+                await self._audit_call(session, tool, call.arguments, result)
+                return result, trust_level
             # ALLOW：允许 checker/asker 改写入参（如安全路径重写）
             if decision.updated_input is not None:
                 effective_args = decision.updated_input
@@ -634,18 +658,43 @@ class Engine:
             if cap is not None:
                 cap_result = enforce_cap(output, cap, self._blob_store)
                 output = cap_result.output
-            return ToolResult(call_id=call.id, output=output), trust_level
+            result = ToolResult(call_id=call.id, output=output)
+            await self._audit_call(session, tool, effective_args, result)
+            return result, trust_level
         except Cancelled:
             raise
         except Exception as exc:
-            return (
-                ToolResult(
-                    call_id=call.id,
-                    output=f"{type(exc).__name__}: {exc}",
-                    is_error=True,
-                ),
-                trust_level,
+            result = ToolResult(
+                call_id=call.id,
+                output=f"{type(exc).__name__}: {exc}",
+                is_error=True,
             )
+            await self._audit_call(session, tool, effective_args, result)
+            return result, trust_level
+
+    async def _audit_call(
+        self,
+        session: Session,
+        tool: ToolSpec | None,
+        args: dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        """Emit audit entry for a completed tool call. Swallows logger errors.
+
+        outcome="error" on ToolResult.is_error else "allowed". reason 仅在错误路径
+        记录原始 output 文本，便于排查；args_preview 由 AuditLogger 内部 redact。
+        """
+        if self._audit_logger is None:
+            return
+        outcome = "error" if result.is_error else "allowed"
+        reason = str(result.output) if result.is_error else None
+        try:
+            await self._audit_logger.log_call(
+                session=session, tool=tool, args=args,
+                outcome=outcome, reason=reason,
+            )
+        except Exception:
+            _logger.warning("audit log_call failed", exc_info=True)
 
     async def _execute_tool_calls(
         self,
