@@ -1,5 +1,42 @@
 # Project Learnings
 
+## Capability-based ACL beats runtime decision engines for enterprise agent platforms
+
+**Context:** Designing the permission subsystem for an enterprise internal
+AI productivity platform where the sandbox already confines risky operations.
+Initial design was a runtime ALLOW/DENY/ASK decision engine with pattern
+rules and pending-approval workflow.
+
+**Learned:** When risky operations are already confined (sandbox), runtime
+decisions are asking the wrong question. The real question is "which tools
+should this agent see at all?" — a static capability check at snapshot time,
+not a per-call pattern match.
+
+Signs the problem is capability-ACL rather than runtime-decision:
+1. Operations are trigger-and-leave (no user watching to approve)
+2. Risky work is already sandboxed (or containerized)
+3. Tool populations are stable (not generated per session)
+4. Tenants are well-defined (not per-operation trust decisions)
+
+Capability-ACL characteristics:
+- Tool declares required_permissions (static, at definition time)
+- Subject carries granted_permissions (populated at session creation)
+- Runtime = `tool.required.issubset(subject.granted)` — O(1) per tool
+- No ASK, no pending, no mutation — decisions happen at configuration time
+
+Sunk-cost temptation: the previous runtime-decision module had tests and
+working code, so "why not keep it and add capability-ACL alongside?" The
+right call was deprecate + replace in one minor cycle, because runtime-
+decision surface is a footgun: future contributors would wire Asker/Checker
+into code paths that should use the Filter, and the architecture would
+bifurcate.
+
+**Evidence:** `docs/superpowers/specs/2026-04-23-permission-capability-acl-design.md`,
+`docs/superpowers/plans/2026-04-23-permission-capability-acl.md`,
+`src/topsport_agent/engine/permission/filter.py`.
+
+---
+
 ## TypeVar bound to `BaseModel` preserves type inference in factory classmethods
 
 **Context:** `ToolSpec.from_model(input_model=MyInput, handler=my_handler)` was

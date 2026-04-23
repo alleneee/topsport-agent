@@ -394,59 +394,72 @@ while the full payload lives on disk.
 
 ## Permission System
 
-Two-stage injectable decision flow modeled after the Claude-Code permission
-layer, minus the persisted rule set (that's a separate concern for deployment
-configuration):
+**Capability-based ACL** — tools declare `required_permissions`; sessions
+carry preset `granted_permissions` populated from a `Persona`. Runtime
+enforcement is a static frozenset subset check in `Engine._snapshot_tools`.
+Tools whose requirements are not a subset of the session's grants are
+hidden from the LLM entirely.
+
+### Declaring requirements on tools
 
 ```python
-from topsport_agent.engine.permission import (
-    DefaultPermissionChecker,
-    AlwaysDenyAsker,
-)
+from topsport_agent.types.permission import Permission
+from topsport_agent.types.tool import ToolSpec
 
-engine = Engine(
-    provider, tools, EngineConfig(model="..."),
-    permission_checker=DefaultPermissionChecker(),
-    permission_asker=AlwaysDenyAsker(),  # or your interactive CLI/server asker
+spec = ToolSpec(
+    name="write_file",
+    description="...", parameters={...}, handler=handler,
+    required_permissions=frozenset({Permission.FS_WRITE}),
 )
 ```
 
-### Decision flow
+### Granting permissions to a session via Persona
 
-1. `permission_checker.check(tool, call, ctx)` returns `ALLOW` / `DENY` / `ASK`.
-2. On `ASK`, `permission_asker.ask(tool, call, ctx, reason)` gives the final
-   `ALLOW` / `DENY`.
-3. `ALLOW` may include `updated_input` — the handler receives the rewritten
-   arguments instead of the LLM's original (path normalization, safety
-   injection, etc.).
-4. `DENY` short-circuits the handler; the reason becomes the `ToolResult`
-   error content the LLM sees.
+```python
+from topsport_agent.engine.permission.persona_registry import InMemoryPersonaRegistry
+from topsport_agent.types.permission import Permission, Persona
 
-### Fail-closed defaults
+registry = InMemoryPersonaRegistry()
+await registry.put(Persona(
+    id="dev_engineer", display_name="Developer", description="...",
+    permissions=frozenset({Permission.FS_READ, Permission.FS_WRITE, Permission.SHELL_FULL}),
+))
 
-Every non-ALLOW branch denies when something goes wrong:
+agent = Agent.from_config(provider, AgentConfig(
+    model="...", persona="dev_engineer", persona_registry=registry,
+    tenant_id="acme",
+))
+session = await agent.new_session_async()
+```
 
-| Failure | Behavior |
-| --- | --- |
-| `permission_checker=None` | No checks (opt-in API; back-compat) |
-| Checker raises | `DENY` with `"checker error: ..."` |
-| Checker returns `ASK`, no asker configured | `DENY` |
-| Asker raises | `DENY` with `"asker error: ..."` |
-| Asker returns `ASK` (contract violation) | `DENY` |
+### Operational infrastructure
 
-`PermissionDecision` is `frozen=True` so subscribers cannot mutate a decision
-between the checker and the handler.
+- `KillSwitchGate` — per-tenant emergency shutdown (empties tool pool)
+- `AuditLogger` + `AuditStore` — append-only audit of every tool call (PII-redacted)
+- `PIIRedactor` — pluggable regex patterns; 4 KB args_preview cap
+- `PermissionMetrics` — per-tool / per-outcome counters via EventSubscriber
+- `server/permission_api.py` — FastAPI admin router (personas / killswitch / audit)
+- `server/rbac.py` — `require_role(Role.ADMIN)` dependency for HTTP routes
 
-### Default checker policy
+### MCP unified path
 
-`DefaultPermissionChecker` consumes `ToolSpec` metadata:
+Declare `permissions` in MCP server config; the bridge propagates them:
 
-- `destructive=True` → `ASK` (require asker approval)
-- `read_only=True` → `ALLOW`
-- Otherwise → `ALLOW` (back-compat with tools that predate metadata)
+```json
+{
+  "mcpServers": {
+    "github": {
+      "transport": "stdio", "command": "mcp-github",
+      "permissions": ["mcp.github"]
+    }
+  }
+}
+```
 
-Custom policies (tenant blacklists, regex-on-args, cached "always allow this
-command" state) implement the `PermissionChecker` Protocol directly.
+Bridged `ToolSpec.required_permissions` automatically contain the server's
+declared permissions — no dedicated MCP permission pipeline.
+
+Full design: `docs/superpowers/specs/2026-04-23-permission-capability-acl-design.md`.
 
 ## Skills
 
