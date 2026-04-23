@@ -12,8 +12,10 @@ Real sub-agent execution via spawn_agent. LLM streaming output. Conditional
 plan DAG with shared `PlanContext`, post-condition refine loops, and
 plan-level checkpointing. Claude-Code schema parity: typed event payloads,
 extended `ToolSpec` metadata, automatic blob offload for large tool outputs,
-pydantic-driven input schemas, and an injectable permission system
-(checker + asker, fail-closed). 705 tests passing.
+pydantic-driven input schemas. Capability-based ACL permission system
+(tools declare `required_permissions`, sessions carry preset
+`granted_permissions` from a `Persona`, filter at snapshot time; audit +
+kill-switch + PII redaction + RBAC admin API). 777 tests passing.
 
 | Module | Location | State |
 | --- | --- | --- |
@@ -22,7 +24,7 @@ pydantic-driven input schemas, and an injectable permission system
 | llm.clients | `src/topsport_agent/llm/clients/` | SDK client construction, env resolution, transport calls, transient retry |
 | llm.providers | `src/topsport_agent/llm/providers/` | provider orchestration around SDK clients |
 | llm.adapters | `src/topsport_agent/llm/adapters/` | provider-specific payload/response codecs |
-| engine | `src/topsport_agent/engine/` | ReAct loop, cancel, hooks, planner, orchestrator, checkpoint, plan_context_tools, permission |
+| engine | `src/topsport_agent/engine/` | ReAct loop, cancel, hooks, planner, orchestrator, checkpoint, plan_context_tools, permission (v2: filter / audit / persona / killswitch / redaction / metrics) |
 | memory | `src/topsport_agent/memory/` | file store, injector, save/recall/forget tools |
 | skills | `src/topsport_agent/skills/` | registry, loader, matcher, injector, load/unload/list tools |
 | browser | `src/topsport_agent/browser/` | Playwright-based browser control with snapshot/ref interaction model |
@@ -32,7 +34,8 @@ pydantic-driven input schemas, and an injectable permission system
 | plugins | `src/topsport_agent/plugins/` | Claude Code plugin ecosystem: discovery, skills, agents, hooks |
 | agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
-| tests | `tests/` | 705 passing |
+| server | `src/topsport_agent/server/` | HTTP + SSE chat & plan endpoints, RBAC middleware, admin permission API |
+| tests | `tests/` | 777 passing |
 
 ## Quickstart
 
