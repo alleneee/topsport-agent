@@ -105,8 +105,8 @@ async def test_audit_logger_log_call_redacts_args():
     assert "bob@x.com" not in str(entries[0].args_preview)
 
 
-def test_audit_logger_log_filtered_is_sync_not_async():
-    """ToolVisibilityFilter calls log_filtered from a sync path; verify signature."""
+def test_audit_logger_log_filtered_is_async():
+    """Filter-time audit entries must be persisted; both hooks are async."""
     import inspect
-    assert not inspect.iscoroutinefunction(AuditLogger.log_filtered)
-    assert not inspect.iscoroutinefunction(AuditLogger.log_killswitch_blocked)
+    assert inspect.iscoroutinefunction(AuditLogger.log_filtered)
+    assert inspect.iscoroutinefunction(AuditLogger.log_killswitch_blocked)

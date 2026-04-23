@@ -13,7 +13,6 @@ from ..tools.blob_store import BlobStore
 from ..tools.output_cap import enforce_cap
 from ..types.events import Event, EventType
 from ..types.message import Message, Role, ToolCall, ToolResult
-from ..types.permission import PermissionAsker, PermissionBehavior, PermissionChecker
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
@@ -21,6 +20,7 @@ from .prompt import PromptBuilder, SectionPriority
 from .sanitizer import SECURITY_GUARD_CONTENT, SECURITY_GUARD_TAG, ToolResultSanitizer
 
 if TYPE_CHECKING:
+    from ..types.permission import PermissionAsker, PermissionChecker
     from .permission.audit import AuditLogger
     from .permission.filter import ToolVisibilityFilter
 
@@ -76,8 +76,8 @@ class Engine:
         sanitizer: ToolResultSanitizer | None = None,
         blob_store: BlobStore | None = None,
         default_max_result_chars: int | None = None,
-        permission_checker: PermissionChecker | None = None,
-        permission_asker: PermissionAsker | None = None,
+        permission_checker: "PermissionChecker | None" = None,
+        permission_asker: "PermissionAsker | None" = None,
         permission_filter: "ToolVisibilityFilter | None" = None,
         audit_logger: "AuditLogger | None" = None,
     ) -> None:
@@ -207,7 +207,7 @@ class Engine:
         # v2 capability-ACL：静态能力过滤 + kill-switch 由 filter 统一处理。
         # 未注入 filter 时完全跳过，保持旧行为（granted_permissions 不强制）。
         if self._permission_filter is not None and session is not None:
-            tools = self._permission_filter.filter(tools, session)
+            tools = await self._permission_filter.filter(tools, session)
         return tools
 
     async def _collect_ephemeral_context(self, session: Session) -> list[Message]:
@@ -600,7 +600,9 @@ class Engine:
                 )
                 await self._audit_call(session, tool, call.arguments, result)
                 return result, trust_level
-            if decision.behavior == PermissionBehavior.ASK:
+            # 用字符串字面量比较 behavior，避免在模块级导入 legacy PermissionBehavior
+            # 触发自己的 DeprecationWarning。v1 runtime-decision 路径整体下个版本下线。
+            if decision.behavior == "ask":
                 if self._permission_asker is None:
                     # 无 asker 的保守默认：直接拒绝。日志里记一下，便于排查。
                     _logger.info(
@@ -636,12 +638,20 @@ class Engine:
                     await self._audit_call(session, tool, call.arguments, result)
                     return result, trust_level
                 # asker 再返回 ASK 是契约违反，保守按 DENY 处理
-                if decision.behavior == PermissionBehavior.ASK:
-                    decision = decision.__class__(
-                        PermissionBehavior.DENY,
+                if decision.behavior == "ask":
+                    import warnings as _w
+
+                    with _w.catch_warnings():
+                        _w.simplefilter("ignore", DeprecationWarning)
+                        from ..types.permission import (
+                            PermissionBehavior as _PB,
+                            PermissionDecision as _PD,
+                        )
+                    decision = _PD(
+                        _PB.DENY,
                         reason="asker returned ASK; contract violation",
                     )
-            if decision.behavior == PermissionBehavior.DENY:
+            if decision.behavior == "deny":
                 result = ToolResult(
                     call_id=call.id,
                     output=decision.reason or f"tool '{call.name}' denied",

@@ -34,6 +34,9 @@ from .sessions import SessionStore
 from .sessions_api import router as sessions_router
 
 if TYPE_CHECKING:
+    from ..engine.permission.audit import AuditStore
+    from ..engine.permission.killswitch import KillSwitchGate
+    from ..engine.permission.persona_registry import PersonaRegistry
     from ..sandbox import OpenSandboxPool
 
 _logger = logging.getLogger(__name__)
@@ -137,6 +140,9 @@ def create_app(
     agent_factory: Callable[[LLMProvider, str], Agent] | None = None,
     metrics: Any | None = None,
     sandbox_pool: "OpenSandboxPool | None" = None,
+    persona_registry: "PersonaRegistry | None" = None,
+    audit_store: "AuditStore | None" = None,
+    kill_switch: "KillSwitchGate | None" = None,
 ) -> FastAPI:
     """构造一个绑定好依赖的 FastAPI app。
 
@@ -295,6 +301,20 @@ def create_app(
     app.include_router(chat_router)
     app.include_router(plan_router)
     app.include_router(sessions_router)
+
+    # Permission admin API 可选挂载：三件依赖都齐才暴露 /v1/admin/* 路由，
+    # 缺任一（典型 CLI/测试场景）保持不变。
+    if persona_registry is not None and audit_store is not None and kill_switch is not None:
+        from .permission_api import build_permission_router
+
+        app.include_router(
+            build_permission_router(
+                persona_registry=persona_registry,
+                audit_store=audit_store,
+                kill_switch=kill_switch,
+            ),
+            prefix="/v1/admin",
+        )
     return app
 
 

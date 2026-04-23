@@ -131,11 +131,10 @@ def _entry_from_jsonable(data: dict[str, Any]) -> AuditEntry:
 
 
 class AuditLogger:
-    """Engine-facing API: async for per-call audit; sync for filter-time logs.
+    """Engine-facing API: async for per-call audit and filter-time logs.
 
-    Sync log_filtered / log_killswitch_blocked are fire-and-forget at the filter
-    call site; they enqueue into a background task. This keeps _snapshot_tools
-    non-async-contaminated in backwards-compatible ways.
+    log_filtered / log_killswitch_blocked persist one AuditEntry per hidden/blocked
+    tool so compliance auditors can query these events via the HTTP API.
     """
 
     def __init__(
@@ -176,20 +175,69 @@ class AuditLogger:
         except Exception as exc:
             _logger.error("audit store append failed: %r", exc, exc_info=True)
 
-    def log_filtered(
+    async def log_filtered(
         self, session: "Session", filtered_tools: "list[ToolSpec]"
     ) -> None:
-        """Sync-fire-and-forget logging for the snapshot-time filter drop."""
+        """Persist one AuditEntry per tool hidden by capability filter.
+
+        outcome="filtered_out"；reason=None（过滤是静态策略，无需人类可读原因）。
+        args_preview 为空，因为过滤发生在 LLM 生成 tool_call 之前。
+        """
         _logger.debug(
             "filtered out %d tools for session %s (tenant=%s, persona=%s): %s",
             len(filtered_tools), session.id, session.tenant_id, session.persona_id,
             [t.name for t in filtered_tools],
         )
+        now = datetime.now(timezone.utc)
+        for tool in filtered_tools:
+            entry = AuditEntry(
+                id=str(uuid.uuid4()),
+                tenant_id=session.tenant_id or "",
+                session_id=session.id,
+                user_id=session.principal,
+                persona_id=session.persona_id,
+                tool_name=tool.name,
+                tool_required=tool.required_permissions,
+                subject_granted=session.granted_permissions,
+                outcome="filtered_out",
+                args_preview={},
+                reason=None,
+                timestamp=now,
+            )
+            try:
+                await self._store.append(entry)
+            except Exception as exc:
+                _logger.error(
+                    "audit store append failed (filtered_out): %r", exc, exc_info=True,
+                )
 
-    def log_killswitch_blocked(
+    async def log_killswitch_blocked(
         self, session: "Session", blocked_tools: "list[ToolSpec]"
     ) -> None:
+        """Persist one AuditEntry per tool blocked by the tenant kill-switch."""
         _logger.warning(
             "kill-switch blocked %d tools for session %s (tenant=%s)",
             len(blocked_tools), session.id, session.tenant_id,
         )
+        now = datetime.now(timezone.utc)
+        for tool in blocked_tools:
+            entry = AuditEntry(
+                id=str(uuid.uuid4()),
+                tenant_id=session.tenant_id or "",
+                session_id=session.id,
+                user_id=session.principal,
+                persona_id=session.persona_id,
+                tool_name=tool.name,
+                tool_required=tool.required_permissions,
+                subject_granted=session.granted_permissions,
+                outcome="killed",
+                args_preview={},
+                reason="kill-switch active",
+                timestamp=now,
+            )
+            try:
+                await self._store.append(entry)
+            except Exception as exc:
+                _logger.error(
+                    "audit store append failed (killed): %r", exc, exc_info=True,
+                )

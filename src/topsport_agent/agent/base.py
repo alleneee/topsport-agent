@@ -37,8 +37,14 @@ from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 
 if TYPE_CHECKING:
+    from ..engine.permission.audit import AuditLogger
+    from ..engine.permission.filter import ToolVisibilityFilter
     from ..engine.permission.persona_registry import PersonaRegistry
-    from ..types.permission import Persona
+    from ..types.permission import (
+        Persona,
+        PermissionAsker,
+        PermissionChecker,
+    )
 
 
 @dataclass(slots=True)
@@ -85,6 +91,13 @@ class AgentConfig:
     persona: "Persona | str | None" = None
     persona_registry: "PersonaRegistry | None" = None
     tenant_id: str | None = None
+
+    # v2 capability-ACL hooks. Propagated to Engine as-is; Engine interprets None
+    # as "disabled" for each, preserving back-compat.
+    permission_filter: "ToolVisibilityFilter | None" = None
+    audit_logger: "AuditLogger | None" = None
+    permission_checker: "PermissionChecker | None" = None
+    permission_asker: "PermissionAsker | None" = None
 
 
 class Agent:
@@ -260,6 +273,10 @@ class Agent:
             post_step_hooks=post_step_hooks,
             event_subscribers=event_subscribers,
             sanitizer=config.sanitizer,
+            permission_filter=config.permission_filter,
+            audit_logger=config.audit_logger,
+            permission_checker=config.permission_checker,
+            permission_asker=config.permission_asker,
         )
 
         bundle: dict[str, Any] = {

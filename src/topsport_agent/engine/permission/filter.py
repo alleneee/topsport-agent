@@ -38,7 +38,7 @@ class ToolVisibilityFilter:
         self._audit = audit_logger
         self._kill = kill_switch
 
-    def filter(
+    async def filter(
         self,
         pool: "list[ToolSpec]",
         session: "Session",
@@ -49,7 +49,7 @@ class ToolVisibilityFilter:
                 session.tenant_id,
             )
             if self._audit is not None:
-                self._audit.log_killswitch_blocked(session, pool)
+                await self._audit.log_killswitch_blocked(session, pool)
             return []
 
         granted = session.granted_permissions
@@ -62,6 +62,6 @@ class ToolVisibilityFilter:
                 filtered.append(tool)
 
         if filtered and self._audit is not None:
-            self._audit.log_filtered(session, filtered)
+            await self._audit.log_filtered(session, filtered)
 
         return visible
