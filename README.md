@@ -1163,6 +1163,111 @@ Among plugins, first discovered wins (sorted by marketplace then name).
 Hooks execute in subprocess with 30s default timeout. Failures are logged
 but never interrupt the engine.
 
+## Database Abstraction (skeleton)
+
+Pluggable multi-backend database gateway. The abstraction is fully landed;
+backends ship with **pool lifecycle only** — query methods raise
+`NotImplementedError` until downstream stores wire them in (separate spec).
+
+### Enabling
+
+```bash
+uv sync --group db                       # install asyncpg
+export ENABLE_DATABASE=true
+export DATABASE_BACKEND=postgres         # default when enabled
+export DATABASE_URL="postgresql://user:pw@localhost:5432/mydb"
+```
+
+### Supported backends
+
+| Backend    | Status                                           |
+| ---------- | ------------------------------------------------ |
+| `null`     | Default when `ENABLE_DATABASE=false`. No-op.     |
+| `postgres` | Pool lifecycle + `health_check` implemented.     |
+| `mysql`    | Placeholder — raises `NotImplementedError`.      |
+| `sqlite`   | Placeholder — raises `NotImplementedError`.      |
+
+### Environment variables
+
+| Variable                      | Default    | Notes                                   |
+| ----------------------------- | ---------- | --------------------------------------- |
+| `ENABLE_DATABASE`             | `false`    | Master switch                           |
+| `DATABASE_BACKEND`            | `postgres` | Only used when enabled                  |
+| `DATABASE_URL`                | —          | Required when enabled                   |
+| `DATABASE_POOL_MIN`           | `1`        |                                         |
+| `DATABASE_POOL_MAX`           | `10`       |                                         |
+| `DATABASE_TIMEOUT_SECONDS`    | `30`       | Connect timeout                         |
+
+### Behavior
+
+- `ENABLE_DATABASE=false` → `app.state.database` is a `NullGateway`; imports
+  succeed even without `asyncpg` installed.
+- `ENABLE_DATABASE=true` + unreachable Postgres → server **fails to start**
+  (fail-fast; prevents serving with a broken dependency).
+- `ENABLE_DATABASE=true` + good URL → `health_check` reports True;
+  `execute()` / `fetch_*()` still raise `NotImplementedError` (deliberate —
+  store implementations arrive in a separate spec).
+
+## Rate Limiting (Redis-backed)
+
+Four-dimension sliding-window rate limiter enforced by a FastAPI middleware.
+Checks run **atomically** via one Lua script per request — any single
+dimension over quota denies the request without incrementing other
+dimensions' counters.
+
+### Enabling
+
+```bash
+uv sync --group redis                  # install redis-py
+export ENABLE_RATE_LIMIT=true
+export RATELIMIT_REDIS_URL="redis://localhost:6379/0"
+```
+
+### Dimensions
+
+| Scope       | Identity                  | Default limit / 60s |
+| ----------- | ------------------------- | ------------------- |
+| `ip`        | `request.client.host`     | 300                 |
+| `principal` | `request.state.principal` | 60                  |
+| `tenant`    | `request.state.tenant_id` | 1000                |
+| `route`     | `METHOD:/path/template`   | 0 (disabled)        |
+
+Set any dimension's limit to `0` to disable that dimension.
+
+### Environment variables
+
+| Variable                           | Default  | Notes                                                 |
+| ---------------------------------- | -------- | ----------------------------------------------------- |
+| `ENABLE_RATE_LIMIT`                | `false`  | Master switch                                         |
+| `RATELIMIT_REDIS_URL`              | —        | Required when enabled                                 |
+| `RATELIMIT_WINDOW_SECONDS`         | `60`     | Sliding-window size                                   |
+| `RATELIMIT_PER_IP`                 | `300`    | Per-client-IP quota                                   |
+| `RATELIMIT_PER_PRINCIPAL`          | `60`     | Per-authenticated-user quota                          |
+| `RATELIMIT_PER_TENANT`             | `1000`   | Per-tenant quota                                      |
+| `RATELIMIT_PER_ROUTE_DEFAULT`      | `0`      | Default route quota (0 = disabled)                    |
+| `RATELIMIT_ROUTES`                 | `{}`     | JSON object `{"GET:/chat": 20}`                       |
+| `RATELIMIT_TRUST_FORWARDED_FOR`    | `false`  | Read `X-Forwarded-For` (enable when behind a proxy)   |
+| `RATELIMIT_FAIL_OPEN`              | `true`   | Runtime Redis failure → allow request (log + metric)  |
+
+### Behavior
+
+- **Exempt paths** (`/health`, `/metrics`, `/docs`, `/openapi.json`, `/redoc`)
+  bypass limiting unconditionally.
+- **Startup fail-fast**: `ENABLE_RATE_LIMIT=true` + Redis unreachable → server
+  refuses to start.
+- **Runtime fail-open**: Redis dies mid-request → log a warning, increment
+  `ratelimit_degraded_total`, let the request through. Set
+  `RATELIMIT_FAIL_OPEN=false` to flip to 503 on Redis errors instead.
+- **429 response** includes `Retry-After`, `X-RateLimit-Scope`,
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+
+### Metrics (optional — requires `--group metrics`)
+
+- `ratelimit_requests_total{scope}` — checks performed
+- `ratelimit_denied_total{scope}` — 429 responses
+- `ratelimit_degraded_total{reason}` — Redis errors handled via fail-open
+- `ratelimit_check_duration_seconds` — Lua script latency histogram
+
 ## Not yet implemented
 
 - HTTP or streaming surface for frontend integration

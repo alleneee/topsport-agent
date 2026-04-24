@@ -15,6 +15,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Request
@@ -26,6 +27,11 @@ from ..agent.default import default_agent
 from ..engine.sanitizer import DefaultSanitizer
 from ..llm.provider import LLMProvider
 from ..observability.logging import configure_json_logging
+from ..database import DatabaseConfig, NullGateway, create_database
+from ..ratelimit.config import RateLimitConfig
+from ..ratelimit.limiter import RedisSlidingWindowLimiter
+from ..ratelimit.middleware import RateLimitMiddleware
+from ..ratelimit.redis_client import create_redis_client
 from .auth import AuthConfig
 from .chat import router as chat_router
 from .config import ServerConfig
@@ -228,6 +234,64 @@ def create_app(
         app.state.config = cfg
         app.state.auth_config = auth_config
         app.state.sandbox_pool = pool
+        # === Database (optional, default off) ===
+        if cfg.enable_database:
+            if not cfg.database_url:
+                raise RuntimeError(
+                    "ENABLE_DATABASE=true but DATABASE_URL is unset"
+                )
+            db_config = DatabaseConfig(
+                backend=cfg.database_backend,
+                url=cfg.database_url,
+                pool_min=cfg.database_pool_min,
+                pool_max=cfg.database_pool_max,
+                timeout_seconds=cfg.database_timeout_seconds,
+            )
+            db = create_database(db_config)
+            await db.connect()
+            # Assign to app.state BEFORE health_check so the finally-block
+            # teardown can close the pool even if health_check fails
+            # (otherwise a failed health_check leaks the asyncpg pool).
+            app.state.database = db
+            if not await db.health_check():
+                raise RuntimeError(
+                    "database enabled but health_check failed"
+                )
+        else:
+            app.state.database = NullGateway()
+
+        # === Rate limit (optional, default off) ===
+        if cfg.enable_rate_limit:
+            if not cfg.ratelimit_redis_url:
+                raise RuntimeError(
+                    "ENABLE_RATE_LIMIT=true but RATELIMIT_REDIS_URL is unset"
+                )
+            rl_client = create_redis_client(cfg.ratelimit_redis_url)
+            try:
+                if not await rl_client.ping():
+                    raise RuntimeError(
+                        "rate limit enabled but Redis ping failed"
+                    )
+            except Exception as exc:
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(
+                    f"rate limit enabled but Redis connection failed: {exc!r}"
+                ) from exc
+            lua_path = (
+                Path(__file__).resolve().parent.parent
+                / "ratelimit" / "lua" / "sliding_window.lua"
+            )
+            lua_script = lua_path.read_text(encoding="utf-8")
+            sha = await rl_client.script_load(lua_script)
+            rl_limiter = RedisSlidingWindowLimiter(
+                client=rl_client, sha=sha, script=lua_script
+            )
+            app.state.ratelimit_client = rl_client
+            app.state.ratelimit_limiter = rl_limiter
+        else:
+            app.state.ratelimit_limiter = None
+
         app.state.draining = False
         app.state.inflight = 0
         if not auth_config.required:
@@ -254,6 +318,22 @@ def create_app(
                     await pool.close_all()
                 except Exception as exc:
                     _logger.warning("sandbox pool close failed: %r", exc)
+            # Close database if it was a real backend (NullGateway.close is no-op).
+            db_state = getattr(app.state, "database", None)
+            if db_state is not None:
+                try:
+                    await db_state.close()
+                except Exception as exc:
+                    _logger.warning("database close failed during shutdown: %r", exc)
+            # Close rate-limit Redis client (if it was created).
+            rl_client_state = getattr(app.state, "ratelimit_client", None)
+            if rl_client_state is not None:
+                try:
+                    await rl_client_state.aclose()
+                except Exception as exc:
+                    _logger.warning(
+                        "ratelimit client close failed: %r", exc
+                    )
 
     app = FastAPI(
         title="topsport-agent",
@@ -289,6 +369,53 @@ def create_app(
             return await call_next(request)
 
     app.add_middleware(_DrainMiddleware)
+
+    # Rate limit middleware — installs only when enabled. Uses a lazy shim
+    # that reads the real limiter from app.state at request time, so the
+    # add_middleware call can happen before lifespan runs.
+    if cfg.enable_rate_limit:
+        rl_config = RateLimitConfig(
+            enabled=True,
+            redis_url=cfg.ratelimit_redis_url,
+            window_seconds=cfg.ratelimit_window_seconds,
+            per_ip_limit=cfg.ratelimit_per_ip,
+            per_principal_limit=cfg.ratelimit_per_principal,
+            per_tenant_limit=cfg.ratelimit_per_tenant,
+            per_route_default=cfg.ratelimit_per_route_default,
+            per_route_limits=dict(cfg.ratelimit_routes),
+            trust_forwarded_for=cfg.ratelimit_trust_forwarded_for,
+            fail_open_on_redis_error=cfg.ratelimit_fail_open,
+        )
+
+        class _LazyLimiter:
+            """Defer to the live limiter stored on app.state at request time.
+
+            The middleware is wired up at app creation, but the real limiter
+            is only instantiated inside lifespan. Until lifespan runs, this
+            shim returns allow-all (matches "not yet enforced" semantics).
+            """
+
+            async def check(self, rules):
+                real = getattr(app.state, "ratelimit_limiter", None)
+                if real is None:
+                    from topsport_agent.ratelimit.types import (
+                        RateLimitDecision,
+                    )
+                    return RateLimitDecision(
+                        allowed=True,
+                        denied_scope=None,
+                        limit=0,
+                        remaining=0,
+                        reset_at_ms=0,
+                        retry_after_seconds=0,
+                    )
+                return await real.check(rules)
+
+        app.add_middleware(
+            RateLimitMiddleware,
+            limiter=_LazyLimiter(),
+            config=rl_config,
+        )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
