@@ -1163,6 +1163,51 @@ Among plugins, first discovered wins (sorted by marketplace then name).
 Hooks execute in subprocess with 30s default timeout. Failures are logged
 but never interrupt the engine.
 
+## Database Abstraction (skeleton)
+
+Pluggable multi-backend database gateway. The abstraction is fully landed;
+backends ship with **pool lifecycle only** — query methods raise
+`NotImplementedError` until downstream stores wire them in (separate spec).
+
+### Enabling
+
+```bash
+uv sync --group db                       # install asyncpg
+export ENABLE_DATABASE=true
+export DATABASE_BACKEND=postgres         # default when enabled
+export DATABASE_URL="postgresql://user:pw@localhost:5432/mydb"
+```
+
+### Supported backends
+
+| Backend    | Status                                           |
+| ---------- | ------------------------------------------------ |
+| `null`     | Default when `ENABLE_DATABASE=false`. No-op.     |
+| `postgres` | Pool lifecycle + `health_check` implemented.     |
+| `mysql`    | Placeholder — raises `NotImplementedError`.      |
+| `sqlite`   | Placeholder — raises `NotImplementedError`.      |
+
+### Environment variables
+
+| Variable                      | Default    | Notes                                   |
+| ----------------------------- | ---------- | --------------------------------------- |
+| `ENABLE_DATABASE`             | `false`    | Master switch                           |
+| `DATABASE_BACKEND`            | `postgres` | Only used when enabled                  |
+| `DATABASE_URL`                | —          | Required when enabled                   |
+| `DATABASE_POOL_MIN`           | `1`        |                                         |
+| `DATABASE_POOL_MAX`           | `10`       |                                         |
+| `DATABASE_TIMEOUT_SECONDS`    | `30`       | Connect timeout                         |
+
+### Behavior
+
+- `ENABLE_DATABASE=false` → `app.state.database` is a `NullGateway`; imports
+  succeed even without `asyncpg` installed.
+- `ENABLE_DATABASE=true` + unreachable Postgres → server **fails to start**
+  (fail-fast; prevents serving with a broken dependency).
+- `ENABLE_DATABASE=true` + good URL → `health_check` reports True;
+  `execute()` / `fetch_*()` still raise `NotImplementedError` (deliberate —
+  store implementations arrive in a separate spec).
+
 ## Not yet implemented
 
 - HTTP or streaming surface for frontend integration
