@@ -1208,6 +1208,66 @@ export DATABASE_URL="postgresql://user:pw@localhost:5432/mydb"
   `execute()` / `fetch_*()` still raise `NotImplementedError` (deliberate —
   store implementations arrive in a separate spec).
 
+## Rate Limiting (Redis-backed)
+
+Four-dimension sliding-window rate limiter enforced by a FastAPI middleware.
+Checks run **atomically** via one Lua script per request — any single
+dimension over quota denies the request without incrementing other
+dimensions' counters.
+
+### Enabling
+
+```bash
+uv sync --group redis                  # install redis-py
+export ENABLE_RATE_LIMIT=true
+export RATELIMIT_REDIS_URL="redis://localhost:6379/0"
+```
+
+### Dimensions
+
+| Scope       | Identity                  | Default limit / 60s |
+| ----------- | ------------------------- | ------------------- |
+| `ip`        | `request.client.host`     | 300                 |
+| `principal` | `request.state.principal` | 60                  |
+| `tenant`    | `request.state.tenant_id` | 1000                |
+| `route`     | `METHOD:/path/template`   | 0 (disabled)        |
+
+Set any dimension's limit to `0` to disable that dimension.
+
+### Environment variables
+
+| Variable                           | Default  | Notes                                                 |
+| ---------------------------------- | -------- | ----------------------------------------------------- |
+| `ENABLE_RATE_LIMIT`                | `false`  | Master switch                                         |
+| `RATELIMIT_REDIS_URL`              | —        | Required when enabled                                 |
+| `RATELIMIT_WINDOW_SECONDS`         | `60`     | Sliding-window size                                   |
+| `RATELIMIT_PER_IP`                 | `300`    | Per-client-IP quota                                   |
+| `RATELIMIT_PER_PRINCIPAL`          | `60`     | Per-authenticated-user quota                          |
+| `RATELIMIT_PER_TENANT`             | `1000`   | Per-tenant quota                                      |
+| `RATELIMIT_PER_ROUTE_DEFAULT`      | `0`      | Default route quota (0 = disabled)                    |
+| `RATELIMIT_ROUTES`                 | `{}`     | JSON object `{"GET:/chat": 20}`                       |
+| `RATELIMIT_TRUST_FORWARDED_FOR`    | `false`  | Read `X-Forwarded-For` (enable when behind a proxy)   |
+| `RATELIMIT_FAIL_OPEN`              | `true`   | Runtime Redis failure → allow request (log + metric)  |
+
+### Behavior
+
+- **Exempt paths** (`/health`, `/metrics`, `/docs`, `/openapi.json`, `/redoc`)
+  bypass limiting unconditionally.
+- **Startup fail-fast**: `ENABLE_RATE_LIMIT=true` + Redis unreachable → server
+  refuses to start.
+- **Runtime fail-open**: Redis dies mid-request → log a warning, increment
+  `ratelimit_degraded_total`, let the request through. Set
+  `RATELIMIT_FAIL_OPEN=false` to flip to 503 on Redis errors instead.
+- **429 response** includes `Retry-After`, `X-RateLimit-Scope`,
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+
+### Metrics (optional — requires `--group metrics`)
+
+- `ratelimit_requests_total{scope}` — checks performed
+- `ratelimit_denied_total{scope}` — 429 responses
+- `ratelimit_degraded_total{reason}` — Redis errors handled via fail-open
+- `ratelimit_check_duration_seconds` — Lua script latency histogram
+
 ## Not yet implemented
 
 - HTTP or streaming surface for frontend integration
