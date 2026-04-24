@@ -35,8 +35,22 @@ class ServerConfig:
     enable_skills: bool = False
     enable_memory: bool = False
     enable_plugins: bool = False
+    enable_browser: bool = False
+    # Image generation（OpenAI /v1/images/generations）。客户端和 chat 的 API_KEY / BASE_URL
+    # 共用，`image_gen_model` 作为请求缺省模型；IMAGE_GEN_BASE_URL 单独指定可覆盖 chat 的
+    enable_image_gen: bool = False
+    image_gen_model: str = ""
+    image_gen_base_url: str | None = None
+    # Langfuse tracing（可观测性）。enable=true 且 LANGFUSE_PUBLIC_KEY/SECRET_KEY 齐
+    # 才真正构造；缺 key 时启动失败（fail-fast，避免运维以为开了实际没数据）。
+    enable_langfuse: bool = False
+    # MCP（Model Context Protocol）tool sources。指向 claude-desktop 兼容的 JSON 配置；
+    # 启动时加载，server 端对所有 session 生效。当前不支持 per-tenant 不同 MCP。
+    mcp_config_path: str | None = None
     # Plan 执行的硬上限，防止客户端提交超大 max_steps 绕过运营预算
     max_plan_steps: int = 20
+    # Chat 路径的 Engine 每会话最大 ReAct 步数（工具调用+LLM 往返次数上限）
+    max_chat_steps: int = 20
     # 进程收到 SIGTERM 后等待 in-flight 请求的最大秒数（H-R5 graceful drain）
     drain_timeout_seconds: float = 25.0
 
@@ -97,12 +111,19 @@ class ServerConfig:
             enable_skills=_parse_bool(os.environ.get("ENABLE_SKILLS"), default=False),
             enable_memory=_parse_bool(os.environ.get("ENABLE_MEMORY"), default=False),
             enable_plugins=_parse_bool(os.environ.get("ENABLE_PLUGINS"), default=False),
+            enable_browser=_parse_bool(os.environ.get("ENABLE_BROWSER"), default=False),
+            enable_image_gen=_parse_bool(os.environ.get("ENABLE_IMAGE_GEN"), default=False),
+            image_gen_model=os.environ.get("IMAGE_GEN_MODEL", "") or "",
+            image_gen_base_url=os.environ.get("IMAGE_GEN_BASE_URL") or None,
+            enable_langfuse=_parse_bool(os.environ.get("ENABLE_LANGFUSE"), default=False),
+            mcp_config_path=os.environ.get("MCP_CONFIG_PATH") or None,
             prompt_injection_guard=_parse_bool(
                 os.environ.get("PROMPT_INJECTION_GUARD"), default=True
             ),
             log_format=os.environ.get("LOG_FORMAT", "text").strip().lower() or "text",
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             max_plan_steps=int(os.environ.get("MAX_PLAN_STEPS", "20")),
+            max_chat_steps=int(os.environ.get("MAX_CHAT_STEPS", "20")),
             drain_timeout_seconds=float(
                 os.environ.get("DRAIN_TIMEOUT_SECONDS", "25")
             ),

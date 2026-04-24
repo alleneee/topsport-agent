@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -23,7 +24,8 @@ from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..agent.base import Agent
-from ..agent.default import default_agent
+from ..agent.browser import BROWSER_SYSTEM_PROMPT
+from ..agent.default import DEFAULT_SYSTEM_PROMPT, default_agent
 from ..engine.sanitizer import DefaultSanitizer
 from ..llm.provider import LLMProvider
 from ..observability.logging import configure_json_logging
@@ -35,6 +37,7 @@ from ..ratelimit.redis_client import create_redis_client
 from .auth import AuthConfig
 from .chat import router as chat_router
 from .config import ServerConfig
+from .images import router as images_router
 from .plan import router as plan_router
 from .sessions import SessionStore
 from .sessions_api import router as sessions_router
@@ -86,6 +89,118 @@ def _wrap_with_metrics(
     return factory
 
 
+def _wrap_with_extras(
+    inner: Callable[[LLMProvider, str], Agent],
+    tool_sources: list[Any],
+    event_subscribers: list[Any],
+) -> Callable[[LLMProvider, str], Agent]:
+    """装饰 factory：把 MCP tool sources / Langfuse 等 event subscribers 挂到
+    每个新 agent 的 engine。与 _wrap_with_metrics 互不干扰，可叠加。"""
+    if not tool_sources and not event_subscribers:
+        return inner
+
+    def factory(provider: LLMProvider, model: str) -> Agent:
+        agent = inner(provider, model)
+        for src in tool_sources:
+            agent.engine.add_tool_source(src)
+        for sub in event_subscribers:
+            agent.engine.add_event_subscriber(sub)
+        return agent
+
+    return factory
+
+
+def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
+    """Load MCP server manager from config file if MCP_CONFIG_PATH is set.
+
+    Returns None when path unset. Fails fast on a bad path so operators see
+    the misconfiguration at startup rather than at first tool call.
+    """
+    if not cfg.mcp_config_path:
+        return None
+    from ..mcp.manager import MCPManager
+
+    return MCPManager.from_config_file(cfg.mcp_config_path)
+
+
+def _build_langfuse_tracer(cfg: ServerConfig) -> Any | None:
+    """Construct LangfuseTracer if enable_langfuse=True. Fail-fast when keys missing."""
+    if not cfg.enable_langfuse:
+        return None
+    from ..observability.langfuse_tracer import LangfuseTracer
+
+    if not os.environ.get("LANGFUSE_PUBLIC_KEY") or not os.environ.get("LANGFUSE_SECRET_KEY"):
+        raise RuntimeError(
+            "ENABLE_LANGFUSE=true but LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY missing"
+        )
+    return LangfuseTracer()
+
+
+def _build_image_client(cfg: ServerConfig) -> Any | None:
+    """Construct OpenAIImageGenerationClient if ENABLE_IMAGE_GEN=true.
+
+    Fails fast if API_KEY missing or IMAGE_GEN_MODEL not set (operators expect
+    a default model to hand to client requests that omit the `model` field).
+    """
+    if not cfg.enable_image_gen:
+        return None
+    from ..llm.image_generation import OpenAIImageGenerationClient
+
+    if not cfg.api_key:
+        raise RuntimeError("ENABLE_IMAGE_GEN=true but API_KEY missing")
+    if not cfg.image_gen_model:
+        raise RuntimeError(
+            "ENABLE_IMAGE_GEN=true but IMAGE_GEN_MODEL is empty — set a default model"
+        )
+    image_base = cfg.image_gen_base_url or cfg.base_url
+
+    def _factory() -> Any:
+        openai_mod = importlib.import_module("openai")
+        return openai_mod.AsyncOpenAI(api_key=cfg.api_key, base_url=image_base)
+
+    return OpenAIImageGenerationClient(
+        client_factory=_factory,
+        default_model=cfg.image_gen_model,
+    )
+
+
+def _build_server_system_prompt(cfg: ServerConfig) -> str | None:
+    """Decide the system prompt handed to default_agent based on enabled capabilities.
+
+    Context: DEFAULT_SYSTEM_PROMPT documents file/skills/memory/plugin tools but
+    says nothing about browser. BROWSER_SYSTEM_PROMPT documents browser workflow
+    (@ref snapshot model) but drops the other capability docs. When both are
+    enabled we need a merge strategy.
+
+    Return None to fall back to default_agent's built-in prompt (DEFAULT_SYSTEM_PROMPT).
+
+    TODO(niko): choose the merge strategy. Options to consider:
+
+      (A) Return BROWSER_SYSTEM_PROMPT when cfg.enable_browser else None.
+          -> Simple, but loses file/skills/memory guidance when browser is on.
+
+      (B) Return DEFAULT_SYSTEM_PROMPT + "\n\n" + <browser-section extracted from
+          BROWSER_SYSTEM_PROMPT> when cfg.enable_browser.
+          -> Keeps all docs. Requires picking which section of
+             BROWSER_SYSTEM_PROMPT to inline (toolset + interaction model + workflow?).
+
+      (C) Build a dynamic prompt: only include capability sections that are
+          actually enabled via cfg.enable_* flags (file tools / skills / memory /
+          plugins / browser).
+          -> Cleanest for multi-tenant but most code. Overkill if the model
+             tolerates unused-capability hints.
+
+    Trade-offs:
+    - prompt length vs model context budget
+    - does the LLM get confused by capability hints for tools it can't see?
+    - do we want browser workflow discipline (snapshot-before-click) strictly
+      enforced, or just hinted?
+    """
+    if not cfg.enable_browser:
+        return None
+    return DEFAULT_SYSTEM_PROMPT + "\n\n" + BROWSER_SYSTEM_PROMPT
+
+
 def _default_agent_factory(
     cfg: ServerConfig,
     sandbox_pool: "OpenSandboxPool | None" = None,
@@ -119,7 +234,9 @@ def _default_agent_factory(
             provider=provider,
             model=model,
             stream=True,
-            enable_browser=False,
+            max_steps=cfg.max_chat_steps,
+            system_prompt=_build_server_system_prompt(cfg),
+            enable_browser=cfg.enable_browser,
             enable_file_ops=file_ops_enabled,
             enable_skills=cfg.enable_skills,
             enable_memory=cfg.enable_memory,
@@ -182,11 +299,25 @@ def create_app(
     # 未显式注入 agent_factory 时，default factory 带上 sandbox tool_source
     raw_factory = agent_factory or _default_agent_factory(cfg, sandbox_pool=pool)
 
-    # 若传入 metrics，把它装到每个新 session 的 agent 事件订阅里
+    # MCP / Langfuse / ImageGen：同步 opt-in，MCPManager.from_config_file 不做实际连接；
+    # LangfuseTracer 构造时会 import langfuse（失败 fail-fast）；Image 客户端构造
+    # 延迟到首次调用（client_factory 延迟 import openai）。
+    mcp_manager = _build_mcp_manager(cfg)
+    langfuse_tracer = _build_langfuse_tracer(cfg)
+    image_client = _build_image_client(cfg)
+
+    extra_tool_sources: list[Any] = []
+    if mcp_manager is not None:
+        extra_tool_sources.extend(mcp_manager.tool_sources())
+    extra_event_subs: list[Any] = []
+    if langfuse_tracer is not None:
+        extra_event_subs.append(langfuse_tracer)
+
+    # 叠加装饰：metrics → extras(MCP/Langfuse)
+    factory: Callable[[LLMProvider, str], Agent] = raw_factory
     if metrics is not None:
-        factory = _wrap_with_metrics(raw_factory, metrics)
-    else:
-        factory = raw_factory
+        factory = _wrap_with_metrics(factory, metrics)
+    factory = _wrap_with_extras(factory, extra_tool_sources, extra_event_subs)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -234,6 +365,10 @@ def create_app(
         app.state.config = cfg
         app.state.auth_config = auth_config
         app.state.sandbox_pool = pool
+        app.state.image_client = image_client
+        app.state.image_default_model = cfg.image_gen_model or None
+        app.state.mcp_manager = mcp_manager
+        app.state.langfuse_tracer = langfuse_tracer
         # === Database (optional, default off) ===
         if cfg.enable_database:
             if not cfg.database_url:
@@ -449,6 +584,7 @@ def create_app(
     app.include_router(chat_router)
     app.include_router(plan_router)
     app.include_router(sessions_router)
+    app.include_router(images_router)
 
     # Permission admin API 可选挂载：三件依赖都齐才暴露 /v1/admin/* 路由，
     # 缺任一（典型 CLI/测试场景）保持不变。

@@ -33,6 +33,7 @@ from ..skills import (
 )
 from ..types.events import Event, EventType
 from ..types.message import ContentPart, Message, Role
+from ..types.plan import Plan
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 
@@ -186,16 +187,50 @@ class Agent:
 
     async def run(
         self,
-        user_input: str | list[ContentPart] | Message,
-        session: Session,
+        user_input: str | list[ContentPart] | Message | None = None,
+        session: Session | None = None,
+        *,
+        mode: str = "react",
+        plan: Plan | None = None,
+        system: str | None = None,
     ) -> AsyncIterator[Event]:
-        """附加一条用户消息到 session，驱动 engine 跑一轮推理。
+        """Unified execution entry — the single public verb for this Agent.
 
-        user_input 接受三种形态：
-          - str: 向后兼容的纯文本
-          - list[ContentPart]: 多模态 parts，自动包装为 USER 消息
-          - Message: 用户构造好的完整消息，按角色/字段原样使用
+        Mode selection:
+          - mode="react" (default): classic ReAct loop driven by user_input.
+            user_input accepts: str (plain text), list[ContentPart] (multimodal),
+            Message (fully formed), or None (continues existing session without
+            a new turn — rare, mostly for resume flows).
+          - mode="plan": executes a Plan DAG. Requires `plan=<Plan>`. user_input
+            is ignored. Each step spawns a child Agent inheriting all capabilities
+            (skills / memory / tools / permission filters / event subscribers).
+
+        Request-level overrides:
+          - system: replaces session.system_prompt for this turn onward
+            (persists to session; subsequent calls keep it unless overridden
+            again). Single place for request-scoped persona switches.
+
+        Plan/Orchestrator is no longer a separate public API — it's an internal
+        execution strategy selected via mode="plan".
         """
+        if session is None:
+            raise ValueError("session is required")
+        if system is not None and system != session.system_prompt:
+            session.system_prompt = system
+
+        if mode == "plan":
+            if plan is None:
+                raise ValueError("mode='plan' requires plan=<Plan>")
+            async for event in self._run_plan(plan, session):
+                yield event
+            return
+        if mode != "react":
+            raise ValueError(
+                f"unknown mode {mode!r}; expected 'react' or 'plan'"
+            )
+
+        if user_input is None:
+            raise ValueError("mode='react' requires user_input")
         if isinstance(user_input, Message):
             msg = user_input
         elif isinstance(user_input, list):
@@ -207,6 +242,34 @@ class Agent:
         async for event in self._engine.run(session):
             yield event
         self._engine.reset_cancel()
+
+    async def _run_plan(
+        self, plan: Plan, session: Session
+    ) -> AsyncIterator[Event]:
+        """Internal: execute a Plan via the Orchestrator strategy.
+
+        session's tenant_id / principal / granted_permissions propagate to every
+        sub-step via spawn_child (handled by Orchestrator.parent_agent path).
+        This method is NOT exposed as a public API — clients drive plans through
+        `agent.run(mode="plan", plan=...)`.
+        """
+        # Lazy import avoids circular (Orchestrator imports Agent for typing).
+        from ..engine.orchestrator import Orchestrator, SubAgentConfig
+
+        sub_config = SubAgentConfig(
+            provider=self._provider,
+            model=self._config.model,
+            max_steps=self._config.max_steps,
+            provider_options=self._config.provider_options,
+        )
+        orchestrator = Orchestrator(plan, sub_config, parent_agent=self)
+        # Make the session reachable to spawn_child for permission inheritance.
+        self._engine._current_session = session
+        try:
+            async for event in orchestrator.execute():
+                yield event
+        finally:
+            self._engine._current_session = None
 
     async def generate_image(
         self,

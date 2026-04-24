@@ -860,3 +860,138 @@ running and doing work, it's buffering, not hanging. Don't kill it.
 
 **Evidence:** `scripts/jd_demo/` (all stages use `PYTHONUNBUFFERED=1` in the
 bash invocation).
+
+---
+
+## Anthropic-compatible endpoints stringify nested object tool-call values
+
+**Context:** Wiring a shared `ServerKVContext` (subclass of `PlanContext`) into
+HTTP `/v1/plan/execute` so DAG steps can share state via `plan_context_merge` /
+`plan_context_read`. When the LLM (MiniMax-M2.7 via its anthropic-compatible
+endpoint) tried `plan_context_merge(key="kv", value={"title": "Example Domain"})`,
+the reducer crashed with `TypeError: requires an object/dict, got str`.
+
+**Learned:** Some third-party anthropic/openai-compatible endpoints
+(MiniMax confirmed; likely some Qwen / DeepSeek setups too) **JSON-stringify
+nested-object tool-call argument values** before sending them in
+`tool_use.input`. The LLM writes `{"key": "kv", "value": {...}}` but what
+reaches the tool handler is `{"key": "kv", "value": "{\"title\":...}"}` —
+`value` is a `str`, not a `dict`. Anthropic's own API does not do this.
+
+Same family as the OpenAI-adapter's `{"_raw_arguments": ...}` fallback
+already documented elsewhere in this file: tool-call argument transport
+is under-specified once you leave the reference implementation, and every
+handler that accepts non-scalar argument values needs a str→json.loads
+detection-and-decode pass of its own.
+
+Canonical fix at the tool-handler / reducer layer (not the adapter — adapters
+decode top-level `arguments` once but do not recurse into per-field values):
+
+```python
+def _kv_dict_merge(current: dict, update: Any) -> dict:
+    if isinstance(update, str):
+        try:
+            update = json.loads(update)
+        except ValueError as exc:
+            raise TypeError(f"expected object, got non-JSON string: {exc}")
+    if not isinstance(update, dict):
+        raise TypeError(f"expected object, got {type(update).__name__}")
+    return {**current, **update}
+```
+
+Rule: for any tool-call argument typed object/array, accept `Any`, detect
+`str`, `json.loads` once, then re-validate the shape.
+
+**Evidence:** `src/topsport_agent/server/plan.py::_kv_dict_merge`
+(`plan-ctx-002` DEBUG log captured the "got str" failure; `plan-ctx-003`
+confirmed the fix by successfully round-tripping "Example Domain" through
+the shared KV context to a file on disk — `/tmp/plan_ctx_v3.txt`).
+
+---
+
+## `Agent._run_plan` must set `_engine._current_session` before orchestrator runs
+
+**Context:** Collapsing the HTTP `/v1/plan/execute` and `/v1/chat/completions`
+paths into a single `Agent.run(mode="plan", plan=...)` facade. The HTTP plan
+router used to own the Orchestrator directly and constructed a fresh parent
+Agent per request. Moving that inside Agent meant `Agent._run_plan` now
+creates the Orchestrator with `parent_agent=self`. On first test run, the
+full DAG executed but sub-step sessions silently lost `granted_permissions`
+(fail-closed — no ACL tools visible), even though the parent session had
+them.
+
+**Learned:** `Agent.spawn_child` inherits tenant/principal/permissions from
+either a caller-passed `parent_session` **or** `self._engine._current_session`
+(the "live running session" slot that `Engine._run_inner` sets when you call
+`engine.run(session)`). In the old `_run_plan`-free code path, the HTTP
+request called `engine.run()` first and the slot was populated naturally. In
+the facade version, `_run_plan` never calls `engine.run()` itself — it only
+drives `Orchestrator.execute()`, which goes through `spawn_child`. So the
+slot stays `None` and every sub-step gets `granted_permissions=∅`.
+
+Fix: `_run_plan` must explicitly set (and clear) the slot:
+
+```python
+self._engine._current_session = session
+try:
+    async for event in orchestrator.execute():
+        yield event
+finally:
+    self._engine._current_session = None
+```
+
+Generalisation: any Agent method that dispatches to a sub-engine/orchestrator
+without going through the main `engine.run()` path needs to either
+(a) plumb `parent_session=` explicitly through `spawn_child`, or
+(b) temporarily set `_engine._current_session`. (a) is cleaner but requires
+changing the Orchestrator API; (b) is a minimal patch. The presence of the
+`_current_session` slot at all is a smell — it's a hidden parameter of
+`spawn_child` that was fine when there was one caller (`Engine._run_inner`)
+but grows brittle as more facade methods appear.
+
+**Evidence:** `src/topsport_agent/agent/base.py::Agent._run_plan` (the
+try/finally around orchestrator.execute). Regression surface: any future
+facade method that composes Agent capabilities without first running the
+main ReAct loop — reflection strategy, tree-of-thoughts, etc. Watch for
+"granted_permissions=∅ in sub-step" as the symptom.
+
+---
+
+## Security tests that white-box private helpers need signature updates during facade refactors
+
+**Context:** Same facade refactor collapsed `server/plan.py::_stream_plan`
+into `server/chat.py::_stream_plan` with a different signature
+(`(orchestrator, request, parent_agent)` → `(entry, plan, request)`). A
+SEC-005 test (`test_plan_error_payload_does_not_leak_exception_message`)
+imported the old helper directly and constructed a `FakeOrch` to drive the
+error branch. It broke immediately on signature change.
+
+**Learned:** White-box unit tests that exercise private `_helper`
+functions are the right choice for security invariants — black-box testing
+the error sanitization path would require triggering a real backend failure
+and is flaky. But they create **legitimate coupling** between test and
+private API, which means any refactor that changes the private function's
+shape is a two-file change: the implementation *and* the SEC test. Don't
+try to remove the coupling by making the test go through the public HTTP
+path; the blast radius of a leaked `str(exc)` containing `sk-…` is high
+enough to justify the coupling.
+
+When moving private helpers across modules during a facade refactor:
+1. Grep for `from X import _helper` across tests FIRST
+2. Either re-export from the old location (`from .chat import _stream_plan`
+   back in `plan.py`) OR update every caller in one commit
+3. If the signature changes semantically, update tests too — don't contort
+   the new signature to match the old test
+
+There's a secondary point that bit me: the new code path went through
+`agent.run(mode="plan")` which doesn't normally raise; the raw exception
+from the underlying exec path surfaced as `str(exc)` in the SSE error
+event. This is the "moved where the exception fires but forgot to update
+the redaction" problem. Always re-verify the SEC invariant **end-to-end**
+after moving any error-handling code, not just rely on test updates.
+
+**Evidence:** `src/topsport_agent/server/chat.py::_stream_plan` (the
+`except Exception` branch now yields `{"message": "plan execution failed",
+"type": type(exc).__name__}` — deliberately drops `str(exc)` to prevent
+API key leakage); test migration at
+`tests/test_server_sandbox.py::test_plan_error_payload_does_not_leak_exception_message`.

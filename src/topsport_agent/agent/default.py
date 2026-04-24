@@ -39,6 +39,7 @@ def default_agent(
     name: str = "default",
     description: str = "Default topsport-agent with all standard capabilities",
     system_prompt: str | None = None,
+    max_steps: int | None = None,
     enable_browser: bool = True,
     enable_file_ops: bool = True,
     enable_skills: bool = True,
@@ -49,6 +50,7 @@ def default_agent(
     local_skill_dirs: list[Path] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_tool_sources: list[ToolSource] | None = None,
+    extra_event_subscribers: list[Any] | None = None,
     sanitizer: Any = _DEFAULT,
 ) -> Agent:
     """标准 Agent 配置：skills + memory + plugins + file_ops + 可选 browser。
@@ -69,7 +71,7 @@ def default_agent(
         effective_sanitizer = DefaultSanitizer()
     else:
         effective_sanitizer = sanitizer
-    config = AgentConfig(
+    config_kwargs: dict[str, Any] = dict(
         name=name,
         description=description,
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
@@ -85,4 +87,9 @@ def default_agent(
         extra_tool_sources=list(extra_tool_sources or []),
         sanitizer=effective_sanitizer,
     )
+    if max_steps is not None:
+        config_kwargs["max_steps"] = max_steps
+    if extra_event_subscribers:
+        config_kwargs["extra_event_subscribers"] = list(extra_event_subscribers)
+    config = AgentConfig(**config_kwargs)
     return Agent.from_config(provider, config)

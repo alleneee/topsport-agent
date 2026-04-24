@@ -21,6 +21,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..types.events import EventType
 from ..types.message import Role
+from ..types.plan import Plan, PlanStep
+from ..types.plan_context_kv import KVPlanContext
 from .auth import namespace_session_id, require_principal
 from .schemas import (
     ChatCompletionChoice,
@@ -28,9 +30,10 @@ from .schemas import (
     ChatCompletionResponse,
     ChatCompletionUsage,
     ChatMessage,
+    PlanSchema,
 )
 from .sessions import SessionEntry, SessionStore
-from .sse import SSE_DONE_LINE, make_chat_chunk, sse_data
+from .sse import SSE_DONE_LINE, make_chat_chunk, sse_data, sse_event
 
 _logger = logging.getLogger(__name__)
 
@@ -40,6 +43,20 @@ router = APIRouter()
 def _extract_last_user_message(messages: list) -> str | None:
     for m in reversed(messages):
         if m.role == "user" and m.content:
+            return m.content
+    return None
+
+
+def _extract_system_prompt(body) -> str | None:
+    """Pick the request-level system prompt override.
+
+    Precedence: body.system > first messages[] entry with role=system.
+    Returns None if neither is set; caller then keeps the session default.
+    """
+    if body.system:
+        return body.system
+    for m in body.messages:
+        if m.role == "system" and m.content:
             return m.content
     return None
 
@@ -55,6 +72,48 @@ def _parse_model(model_str: str) -> tuple[str, str]:
     if not name:
         raise HTTPException(400, detail="model name is empty")
     return provider, name
+
+
+def _build_plan(schema: PlanSchema) -> Plan:
+    """Construct a Plan with a default shared KV context.
+
+    Every HTTP-initiated plan gets KVPlanContext() so steps can use the
+    auto-mounted plan_context_read / plan_context_merge tools without the
+    client having to declare a context shape.
+    """
+    try:
+        return Plan(
+            id=schema.id,
+            goal=schema.goal,
+            steps=[
+                PlanStep(
+                    id=s.id,
+                    title=s.title,
+                    instructions=s.instructions,
+                    depends_on=list(s.depends_on),
+                    max_iterations=s.max_iterations,
+                )
+                for s in schema.steps
+            ],
+            context=KVPlanContext(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=f"invalid plan: {exc}") from exc
+
+
+# Plan event → SSE event name (flat list; any new EventType adds one entry here).
+_PLAN_EVENT_NAME = {
+    EventType.PLAN_APPROVED: "plan_approved",
+    EventType.PLAN_STEP_START: "plan_step_start",
+    EventType.PLAN_STEP_END: "plan_step_end",
+    EventType.PLAN_STEP_FAILED: "plan_step_failed",
+    EventType.PLAN_STEP_SKIPPED: "plan_step_skipped",
+    EventType.PLAN_WAITING: "plan_waiting",
+    EventType.PLAN_DONE: "plan_done",
+    EventType.PLAN_FAILED: "plan_failed",
+    EventType.CANCELLED: "cancelled",
+    EventType.ERROR: "error",
+}
 
 
 @router.post("/v1/chat/completions")
@@ -74,16 +133,42 @@ async def chat_completions(
             f"got {req_provider!r} in request",
         )
 
-    user_input = _extract_last_user_message(body.messages)
-    if not user_input:
-        raise HTTPException(400, detail="messages must contain at least one user message")
-
     # principal 前缀隔离：不同 principal 即便传同一个 body.user 也命中不同 session
     session_key = namespace_session_id(principal, body.user)
     # tenant = principal（最简映射）：sandbox / per-tenant quota / 审计都按 principal 维度做。
     _, entry, _ = await store.get_or_create(
         session_key, model_name, tenant_id=principal, principal=principal,
     )
+
+    # 请求级 system prompt 覆盖：持久到 session，后续轮次延用。
+    override = _extract_system_prompt(body)
+    if override is not None and override != entry.session.system_prompt:
+        entry.session.system_prompt = override
+
+    # Mode dispatch — Plan 不是独立端点，是 Agent 的一种执行策略。
+    if body.mode == "plan":
+        if body.plan is None:
+            raise HTTPException(
+                400, detail="mode='plan' requires 'plan' field"
+            )
+        cfg = request.app.state.config
+        max_plan_steps = getattr(cfg, "max_plan_steps", 20)
+        if len(body.plan.steps) > max_plan_steps:
+            raise HTTPException(
+                400,
+                detail=f"plan has {len(body.plan.steps)} steps, exceeds server limit {max_plan_steps}",
+            )
+        plan_obj = _build_plan(body.plan)
+        return StreamingResponse(
+            _stream_plan(entry, plan_obj, request),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # Default: mode == "react"
+    user_input = _extract_last_user_message(body.messages)
+    if not user_input:
+        raise HTTPException(400, detail="messages must contain at least one user message")
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
@@ -94,6 +179,78 @@ async def chat_completions(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     return JSONResponse(await _complete_chat(entry, user_input, chat_id, body.model))
+
+
+async def _stream_plan(
+    entry: SessionEntry,
+    plan: Plan,
+    request: Request,
+) -> AsyncIterator[str]:
+    """Stream Plan execution events through the unified agent.run entry point.
+
+    Agent.run(mode="plan", plan=...) dispatches to the internal Orchestrator
+    strategy. Failed steps follow the Orchestrator's default abort policy;
+    client disconnect cancels the entire plan.
+
+    Sandbox lifecycle: when the app has a sandbox_pool, bind the plan-id
+    prefix to this principal so every sub-step's sandbox acquire counts
+    against the same tenant quota, and release them together on plan end.
+    """
+    sandbox_pool = getattr(request.app.state, "sandbox_pool", None)
+    sandbox_prefix = f"{plan.id}:" if sandbox_pool is not None else None
+    principal = entry.session.principal or entry.session.tenant_id or "anonymous"
+    if sandbox_pool is not None and sandbox_prefix is not None:
+        try:
+            sandbox_pool.bind_tenant_prefix(sandbox_prefix, principal)
+        except Exception:
+            _logger.warning(
+                "plan.sandbox bind_tenant_prefix failed prefix=%s",
+                sandbox_prefix, exc_info=True,
+            )
+
+    async with entry.lock:
+        try:
+            async for event in entry.agent.run(
+                session=entry.session, mode="plan", plan=plan,
+            ):
+                if await request.is_disconnected():
+                    entry.agent.cancel()
+                    break
+                name = _PLAN_EVENT_NAME.get(event.type)
+                if name is not None:
+                    yield sse_event(name, event.payload)
+        except asyncio.CancelledError:
+            entry.agent.cancel()
+            raise
+        except Exception as exc:
+            # SEC-005: 不能把 str(exc) 回给客户端（可能含 API key / 内网 URL 等）。
+            # 只暴露异常类型；详细信息只进服务端日志。
+            _logger.exception(
+                "plan stream failed",
+                extra={
+                    "event": "plan_stream_failed",
+                    "session_id": entry.session.id,
+                    "plan_id": plan.id,
+                },
+            )
+            yield sse_event(
+                "error",
+                {"message": "plan execution failed", "type": type(exc).__name__},
+            )
+        finally:
+            if sandbox_pool is not None and sandbox_prefix is not None:
+                try:
+                    released = await sandbox_pool.release_by_prefix(sandbox_prefix)
+                    if released:
+                        _logger.info(
+                            "plan.sandbox cleanup prefix=%s released=%d",
+                            sandbox_prefix, released,
+                        )
+                except Exception:
+                    _logger.warning(
+                        "plan sandbox cleanup failed prefix=%s",
+                        sandbox_prefix, exc_info=True,
+                    )
 
 
 async def _complete_chat(

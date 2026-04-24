@@ -295,17 +295,20 @@ def test_plan_execute_binds_prefix_tenant_from_principal() -> None:
 def test_plan_error_payload_does_not_leak_exception_message() -> None:
     """SEC-005：_stream_plan 的 except 分支必须脱敏异常 str(exc)。
 
-    直接测 _stream_plan 的 except → yield 'error' 路径：构造一个会在 execute()
-    里抛异常的 FakeOrchestrator，确认响应 SSE 中不含原始敏感字符串。
+    新统一架构下 _stream_plan 签名是 (entry, plan, request)。构造一个 FakeAgent
+    让 agent.run() 抛异常，确认响应 SSE 中不含原始敏感字符串。
     """
     import asyncio
 
-    from topsport_agent.server.plan import _stream_plan
+    from topsport_agent.server.chat import _stream_plan
+    from topsport_agent.types.plan import Plan, PlanStep
+    from topsport_agent.types.plan_context_kv import KVPlanContext
+    from topsport_agent.types.session import Session
 
     SECRET = "sk-XXXSECRETxxx"
 
-    class FakeOrch:
-        async def execute(self):
+    class FakeAgent:
+        async def run(self, *, session, mode, plan):
             raise RuntimeError(f"AuthenticationError: Incorrect API key {SECRET}")
             if False:  # pragma: no cover -- keep async-generator shape
                 yield None
@@ -313,16 +316,31 @@ def test_plan_error_payload_does_not_leak_exception_message() -> None:
         def cancel(self) -> None:
             pass
 
-        def provide_decision(self, _d) -> None:
-            pass
+    class FakeEntry:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.session = Session(id="s1", system_prompt="")
+            import asyncio as _a
+            self.lock = _a.Lock()
 
     class FakeRequest:
+        def __init__(self) -> None:
+            from types import SimpleNamespace
+            self.app = SimpleNamespace(state=SimpleNamespace(sandbox_pool=None))
+
         async def is_disconnected(self) -> bool:
             return False
 
+    plan = Plan(
+        id="p-sec",
+        goal="g",
+        steps=[PlanStep(id="s1", title="t", instructions="i")],
+        context=KVPlanContext(),
+    )
+
     async def collect() -> str:
         chunks: list[str] = []
-        async for chunk in _stream_plan(FakeOrch(), FakeRequest(), parent_agent=None):  # type: ignore[arg-type]
+        async for chunk in _stream_plan(FakeEntry(), plan, FakeRequest()):  # type: ignore[arg-type]
             chunks.append(chunk)
         return "".join(chunks)
 
