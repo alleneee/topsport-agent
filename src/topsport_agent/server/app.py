@@ -244,11 +244,14 @@ def create_app(
             )
             db = create_database(db_config)
             await db.connect()
+            # Assign to app.state BEFORE health_check so the finally-block
+            # teardown can close the pool even if health_check fails
+            # (otherwise a failed health_check leaks the asyncpg pool).
+            app.state.database = db
             if not await db.health_check():
                 raise RuntimeError(
                     "database enabled but health_check failed"
                 )
-            app.state.database = db
         else:
             app.state.database = NullGateway()
         app.state.draining = False

@@ -30,12 +30,12 @@ def create_database(config: DatabaseConfig) -> Database:
             mod = importlib.import_module(
                 "topsport_agent.database.backends.postgres"
             )
+            return mod.PostgresGateway(config)
         except ImportError as exc:
             raise ImportError(
                 "PostgresGateway requires 'asyncpg'. Install via: "
                 "uv sync --group db"
             ) from exc
-        return mod.PostgresGateway(config)
     if backend == "mysql":
         return MySQLGateway(config)
     if backend == "sqlite":

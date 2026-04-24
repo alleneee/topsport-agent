@@ -40,6 +40,28 @@ def test_factory_postgres_returns_postgres_gateway() -> None:
     assert isinstance(db, PostgresGateway)
 
 
+def test_factory_postgres_missing_asyncpg_gives_friendly_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When asyncpg is unavailable, the factory must wrap the ImportError with
+    a install-hint message. Regression test for the bug where the wrapping was
+    around `import_module('...postgres')` (which always succeeds because
+    postgres.py has no top-level asyncpg import) instead of around the
+    `PostgresGateway(config)` construction call (which is where asyncpg is
+    actually imported via importlib).
+    """
+    import sys
+
+    # Force any `importlib.import_module("asyncpg")` call inside
+    # PostgresGateway.__init__ to raise ImportError.
+    monkeypatch.setitem(sys.modules, "asyncpg", None)
+
+    with pytest.raises(ImportError, match="uv sync --group db"):
+        create_database(
+            DatabaseConfig(backend="postgres", url="postgresql://x")
+        )
+
+
 def test_public_package_exports() -> None:
     import topsport_agent.database as db_pkg
 
