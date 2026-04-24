@@ -548,12 +548,17 @@ return cls(
 )
 ```
 
-### `spawn_child` parity
+### `spawn_child` note (no inheritance required)
 
-Parent's `image_generator` is inherited by spawned children — same pattern as
-context_providers, tool_sources, etc. This avoids the "ACL disconnect" trap
-documented in `.learnings/LEARNINGS.md`: if the parent can call
-`generate_image`, the child must be able to as well.
+`Agent.spawn_child` returns a `(Session, Engine)` tuple, not a child `Agent`.
+Since `generate_image` is an `Agent`-level convenience method, there is no
+child object on which to call it — image generation is not part of the
+Engine/tool execution surface. Callers who need image generation inside a
+sub-agent's tool execution must pass the `OpenAIImageGenerationClient`
+directly into that tool's closure.
+
+No `_capability_bundle` entry is added for `image_generator`; tracking it
+there would be dead state with no consumer.
 
 ## 8. Testing Strategy
 
@@ -584,7 +589,6 @@ All new tests MUST pass without `openai` or `httpx` installed. No top-level
 | Image generation sync call builds kwargs and parses response | `test_generate_builds_kwargs_and_parses_response` |
 | `GeneratedImage.save` URL path with injected http_client | `test_save_url_uses_injected_http_client` |
 | `GeneratedImage.save` b64_json decoding | `test_save_b64_writes_decoded_bytes` |
-| `spawn_child` inherits `image_generator` | `test_spawn_child_inherits_image_generator` |
 
 ### Verification
 
