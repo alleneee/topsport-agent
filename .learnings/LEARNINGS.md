@@ -1,5 +1,77 @@
 # Project Learnings
 
+## Middleware shim pattern for lifespan-built dependencies
+
+**Context:** FastAPI's `app.add_middleware(MiddlewareCls, ...)` wires
+middleware at app-creation time, but the real `RedisSlidingWindowLimiter`
+requires an async `SCRIPT LOAD` that only happens in `lifespan()`. Two
+canonical solutions (pass limiter factory; or build middleware inside
+lifespan and monkey-patch the stack) are both noisy.
+
+**Learned:** The cleanest pattern is a lazy shim:
+
+```python
+class _LazyLimiter:
+    async def check(self, rules):
+        real = getattr(app.state, "ratelimit_limiter", None)
+        if real is None:
+            return RateLimitDecision(allowed=True, ...)  # allow-all
+        return await real.check(rules)
+
+app.add_middleware(RateLimitMiddleware, limiter=_LazyLimiter(), ...)
+```
+
+The shim is instantiated at `add_middleware` time, but every `check()` call
+pulls the live limiter from `app.state.ratelimit_limiter` — which lifespan
+populates before FastAPI starts accepting requests. The allow-all branch is
+only reachable in non-standard embedding scenarios (e.g. ASGI mount without
+lifespan). Worth a log-once warning if it triggers.
+
+This generalises to ANY middleware that needs a dependency built inside
+lifespan: DB connection, feature flag client, cache, metrics exporter.
+Don't try to "build it eagerly in create_app" — lifespan exists precisely
+because some things must be async-initialised.
+
+**Evidence:** `src/topsport_agent/server/app.py::_LazyLimiter`,
+`tests/test_server_lifespan_ratelimit.py::test_disabled_ratelimit_does_not_touch_redis`.
+
+---
+
+## `prometheus_client.Counter` is process-global; use private registries per test
+
+**Context:** Running `pytest` with multiple `RateLimitMetrics()` fixtures
+threw `ValueError: Duplicated timeseries in CollectorRegistry:
+{'ratelimit_requests_total'}`. Each fixture tried to register the same
+counter on the default (process-global) registry — fine in production,
+fatal in tests.
+
+**Learned:** When building metrics classes that might be instantiated
+multiple times in one process (tests, worker pools, multi-tenant embeds),
+accept an optional `registry` arg **and default to a fresh
+`CollectorRegistry()` instead of the global one**:
+
+```python
+def __init__(self, *, registry: Any | None = None) -> None:
+    if registry is None:
+        registry = prom.CollectorRegistry()
+    self._requests = prom.Counter(..., registry=registry, **kwargs)
+```
+
+Production callers who want metrics exposed on `/metrics` pass the real
+process-global registry (`prom.REGISTRY`) explicitly. Library code should
+never default to `prom.REGISTRY` implicitly — that makes the class
+single-instance-per-process, which is a hidden footgun.
+
+The related idiom in the codebase is the `metrics: X | None = None` +
+"build a fresh one if missing" pattern used by
+`RateLimitMiddleware.__init__`.
+
+**Evidence:** `src/topsport_agent/ratelimit/metrics.py::RateLimitMetrics.__init__`,
+`tests/test_ratelimit_metrics.py::test_metrics_with_prometheus_registers_counters`
+(explicitly passes a fresh `CollectorRegistry()`).
+
+---
+
 ## Lazy-import factory: `try` must wrap the constructor, not the submodule import
 
 **Context:** `create_database` dispatches backends via
