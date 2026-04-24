@@ -1,5 +1,90 @@
 # Project Learnings
 
+## Lazy-import factory: `try` must wrap the constructor, not the submodule import
+
+**Context:** `create_database` dispatches backends via
+`importlib.import_module("topsport_agent.database.backends.postgres")` and then
+`mod.PostgresGateway(config)`. The expected UX is that a missing `asyncpg`
+turns into a helpful `ImportError("... install via: uv sync --group db")`.
+Initial factory only wrapped the `import_module(submodule_name)` call in the
+`try`; a final reviewer flagged that this wrapper is always a no-op.
+
+**Learned:** The project's optional-dep pattern has `postgres.py` **import
+asyncpg lazily inside `PostgresGateway.__init__`** via
+`importlib.import_module(mod_name)`. That means:
+
+- `importlib.import_module("topsport_agent.database.backends.postgres")`
+  always succeeds — postgres.py has no top-level `asyncpg` reference.
+- The real `ImportError` fires on `mod.PostgresGateway(config)` when
+  `__init__` runs `importlib.import_module("asyncpg")`.
+
+Therefore `try` must wrap **both** the `import_module(submodule)` call and
+the subsequent `ClassName(config)` construction. Wrapping only the first
+lets the raw `ModuleNotFoundError: No module named 'asyncpg'` escape past the
+translate-to-friendly-error layer.
+
+Regression test pattern: `monkeypatch.setitem(sys.modules, "asyncpg", None)`
+then expect the friendly-message `ImportError`.
+
+**Evidence:** `src/topsport_agent/database/factory.py` (commit `a33dddf`
+fixed the try-block scope), `tests/test_database_factory.py::test_factory_postgres_missing_asyncpg_gives_friendly_import_error`.
+
+---
+
+## `uv sync --group X` is destructive: it removes every group not listed
+
+**Context:** A subagent installing the `db` group for Postgres tests ran
+`uv sync --group db`. Later subagents discovered `tests/test_permission_*.py`
+failed to collect: `ModuleNotFoundError: No module named 'fastapi'`. The
+permission tests were fine — fastapi had been uninstalled.
+
+**Learned:** `uv sync --group X` installs X **and** removes all other groups
+from the venv, unless you re-list them. The project has 9 optional groups
+(`dev db api mcp metrics llm sandbox tracing browser`); any test depending
+on `fastapi` (the `api` group) breaks after a partial sync.
+
+Safe recipes:
+- `uv sync --all-groups` — simplest, reinstalls everything
+- `uv sync --group dev --group db --group api --group mcp --group metrics --group llm --group sandbox --group tracing --group browser` — explicit list
+- Don't sync at all if the needed group is already installed
+
+Prompt-level fix: when dispatching subagents that might sync, tell them the
+venv already has all groups installed and that a partial sync will break
+unrelated tests.
+
+**Evidence:** Commit `0a93f20` followed by `uv run pytest` showing 4
+collection errors on `test_permission_*` / `test_sandbox` due to missing
+`fastapi`. Restored via full-group resync.
+
+---
+
+## Subagents constrained by `.trellis/workflow.md` can't `git commit`
+
+**Context:** While running subagent-driven development to execute the
+database skeleton plan, each TDD task's Plan-defined Step 5 is "commit".
+The `implement` subagent type read `.trellis/workflow.md` and refused:
+"AI should not commit code". It reported `DONE_WITH_CONCERNS` but the
+working tree was still modified/untracked.
+
+**Learned:** Project-level rules (`.trellis/workflow.md`, global `CLAUDE.md`)
+override per-task instructions that the main agent writes into subagent
+prompts. For any plan whose tasks include commits, the main agent must:
+
+1. Explicitly tell the subagent in its prompt: "Do NOT `git commit`. Stop
+   before commit. The main agent will commit after verifying."
+2. Run `git add` + `git commit` itself after verifying the subagent's work.
+
+Without the explicit "no commit" instruction, subagents that encounter the
+project rule will produce a confusing "DONE - Ready for commit" report
+(code ready but not committed) that doesn't match any of the four documented
+statuses. Don't trust a DONE without verifying with `git status`.
+
+**Evidence:** First Task 0 dispatch to `implement` subagent produced a
+"DONE" report while `git status` showed 5 untracked/modified files. Fixed
+by amending all subsequent Plan A dispatch prompts to say "Do NOT commit".
+
+---
+
 ## "Enterprise ACL" can look complete per-module and still be functionally disconnected
 
 **Context:** After landing the capability-ACL subsystem
