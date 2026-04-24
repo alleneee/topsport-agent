@@ -89,6 +89,91 @@ await agent.close()
 Custom Agents are built via `Agent.from_config(provider, AgentConfig(...))`
 — declare the capability flags and extras you need.
 
+## Multimodal Input & Image Generation
+
+Applies to OpenAI-compatible endpoints only. The Anthropic adapter does not
+support multimodal content in this release.
+
+### Analyzing images and videos
+
+Pass a list of `ContentPart` (or a pre-built `Message`) to `agent.run()`:
+
+```python
+from topsport_agent.types.message import (
+    TextPart, image_url, image_file, video_url,
+)
+
+session = agent.new_session()
+async for event in agent.run(
+    [
+        TextPart("Compare these two images"),
+        image_url("https://cdn.example.com/a.jpg"),
+        image_file("/tmp/b.png", detail="high"),
+    ],
+    session,
+):
+    ...
+```
+
+Videos use the `video_url` content part (requires a Qwen-VL-compatible
+endpoint):
+
+```python
+async for event in agent.run(
+    [TextPart("describe this clip"), video_url("https://.../clip.mp4")],
+    session,
+):
+    ...
+```
+
+Local files are read and base64-encoded into data URIs automatically.
+For files with uncommon extensions, pass an explicit `media_type` via
+`MediaRef`:
+
+```python
+from pathlib import Path
+from topsport_agent.types.message import MediaRef, ImagePart
+
+ImagePart(
+    source=MediaRef(path=Path("/tmp/x.heic"), media_type="image/heic"),
+)
+```
+
+### Generating images
+
+Image generation is a separate, synchronous API. It does not go through
+the LLM reasoning loop.
+
+```python
+import os
+from topsport_agent.agent.base import Agent, AgentConfig
+from topsport_agent.llm.image_generation import OpenAIImageGenerationClient
+
+def _openai_factory():
+    import openai
+    return openai.AsyncOpenAI(
+        api_key=os.environ["OPENAI_COMPAT_KEY"],
+        base_url=os.environ["OPENAI_COMPAT_BASE_URL"],
+    )
+
+image_gen = OpenAIImageGenerationClient(
+    client_factory=_openai_factory,
+    default_model="dall-e-3",
+)
+
+agent = Agent.from_config(
+    provider=my_provider,
+    config=AgentConfig(image_generator=image_gen),
+)
+
+resp = await agent.generate_image("a cyberpunk cat", size="1024x1024")
+await resp.images[0].save("./cat.png")
+```
+
+If the underlying endpoint does not support `/v1/images/generations`
+(e.g., DashScope's compat layer), the provider's HTTP error is surfaced
+unchanged. Configure a proxy like one-api/new-api to bridge to
+async-only providers.
 
 ## CLI
 

@@ -1,5 +1,50 @@
 # Project Learnings
 
+## `list["ForwardRef"]` double-stringifies under `from __future__ import annotations`
+
+**Context:** Adding `content_parts: list["ContentPart"] | None = None` to the
+`Message` dataclass in `types/message.py`. Runtime tests passed (15/15) but
+Pyright reported:
+
+```
+Cannot access attribute "content_parts" for class "Message"
+No parameter named "content_parts"
+```
+
+`ContentPart = TextPart | ImagePart | VideoPart` was already defined at
+module top-level, above `Message`. The forward-ref quoting looked defensive
+— shouldn't it be fine either way?
+
+**Learned:** When `from __future__ import annotations` is active (line 1 of
+the module), **all** type annotations are already lazy-evaluated strings at
+runtime. Wrapping a name in extra `"..."` produces a double-quoted string
+that Pyright can't resolve as a type reference, even when the name exists
+in module scope. The runtime is happy (dataclass just stores a string
+annotation either way), but Pyright's static analyzer treats the field as
+type-unknown, and any downstream code that reads `msg.content_parts`
+cascades into `reportAttributeAccessIssue` noise.
+
+Fix: drop the quotes when the name is defined above the reference point.
+
+```python
+# wrong (under __future__.annotations): Pyright can't resolve
+content_parts: list["ContentPart"] | None = None
+
+# right: PEP 563 lazy-strings the annotation for you
+content_parts: list[ContentPart] | None = None
+```
+
+Rule of thumb: only use string forward-refs when the referenced name is
+defined **below** the annotation (genuine forward reference). If it's above,
+let `from __future__ import annotations` do the deferral.
+
+**Evidence:** `src/topsport_agent/types/message.py::Message.content_parts`
+(commit `033f719` introduced double-quote, immediately fixed in follow-up
+edit before merge). Regression surface would be caught by any Pyright run
+on files that consume `Message.content_parts`.
+
+---
+
 ## Middleware shim pattern for lifespan-built dependencies
 
 **Context:** FastAPI's `app.add_middleware(MiddlewareCls, ...)` wires

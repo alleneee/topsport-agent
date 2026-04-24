@@ -32,7 +32,7 @@ from ..skills import (
     build_skill_tools,
 )
 from ..types.events import Event, EventType
-from ..types.message import Message, Role
+from ..types.message import ContentPart, Message, Role
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 
@@ -40,6 +40,10 @@ if TYPE_CHECKING:
     from ..engine.permission.audit import AuditLogger
     from ..engine.permission.filter import ToolVisibilityFilter
     from ..engine.permission.persona_registry import PersonaRegistry
+    from ..llm.image_generation import (
+        ImageGenerationResponse,
+        OpenAIImageGenerationClient,
+    )
     from ..types.permission import (
         Persona,
         PermissionAsker,
@@ -99,6 +103,11 @@ class AgentConfig:
     permission_checker: "PermissionChecker | None" = None
     permission_asker: "PermissionAsker | None" = None
 
+    # Multimodal: optional image generation client (e.g. OpenAI DALL-E).
+    # When set, Agent.generate_image(...) delegates here. Threaded through
+    # from_config → Agent() so operators only need to populate the config.
+    image_generator: "OpenAIImageGenerationClient | None" = None
+
 
 class Agent:
     """高层代理对象。组装 Engine 及其所有扩展，提供统一的 run/close 接口。"""
@@ -113,6 +122,7 @@ class Agent:
         skill_registry: SkillRegistry | None = None,
         plugin_manager: PluginManager | None = None,
         capability_bundle: dict[str, Any] | None = None,
+        image_generator: "OpenAIImageGenerationClient | None" = None,
     ) -> None:
         self._provider = provider
         self._config = config
@@ -123,6 +133,7 @@ class Agent:
         # H-A2：父 Agent 构造期的能力快照（tools / providers / sources / hooks /
         # subscribers），spawn_child 要拿来给子代理用，实现能力 parity。
         self._capability_bundle: dict[str, Any] = capability_bundle or {}
+        self._image_generator = image_generator
 
     @property
     def config(self) -> AgentConfig:
@@ -174,14 +185,55 @@ class Agent:
         return session
 
     async def run(
-        self, user_input: str, session: Session
+        self,
+        user_input: str | list[ContentPart] | Message,
+        session: Session,
     ) -> AsyncIterator[Event]:
-        """附加一条用户消息到 session，驱动 engine 跑一轮推理。"""
-        session.messages.append(Message(role=Role.USER, content=user_input))
+        """附加一条用户消息到 session，驱动 engine 跑一轮推理。
+
+        user_input 接受三种形态：
+          - str: 向后兼容的纯文本
+          - list[ContentPart]: 多模态 parts，自动包装为 USER 消息
+          - Message: 用户构造好的完整消息，按角色/字段原样使用
+        """
+        if isinstance(user_input, Message):
+            msg = user_input
+        elif isinstance(user_input, list):
+            msg = Message(role=Role.USER, content_parts=user_input)
+        else:
+            msg = Message(role=Role.USER, content=user_input)
+        session.messages.append(msg)
         session.state = RunState.IDLE
         async for event in self._engine.run(session):
             yield event
         self._engine.reset_cancel()
+
+    async def generate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> "ImageGenerationResponse":
+        """Generate an image via the configured image_generator.
+
+        Raises RuntimeError if no image_generator was wired into this Agent.
+        """
+        if self._image_generator is None:
+            raise RuntimeError(
+                "No image_generator configured; pass image_generator= "
+                "to Agent(), or construct OpenAIImageGenerationClient directly."
+            )
+        from ..llm.image_generation import ImageGenerationRequest
+        resolved_model = model or self._image_generator.default_model
+        if resolved_model is None:
+            raise ValueError(
+                "model required (or set default_model on image_generator)"
+            )
+        request = ImageGenerationRequest(
+            prompt=prompt, model=resolved_model, **kwargs
+        )
+        return await self._image_generator.generate(request)
 
     def cancel(self) -> None:
         self._engine.cancel()
@@ -303,6 +355,7 @@ class Agent:
             skill_registry=skill_registry,
             plugin_manager=plugin_manager,
             capability_bundle=bundle,
+            image_generator=config.image_generator,
         )
         # 回填占位符，spawn_child 现在拿得到完整能力
         parent_ref.append(agent)
