@@ -70,6 +70,10 @@ class AgentConfig:
     enable_memory: bool = True
     enable_plugins: bool = True
     enable_browser: bool = False
+    # file_ops: read_file / write_file / edit_file / list_dir / glob_files /
+    # grep_files. Previously only opt-in via default_agent's enable_file_ops param;
+    # now a first-class AgentConfig flag so CapabilityModule assembly is uniform.
+    enable_file_ops: bool = False
     # 启用流式输出（需要 provider 实现 StreamingLLMProvider）
     stream: bool = False
 
@@ -315,7 +319,17 @@ class Agent:
 
     @classmethod
     def from_config(cls, provider: LLMProvider, config: AgentConfig) -> Agent:
-        """按 config 声明组装所有能力并构造 Agent。"""
+        """按 config 声明组装所有能力并构造 Agent.
+
+        Capability assembly goes through the CapabilityModule protocol: each
+        capability (plugins / skills / memory / file_ops / browser) is a
+        module that decides if it applies and produces a CapabilityBundle.
+        Adding a new capability = one new module class in capability_impls.py,
+        zero edits to this method.
+        """
+        from .capabilities import InstallContext
+        from .capability_impls import default_capability_modules
+
         tools: list[ToolSpec] = list(config.extra_tools)
         context_providers: list[ContextProvider] = list(config.extra_context_providers)
         tool_sources: list[ToolSource] = list(config.extra_tool_sources)
@@ -323,55 +337,32 @@ class Agent:
         event_subscribers: list[EventSubscriber] = list(config.extra_event_subscribers)
         cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
 
+        # parent_ref is a late-binding slot: modules that build spawn executors
+        # (PluginsModule) capture it now, dereference on tool-call time — by
+        # which point we've appended the constructed Agent.
+        parent_ref: list[Agent] = []
+        ctx = InstallContext(config=config, provider=provider, parent_ref=parent_ref)
+
         skill_registry: SkillRegistry | None = None
         plugin_manager: PluginManager | None = None
 
-        # Plugins 先加载，后续 skills 会用到 plugin 提供的 skill_dirs
-        if config.enable_plugins:
-            plugin_manager = PluginManager()
-            plugin_manager.load()
-            # spawn_executor 需要访问构造完成后的父 Agent 实例；先用占位符引用，
-            # from_config 末尾回填真正的 Agent。
-            parent_ref: list[Agent] = []
+        for module in default_capability_modules():
+            if not module.is_enabled(ctx):
+                continue
+            bundle = module.install(ctx)
+            tools.extend(bundle.tools)
+            context_providers.extend(bundle.context_providers)
+            tool_sources.extend(bundle.tool_sources)
+            post_step_hooks.extend(bundle.post_step_hooks)
+            event_subscribers.extend(bundle.event_subscribers)
+            cleanup_callbacks.extend(bundle.cleanup_callbacks)
+            # Published state: available to later modules + lifted onto Agent
+            ctx.shared.update(bundle.state)
 
-            def _parent_getter() -> Agent:
-                if not parent_ref:
-                    raise RuntimeError(
-                        "spawn_agent invoked before parent Agent finished construction"
-                    )
-                return parent_ref[0]
-
-            executor = _build_spawn_executor(_parent_getter)
-            tools.extend(build_agent_tools(plugin_manager.agent_registry(), executor))
-            event_subscribers.append(plugin_manager.hook_runner())
-            cleanup_callbacks.append(_async_wrap(plugin_manager.cleanup))
-        else:
-            parent_ref = []
-
-        if config.enable_skills:
-            plugin_skill_dirs = plugin_manager.skill_dirs() if plugin_manager else []
-            all_skill_dirs = list(config.local_skill_dirs) + plugin_skill_dirs
-            skill_registry = SkillRegistry(all_skill_dirs)
-            skill_registry.load()
-            skill_loader = SkillLoader(skill_registry)
-            skill_matcher = SkillMatcher(skill_registry)
-            tools.extend(build_skill_tools(skill_registry, skill_matcher))
-            context_providers.append(
-                SkillInjector(skill_registry, skill_loader, skill_matcher)
-            )
-
-        if config.enable_memory:
-            base = config.memory_base_path or (Path.home() / ".topsport-agent" / "memory")
-            memory_store = FileMemoryStore(base)
-            tools.extend(build_memory_tools(memory_store))
-            context_providers.append(MemoryInjector(memory_store))
-
-        # Browser 延后初始化：playwright 未装或初始化失败时静默跳过
-        if config.enable_browser:
-            browser_client, browser_sources = _try_make_browser()
-            if browser_client is not None:
-                tool_sources.extend(browser_sources)
-                cleanup_callbacks.append(browser_client.close)
+        # Lift well-known state keys onto Agent attributes (direct access
+        # from calling code expects these to live on the Agent itself).
+        plugin_manager = ctx.shared.get("plugin_manager")
+        skill_registry = ctx.shared.get("skill_registry")
 
         engine_config = EngineConfig(
             model=config.model,

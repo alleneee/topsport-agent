@@ -9,7 +9,6 @@ from typing import Any
 from ..engine.hooks import ToolSource
 from ..engine.sanitizer import DefaultSanitizer, ToolResultSanitizer
 from ..llm.provider import LLMProvider
-from ..tools import file_tools
 from ..types.tool import ToolSpec
 from .base import Agent, AgentConfig
 
@@ -62,10 +61,6 @@ def default_agent(
     sanitizer: 省略则默认启用 DefaultSanitizer（对 untrusted 工具结果做 prompt
         injection 防御）；显式传 None 则关闭。
     """
-    tools: list[ToolSpec] = list(extra_tools or [])
-    if enable_file_ops:
-        # 文件工具放最前：优先级高，且用户自定义的 extra_tools 不会覆盖名称冲突
-        tools = file_tools() + tools
     effective_sanitizer: ToolResultSanitizer | None
     if sanitizer is _DEFAULT:
         effective_sanitizer = DefaultSanitizer()
@@ -80,10 +75,11 @@ def default_agent(
         enable_memory=enable_memory,
         enable_plugins=enable_plugins,
         enable_browser=enable_browser,
+        enable_file_ops=enable_file_ops,
         stream=stream,
         memory_base_path=memory_base_path,
         local_skill_dirs=local_skill_dirs or [Path.home() / ".claude" / "skills"],
-        extra_tools=tools,
+        extra_tools=list(extra_tools or []),
         extra_tool_sources=list(extra_tool_sources or []),
         sanitizer=effective_sanitizer,
     )

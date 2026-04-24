@@ -1116,3 +1116,63 @@ goes through the real tool pipeline, not just `_check_containment`
 directly. E2E'd with `WORKSPACE_ROOT=/tmp/ts-ws-test`: attack path
 `/etc/passwd_test_attack` was rejected; `alice` session's file written
 inside `anonymous__ws-sess-alice/files/` succeeded.
+
+---
+
+## CapabilityModule: one shape for every Agent feature's install side-effects
+
+**Context:** `Agent.from_config` was a god factory — each of 5 capabilities
+(plugins / skills / memory / file_ops / browser) had its own hand-written
+if-branch with a bespoke side-effect shape: skills added `tools +
+context_providers`, plugins added `tools + event_subscribers + cleanup`,
+browser added `tool_sources + cleanup`, etc. Adding image_gen or MCP or
+tracing in a future PR meant editing the factory and remembering exactly
+which 3-4 list mutations each capability needs. 8+ `enable_X` flags on
+AgentConfig; the factory length grew linearly in number of capabilities.
+
+**Learned:** The right primitive is "capability install has a uniform
+output shape" — a `CapabilityBundle` that lists what the capability
+contributes to each of the Agent's 6 extension axes (tools,
+context_providers, tool_sources, post_step_hooks, event_subscribers,
+cleanup_callbacks) plus a `state` dict for cross-capability publish/subscribe
+(e.g. PluginsModule publishes `plugin_manager` → SkillsModule reads it to
+discover skill_dirs). Every capability implements the same protocol:
+
+```python
+class CapabilityModule(Protocol):
+    name: str
+    def is_enabled(self, ctx: InstallContext) -> bool: ...
+    def install(self, ctx: InstallContext) -> CapabilityBundle: ...
+```
+
+The factory becomes a 15-line loop: for each module, if enabled, install,
+extend accumulator lists, merge state into `ctx.shared` for next module.
+Agent construction is the same as before — only the assembly changed.
+
+Two subtle wins that aren't obvious until you've migrated:
+
+1. **Late binding via mutable reference cell**: PluginsModule's
+   `spawn_agent` executor needs a reference to the fully-constructed Agent,
+   but Agent isn't built until after all modules install. Pattern used:
+   `parent_ref: list[Agent] = []` in InstallContext; PluginsModule captures
+   it in a closure; factory appends `agent` after construction; closures
+   dereference at tool-call time. Cleaner than post-construction patching.
+
+2. **Ordering is simple linear, not DAG**: I briefly considered
+   `depends_on` + topo-sort for capability ordering. With 5 modules the
+   linearity is trivial (plugins → skills → rest); with 8+ a DAG matters.
+   Ship the simpler form, upgrade only when ordering conflicts actually
+   emerge. (Codex's critique was that the factory grows god-like; the
+   protocol fixes the shape, the ordering issue is orthogonal and
+   pre-extensible.)
+
+Rule of thumb for this pattern: whenever you see N if-branches in a
+constructor all mutating a shared "I'm accumulating state" pile, the
+shared pile is the contract. Give it a name (`CapabilityBundle`), make
+each branch return one, merge in a loop.
+
+**Evidence:** `src/topsport_agent/agent/capabilities.py` (protocol) +
+`capability_impls.py` (5 modules). Factory shrank from ~60 lines of
+if/else to ~25 lines of module loop + accumulator merge. 913 tests
+unchanged. E2E-verified: same server run exposes file_ops + memory +
+skills + plugins simultaneously through the new assembly path.
