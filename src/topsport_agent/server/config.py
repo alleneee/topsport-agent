@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True, frozen=True)
@@ -66,6 +66,18 @@ class ServerConfig:
     database_pool_max: int = 10
     database_timeout_seconds: float = 30.0
 
+    # Rate limiting (Redis-backed)
+    enable_rate_limit: bool = False
+    ratelimit_redis_url: str | None = None
+    ratelimit_window_seconds: int = 60
+    ratelimit_per_ip: int = 300          # 0 = disable this dimension
+    ratelimit_per_principal: int = 60
+    ratelimit_per_tenant: int = 1000
+    ratelimit_per_route_default: int = 0
+    ratelimit_routes: dict[str, int] = field(default_factory=dict)
+    ratelimit_trust_forwarded_for: bool = False
+    ratelimit_fail_open: bool = True
+
     @classmethod
     def from_env(cls) -> ServerConfig:
         return cls(
@@ -121,6 +133,32 @@ class ServerConfig:
             database_timeout_seconds=float(
                 os.environ.get("DATABASE_TIMEOUT_SECONDS", "30")
             ),
+            enable_rate_limit=_parse_bool(
+                os.environ.get("ENABLE_RATE_LIMIT"), default=False
+            ),
+            ratelimit_redis_url=os.environ.get("RATELIMIT_REDIS_URL") or None,
+            ratelimit_window_seconds=int(
+                os.environ.get("RATELIMIT_WINDOW_SECONDS", "60")
+            ),
+            ratelimit_per_ip=int(os.environ.get("RATELIMIT_PER_IP", "300")),
+            ratelimit_per_principal=int(
+                os.environ.get("RATELIMIT_PER_PRINCIPAL", "60")
+            ),
+            ratelimit_per_tenant=int(
+                os.environ.get("RATELIMIT_PER_TENANT", "1000")
+            ),
+            ratelimit_per_route_default=int(
+                os.environ.get("RATELIMIT_PER_ROUTE_DEFAULT", "0")
+            ),
+            ratelimit_routes=_parse_route_limits(
+                os.environ.get("RATELIMIT_ROUTES")
+            ),
+            ratelimit_trust_forwarded_for=_parse_bool(
+                os.environ.get("RATELIMIT_TRUST_FORWARDED_FOR"), default=False
+            ),
+            ratelimit_fail_open=_parse_bool(
+                os.environ.get("RATELIMIT_FAIL_OPEN"), default=True
+            ),
         )
 
 
@@ -143,3 +181,20 @@ def _parse_optional_float(raw: str | None, *, default: float | None = None) -> f
     if s in {"none", "null", "off", "false", "disable", "disabled"}:
         return None
     return float(raw)
+
+
+def _parse_route_limits(raw: str | None) -> dict[str, int]:
+    """Parse RATELIMIT_ROUTES JSON env. Empty/unset → empty dict.
+
+    Raises ValueError on malformed JSON (fail-fast at startup).
+    """
+    if raw is None or not raw.strip():
+        return {}
+    import json
+
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"RATELIMIT_ROUTES must be a JSON object, got: {type(data).__name__}"
+        )
+    return {str(k): int(v) for k, v in data.items()}
