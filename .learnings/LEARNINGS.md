@@ -1055,3 +1055,64 @@ Regression captured by Langfuse API check: `plan-ctx-002` before the fix
 had `observations=2` only for the parent trace; after the fix there are
 separate traces `agent.run[<plan_id>:<step_id>:<hash>]` for every
 sub-step.
+
+---
+
+## Declared sandbox field + unset-by-any-caller = no sandbox at all
+
+**Context:** Reviewing multi-tenant exposure before enabling file_ops on HTTP.
+`ToolContext.workspace_root: Path | None = None` was defined in
+`types/tool.py`, and `tools/file_ops.py::_check_containment` implemented a
+full resolve + is_relative_to + symlink-escape check that rejected any
+path outside the root. Looked complete end-to-end in a code review.
+
+Actually tested: a freshly booted server with `ENABLE_FILE_TOOLS=true`
+let the LLM write `/etc/passwd_test_attack` unrestricted. Because
+`engine/loop.py::_invoke_tool` built `ToolContext` with only
+`session_id / call_id / cancel_event` — `workspace_root` stayed at its
+default `None`, which `_check_containment` treats as CLI-trust-mode and
+short-circuits the check. Type existed, logic existed, **no one ever
+passed a value**.
+
+**Learned:** This is the definitive "control plane exists, execution
+plane doesn't wire it" pattern (codex flagged the category; this was a
+live instance). The diagnostic signature:
+
+1. `grep -rn "<field_name>" src/` shows **type definition** + **reader
+   with conditional guard (`if x is None: return`)** — no writer.
+2. No call site passes the field; callers construct the object with
+   positional / partial kwargs only.
+3. Tests exist but use direct object construction (bypass the broken
+   pipeline) and happen to set the field when testing the sandbox logic,
+   so the `None → skip` branch is never exercised in tests that matter.
+
+Fix for this class of bug = follow the field back to source:
+
+- Every type-level "sandbox" field needs a **default-producer** somewhere
+  in the call chain (session creation → ToolContext construction →
+  tool execution).
+- If the tool runtime gets `None`, decide: is CLI-trust-mode the safe
+  default, or should the tool fail closed? For workspace it's the former
+  (back-compat with CLI); for `granted_permissions` it's the latter.
+- Add a production-path test: boot the real server with defaults, try
+  to escape, assert rejection. Not `write_file(ctx=FakeCtx(root=...))` —
+  the bug was exactly in ctx construction.
+
+Grep regex that finds this class of leak in CI:
+
+```
+field: <Type> | None = None          # definition
+ctx.field is None                     # guard
+```
+
+If writer count is zero and tests don't cover the "server boot → invoke
+tool" path, it's dead sandbox code.
+
+**Evidence:** `src/topsport_agent/workspace/manager.py::WorkspaceRegistry`
+(the missing writer + per-session directory allocator), now wired into
+`server/app.py` via the SessionStore create hook. Regression test
+`tests/test_workspace_sandbox.py::test_write_file_outside_workspace_rejected`
+goes through the real tool pipeline, not just `_check_containment`
+directly. E2E'd with `WORKSPACE_ROOT=/tmp/ts-ws-test`: attack path
+`/etc/passwd_test_attack` was rejected; `alice` session's file written
+inside `anonymous__ws-sess-alice/files/` succeeded.

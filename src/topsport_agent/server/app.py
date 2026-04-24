@@ -364,6 +364,32 @@ def create_app(
             )
             create_hooks.append(persona_hook)
 
+        # Per-session workspace: binds session.workspace.files_dir as the
+        # file_ops sandbox root. Without this hook ToolContext.workspace_root
+        # stays None and file tools run in unbounded CLI trust mode — a major
+        # multi-tenant escape vector.
+        from ..workspace import WorkspaceRegistry
+
+        ws_base = Path(cfg.workspace_root) if cfg.workspace_root else (
+            Path.home() / ".topsport-agent" / "workspaces"
+        )
+        ws_registry = WorkspaceRegistry(ws_base)
+
+        async def _assign_workspace(session_id: str, entry: "SessionEntry") -> None:
+            del session_id
+            entry.session.workspace = ws_registry.acquire(entry.session.id)
+
+        create_hooks.append(_assign_workspace)
+
+        if cfg.workspace_delete_on_close:
+            async def _release_workspace(session_id: str, entry: "SessionEntry") -> None:
+                del entry
+                ws_registry.release(session_id, delete=True)
+
+            close_hooks.append(_release_workspace)
+
+        app.state.workspace_registry = ws_registry
+
         store = SessionStore(
             agent_factory=factory,
             provider=prov,

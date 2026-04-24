@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from .message import Message
+
+if TYPE_CHECKING:
+    from ..workspace.manager import SessionWorkspace
 
 
 class RunState(StrEnum):
@@ -44,3 +48,8 @@ class Session:
     granted_permissions: frozenset[str] = field(default_factory=frozenset)
     # Persona id that populated granted_permissions (audit trail).
     persona_id: str | None = None
+    # Per-session disk sandbox root (file_ops + potentially other disk-facing
+    # tools). None = no sandbox → ToolContext.workspace_root stays None →
+    # file_ops runs in CLI trust mode (host FS access). Production server
+    # creates one per session via SessionStore lifecycle hook.
+    workspace: "SessionWorkspace | None" = None

@@ -575,6 +575,12 @@ class Engine:
             session_id=session.id,
             call_id=call.id,
             cancel_event=self._cancel_event,
+            # workspace_root is the file_ops sandbox boundary. None keeps
+            # CLI trust mode (no restriction); server populates session.workspace
+            # at creation so HTTP-initiated tool calls can't escape to host FS.
+            workspace_root=(
+                session.workspace.files_dir if session.workspace is not None else None
+            ),
         )
 
         # Permission check：checker 返回 DENY/ASK→(asker→)→ 最终决策。

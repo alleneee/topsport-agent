@@ -47,6 +47,14 @@ class ServerConfig:
     # MCP（Model Context Protocol）tool sources。指向 claude-desktop 兼容的 JSON 配置；
     # 启动时加载，server 端对所有 session 生效。当前不支持 per-tenant 不同 MCP。
     mcp_config_path: str | None = None
+    # Per-session disk workspace base directory. Each session gets
+    # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
+    # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
+    # 设为某绝对路径可放到专用存储卷（建议企业部署单独挂盘）。
+    workspace_root: str | None = None
+    # session 关闭时是否删除对应 workspace 目录。False（默认）保留便于 debug /
+    # retention policy 由外部清理；True 适合严格多租户隔离场景。
+    workspace_delete_on_close: bool = False
     # Plan 执行的硬上限，防止客户端提交超大 max_steps 绕过运营预算
     max_plan_steps: int = 20
     # Chat 路径的 Engine 每会话最大 ReAct 步数（工具调用+LLM 往返次数上限）
@@ -117,6 +125,10 @@ class ServerConfig:
             image_gen_base_url=os.environ.get("IMAGE_GEN_BASE_URL") or None,
             enable_langfuse=_parse_bool(os.environ.get("ENABLE_LANGFUSE"), default=False),
             mcp_config_path=os.environ.get("MCP_CONFIG_PATH") or None,
+            workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
+            workspace_delete_on_close=_parse_bool(
+                os.environ.get("WORKSPACE_DELETE_ON_CLOSE"), default=False
+            ),
             prompt_injection_guard=_parse_bool(
                 os.environ.get("PROMPT_INJECTION_GUARD"), default=True
             ),
