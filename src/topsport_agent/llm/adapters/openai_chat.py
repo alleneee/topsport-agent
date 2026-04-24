@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
-from ...types.message import Message, Role, ToolCall
+from ...types.message import (
+    ContentPart,
+    ImagePart,
+    MediaRef,
+    Message,
+    Role,
+    TextPart,
+    ToolCall,
+    VideoPart,
+)
 from ...types.tool import ToolSpec
 from ..request import LLMRequest
 from ..response import (
@@ -11,6 +21,65 @@ from ..response import (
     LLMResponse,
     ProviderResponseMetadata,
 )
+
+
+_EXT_TO_MEDIA: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+}
+
+
+def _resolve_media_url(ref: MediaRef) -> str:
+    """Normalize a MediaRef to a URL string.
+
+    URL -> pass through.
+    Path -> read bytes, base64, build data URI (infer media_type from suffix).
+    Bytes -> base64, build data URI (media_type already validated).
+    """
+    if ref.url is not None:
+        return ref.url
+    if ref.path is not None:
+        suffix = ref.path.suffix.lower()
+        media_type = ref.media_type or _EXT_TO_MEDIA.get(suffix)
+        if not media_type:
+            raise ValueError(
+                f"Cannot infer media_type from {ref.path!r}; "
+                "pass MediaRef(media_type=...) explicitly"
+            )
+        raw = ref.path.read_bytes()
+        b64 = base64.b64encode(raw).decode("ascii")
+        return f"data:{media_type};base64,{b64}"
+    if ref.data is not None:
+        assert ref.media_type is not None
+        b64 = base64.b64encode(ref.data).decode("ascii")
+        return f"data:{ref.media_type};base64,{b64}"
+    raise ValueError("MediaRef has no url/path/data")
+
+
+def _encode_content_part(part: ContentPart) -> dict[str, Any]:
+    """Render a ContentPart into an OpenAI content block."""
+    if isinstance(part, TextPart):
+        return {"type": "text", "text": part.text}
+    if isinstance(part, ImagePart):
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": _resolve_media_url(part.source),
+                "detail": part.detail,
+            },
+        }
+    if isinstance(part, VideoPart):
+        return {
+            "type": "video_url",
+            "video_url": {"url": _resolve_media_url(part.source)},
+        }
+    raise TypeError(f"Unsupported content part: {type(part).__name__}")
 
 
 class OpenAIChatAdapter:
@@ -163,13 +232,25 @@ class OpenAIChatAdapter:
         converted: list[dict[str, Any]] = []
 
         for msg in messages:
+            if msg.content_parts is not None and msg.role != Role.USER:
+                raise ValueError(
+                    f"{msg.role.value} messages do not support content_parts (OpenAI scheme)"
+                )
             if msg.role == Role.SYSTEM:
                 if msg.content:
                     converted.append({"role": "system", "content": msg.content})
                 continue
 
             if msg.role == Role.USER:
-                converted.append({"role": "user", "content": msg.content or ""})
+                if msg.content_parts is None:
+                    converted.append({"role": "user", "content": msg.content or ""})
+                    continue
+                parts_payload: list[dict[str, Any]] = []
+                if msg.content:
+                    parts_payload.append({"type": "text", "text": msg.content})
+                for part in msg.content_parts:
+                    parts_payload.append(_encode_content_part(part))
+                converted.append({"role": "user", "content": parts_payload})
                 continue
 
             if msg.role == Role.ASSISTANT:

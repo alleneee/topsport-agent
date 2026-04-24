@@ -470,3 +470,169 @@ async def test_engine_integration_with_openai_adapter():
     assert assistant_msg["tool_calls"][0]["id"] == "c1"
     tool_role_msg = next(m for m in messages if m["role"] == "tool")
     assert tool_role_msg["tool_call_id"] == "c1"
+
+
+# -----------------------------------------------------------------------------
+# Multimodal content_parts tests (Tasks 4-7)
+# -----------------------------------------------------------------------------
+from pathlib import Path
+
+from topsport_agent.llm.adapters.openai_chat import OpenAIChatAdapter
+from topsport_agent.types.message import (
+    TextPart,
+    image_bytes,
+    image_file,
+    image_url,
+    video_url,
+)
+
+
+def _req(messages: list[Message]) -> LLMRequest:
+    return LLMRequest(model="gpt-4o", messages=messages)
+
+
+def test_user_message_plain_string_payload_unchanged() -> None:
+    adapter = OpenAIChatAdapter()
+    msg = Message(role=Role.USER, content="hello")
+    payload = adapter.build_payload(_req([msg]))
+    assert payload["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_user_message_with_text_part_only_emits_array() -> None:
+    adapter = OpenAIChatAdapter()
+    msg = Message(role=Role.USER, content=None, content_parts=[TextPart("hi")])
+    payload = adapter.build_payload(_req([msg]))
+    assert payload["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+    ]
+
+
+def test_user_message_with_image_url() -> None:
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.USER,
+        content=None,
+        content_parts=[
+            TextPart("what is this?"),
+            image_url("https://example.com/a.jpg"),
+        ],
+    )
+    payload = adapter.build_payload(_req([msg]))
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "what is this?"}
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {
+            "url": "https://example.com/a.jpg",
+            "detail": "auto",
+        },
+    }
+
+
+def test_user_message_with_content_and_parts_prepends_text() -> None:
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.USER,
+        content="lead",
+        content_parts=[image_url("https://x")],
+    )
+    payload = adapter.build_payload(_req([msg]))
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "lead"}
+    assert content[1]["type"] == "image_url"
+
+
+def test_user_message_with_image_detail_high() -> None:
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.USER,
+        content_parts=[image_url("https://x.jpg", detail="high")],
+    )
+    payload = adapter.build_payload(_req([msg]))
+    assert payload["messages"][0]["content"][0]["image_url"]["detail"] == "high"
+
+
+def test_user_message_with_image_file_auto_base64(tmp_path: Path) -> None:
+    adapter = OpenAIChatAdapter()
+    img = tmp_path / "a.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    msg = Message(role=Role.USER, content_parts=[image_file(img)])
+    payload = adapter.build_payload(_req([msg]))
+    url = payload["messages"][0]["content"][0]["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+
+
+def test_user_message_with_image_bytes_explicit_media_type() -> None:
+    import base64 as _b64
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.USER,
+        content_parts=[image_bytes(b"raw-jpeg-data", "image/jpeg")],
+    )
+    payload = adapter.build_payload(_req([msg]))
+    url = payload["messages"][0]["content"][0]["image_url"]["url"]
+    assert url.startswith("data:image/jpeg;base64,")
+    assert _b64.b64decode(url.split(",", 1)[1]) == b"raw-jpeg-data"
+
+
+def test_path_with_unknown_extension_and_no_media_type_raises(
+    tmp_path: Path,
+) -> None:
+    import pytest
+    adapter = OpenAIChatAdapter()
+    f = tmp_path / "mystery.bin"
+    f.write_bytes(b"stuff")
+    msg = Message(role=Role.USER, content_parts=[image_file(f)])
+    with pytest.raises(ValueError, match="Cannot infer media_type"):
+        adapter.build_payload(_req([msg]))
+
+
+def test_user_message_with_video_url() -> None:
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.USER,
+        content=None,
+        content_parts=[
+            TextPart("describe this clip"),
+            video_url("https://example.com/clip.mp4"),
+        ],
+    )
+    payload = adapter.build_payload(_req([msg]))
+    blocks = payload["messages"][0]["content"]
+    assert blocks[1] == {
+        "type": "video_url",
+        "video_url": {"url": "https://example.com/clip.mp4"},
+    }
+
+
+def test_assistant_role_with_content_parts_raises() -> None:
+    import pytest
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.ASSISTANT,
+        content_parts=[TextPart("should not be allowed")],
+    )
+    with pytest.raises(ValueError, match="assistant.*content_parts"):
+        adapter.build_payload(_req([msg]))
+
+
+def test_system_role_with_content_parts_raises() -> None:
+    import pytest
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.SYSTEM,
+        content_parts=[TextPart("nope")],
+    )
+    with pytest.raises(ValueError, match="system.*content_parts"):
+        adapter.build_payload(_req([msg]))
+
+
+def test_tool_role_with_content_parts_raises() -> None:
+    import pytest
+    adapter = OpenAIChatAdapter()
+    msg = Message(
+        role=Role.TOOL,
+        content_parts=[TextPart("nope")],
+    )
+    with pytest.raises(ValueError, match="tool.*content_parts"):
+        adapter.build_payload(_req([msg]))
