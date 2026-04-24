@@ -43,7 +43,18 @@ def test_factory_postgres_returns_postgres_gateway() -> None:
 def test_public_package_exports() -> None:
     import topsport_agent.database as db_pkg
 
-    assert hasattr(db_pkg, "create_database")
-    assert hasattr(db_pkg, "DatabaseConfig")
-    assert hasattr(db_pkg, "Database")
-    assert hasattr(db_pkg, "NullGateway")
+    expected = {
+        "ConnectionError",
+        "Database",
+        "DatabaseConfig",
+        "DatabaseError",
+        "IntegrityError",
+        "NullGateway",
+        "QueryError",
+        "Transaction",
+        "TransactionError",
+        "create_database",
+    }
+    for name in expected:
+        assert hasattr(db_pkg, name), f"missing public export: {name}"
+    assert set(db_pkg.__all__) == expected
