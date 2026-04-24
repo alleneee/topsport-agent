@@ -995,3 +995,63 @@ after moving any error-handling code, not just rely on test updates.
 "type": type(exc).__name__}` — deliberately drops `str(exc)` to prevent
 API key leakage); test migration at
 `tests/test_server_sandbox.py::test_plan_error_payload_does_not_leak_exception_message`.
+
+---
+
+## Agent stores subscribers/tool_sources in TWO places — runtime adds must write both
+
+**Context:** After shipping the Langfuse tracing gate on HTTP server (opt-in
+via `ENABLE_LANGFUSE=true`), a 2-step plan submitted through
+`/v1/chat/completions` mode="plan" produced a chat trace in Langfuse but
+**no traces for the plan's sub-steps**. The chat endpoint worked; plan mode
+looked like tracing was disabled even though the global flag was on.
+
+**Learned:** An `Agent` keeps its event subscribers / tool sources / context
+providers in two synchronized-at-construction-time places:
+
+1. `self._engine._subscribers` (and `_tool_sources`, `_context_providers`) —
+   consumed by the **currently running** engine.
+2. `self._capability_bundle["event_subscribers"]` (and `"tool_sources"`,
+   `"context_providers"`) — consumed by `spawn_child` when it constructs
+   each sub-agent's Engine.
+
+`Engine.add_event_subscriber(sub)` / `Engine.add_tool_source(src)` only
+mutate #1. #2 is a snapshot taken in `Agent.from_config`; it doesn't
+observe runtime changes to the engine's lists. So any wrapper / decorator
+that lazily attaches a subscriber via `agent.engine.add_event_subscriber(...)`
+gets it on the **parent** agent only — the moment Plan mode (or any
+spawn_child-based feature) fans out, the fresh sub-Engines are built with
+the **pre-wrapper** bundle and miss the subscriber entirely.
+
+In our case `_wrap_with_extras` / `_wrap_with_metrics` in `server/app.py`
+did exactly this. The plan path silently lost observability. Tests didn't
+catch it because tests build Agent directly (not through the server-side
+wrapper chain), and even for the wrappers they don't assert sub-agent
+telemetry.
+
+Fix: runtime registration must write BOTH paths.
+
+```python
+agent.engine.add_event_subscriber(sub)
+agent._capability_bundle.setdefault("event_subscribers", []).append(sub)
+# and for tool_sources:
+agent.engine.add_tool_source(src)
+agent._capability_bundle.setdefault("tool_sources", []).append(src)
+```
+
+Longer-term fix: promote this to a public `Agent.register_subscriber(sub)`
+method that encapsulates the two-write invariant. `_capability_bundle`
+being underscore-prefixed + needing two-write synchrony is a leaky
+abstraction.
+
+Diagnostic rule of thumb: **"parent agent has the subscriber, sub-agents
+don't"** is the fingerprint. If Langfuse / Prometheus / MCP bridge works
+for `/v1/chat/completions` default mode but disappears for plan / delegate
+/ spawn_agent flows, suspect this double-list skew.
+
+**Evidence:** `src/topsport_agent/server/app.py::_wrap_with_extras`,
+`_wrap_with_metrics` (both now also mutate `_capability_bundle`).
+Regression captured by Langfuse API check: `plan-ctx-002` before the fix
+had `observations=2` only for the parent trace; after the fix there are
+separate traces `agent.run[<plan_id>:<step_id>:<hash>]` for every
+sub-step.
