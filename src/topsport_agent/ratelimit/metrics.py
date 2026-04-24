@@ -43,7 +43,13 @@ class RateLimitMetrics:
             self._duration = _NoOpHistogram()
             return
 
-        kwargs = {"registry": registry} if registry is not None else {}
+        # Use a private registry by default to avoid duplicate-registration
+        # errors when multiple RateLimitMetrics instances are created in the
+        # same process (e.g. during tests).  Callers that want a shared
+        # registry can pass one explicitly.
+        if registry is None:
+            registry = prom.CollectorRegistry()
+        kwargs = {"registry": registry}
         self._requests = prom.Counter(
             "ratelimit_requests_total",
             "Rate-limit checks by scope",
