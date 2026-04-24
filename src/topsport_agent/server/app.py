@@ -26,6 +26,7 @@ from ..agent.default import default_agent
 from ..engine.sanitizer import DefaultSanitizer
 from ..llm.provider import LLMProvider
 from ..observability.logging import configure_json_logging
+from ..database import DatabaseConfig, NullGateway, create_database
 from .auth import AuthConfig
 from .chat import router as chat_router
 from .config import ServerConfig
@@ -228,6 +229,28 @@ def create_app(
         app.state.config = cfg
         app.state.auth_config = auth_config
         app.state.sandbox_pool = pool
+        # === Database (optional, default off) ===
+        if cfg.enable_database:
+            if not cfg.database_url:
+                raise RuntimeError(
+                    "ENABLE_DATABASE=true but DATABASE_URL is unset"
+                )
+            db_config = DatabaseConfig(
+                backend=cfg.database_backend,
+                url=cfg.database_url,
+                pool_min=cfg.database_pool_min,
+                pool_max=cfg.database_pool_max,
+                timeout_seconds=cfg.database_timeout_seconds,
+            )
+            db = create_database(db_config)
+            await db.connect()
+            if not await db.health_check():
+                raise RuntimeError(
+                    "database enabled but health_check failed"
+                )
+            app.state.database = db
+        else:
+            app.state.database = NullGateway()
         app.state.draining = False
         app.state.inflight = 0
         if not auth_config.required:
@@ -254,6 +277,13 @@ def create_app(
                     await pool.close_all()
                 except Exception as exc:
                     _logger.warning("sandbox pool close failed: %r", exc)
+            # Close database if it was a real backend (NullGateway.close is no-op).
+            db_state = getattr(app.state, "database", None)
+            if db_state is not None:
+                try:
+                    await db_state.close()
+                except Exception as exc:
+                    _logger.warning("database close failed during shutdown: %r", exc)
 
     app = FastAPI(
         title="topsport-agent",
