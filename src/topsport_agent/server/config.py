@@ -58,6 +58,14 @@ class ServerConfig:
     sandbox_idle_pause_seconds: float | None = 300.0  # None = 禁用 idle pause
     sandbox_use_server_proxy: bool = True  # 对 Docker bridge 部署必须 True
 
+    # Database (pluggable skeleton; see database/)
+    enable_database: bool = False
+    database_backend: str = "postgres"          # only applied when enable_database=True
+    database_url: str | None = None
+    database_pool_min: int = 1
+    database_pool_max: int = 10
+    database_timeout_seconds: float = 30.0
+
     @classmethod
     def from_env(cls) -> ServerConfig:
         return cls(
@@ -102,6 +110,16 @@ class ServerConfig:
             ),
             sandbox_use_server_proxy=_parse_bool(
                 os.environ.get("SANDBOX_USE_SERVER_PROXY"), default=True
+            ),
+            enable_database=_parse_bool(
+                os.environ.get("ENABLE_DATABASE"), default=False
+            ),
+            database_backend=os.environ.get("DATABASE_BACKEND", "postgres"),
+            database_url=os.environ.get("DATABASE_URL") or None,
+            database_pool_min=int(os.environ.get("DATABASE_POOL_MIN", "1")),
+            database_pool_max=int(os.environ.get("DATABASE_POOL_MAX", "10")),
+            database_timeout_seconds=float(
+                os.environ.get("DATABASE_TIMEOUT_SECONDS", "30")
             ),
         )
 
