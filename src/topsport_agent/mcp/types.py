@@ -23,6 +23,25 @@ class MCPServerConfig:
     # Capability requirements contributed to every bridged ToolSpec from this
     # server. Empty means the MCP server's tools are visible to any session.
     permissions: frozenset[str] = field(default_factory=frozenset)
+    # 缓存 list_tools / list_prompts / list_resources 结果的最长秒数。
+    # 三种取值语义：
+    #   None  —— 永不过期，仅显式 invalidate / force_refresh / list_changed
+    #            通知触发刷新（适合工具集稳定的长跑场景）
+    #   0     —— 立即过期 / 不缓存（每次访问都新建 session 拉取，适合开发调试）
+    #   正数  —— 缓存过期秒数，过期后下一次访问自动 refresh
+    # 负数会在 load_mcp_config / __post_init__ 阶段被拒绝（避免反直觉行为）。
+    # MCP 规范要求 client 订阅 server 的 list_changed 通知做缓存失效，但当前
+    # 架构是"每次新建短生命周期 session"，session 退出 cancel scope 也带走通知
+    # 通道。TTL + `MCPClient.notify_list_changed` 应用层触发点共同兜住缓存陈旧
+    # 问题。Long-lived listening session 是 follow-up（见 MCPClient docstring）。
+    cache_ttl: float | None = 60.0
+
+    def __post_init__(self) -> None:
+        if self.cache_ttl is not None and self.cache_ttl < 0:
+            raise ValueError(
+                f"mcp config: server '{self.name}' cache_ttl must be >= 0 or "
+                f"None, got {self.cache_ttl!r}"
+            )
 
 
 @dataclass(slots=True, frozen=True)

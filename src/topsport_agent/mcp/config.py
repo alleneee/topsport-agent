@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from .policy import AllowEntry, MCPSecurityPolicy, enforce_stdio_policy
 from .types import MCPServerConfig, MCPTransport
@@ -48,6 +49,7 @@ def load_mcp_config(
             headers=dict(raw.get("headers", {})),
             timeout=float(raw.get("timeout", 30.0)),
             permissions=frozenset(raw.get("permissions", [])),
+            cache_ttl=_parse_cache_ttl(raw.get("cache_ttl", 60.0)),
         )
         _validate(config)
         if config.transport == MCPTransport.STDIO:
@@ -87,6 +89,13 @@ def _policy_from_data(data: dict) -> MCPSecurityPolicy:
         args_prefix = tuple(str(a) for a in raw.get("args_prefix", []))
         entries.append(AllowEntry(name=name, command=command, args_prefix=args_prefix))
     return MCPSecurityPolicy.strict(entries)
+
+
+def _parse_cache_ttl(raw: Any) -> float | None:
+    """JSON config 解析：None / null → None（永不过期）；数值转 float。"""
+    if raw is None:
+        return None
+    return float(raw)
 
 
 def _validate(config: MCPServerConfig) -> None:
