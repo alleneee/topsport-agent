@@ -26,7 +26,7 @@ notifications (`progress`, `logging`, `resources/updated`, all three
 (`roots`, `sampling`, `elicitation`) implemented with security caps
 (rate-limit / token cap / cross-tenant defence). Long-lived listening
 session with auto-reconnect (capped exponential backoff, replay on
-reconnect). 1153 tests passing including 6 in-process e2e against a
+reconnect). 1162 tests passing including 6 in-process e2e against a
 real `mcp.Server`.
 
 | Module | Location | State |
@@ -47,7 +47,7 @@ real `mcp.Server`.
 | agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
 | server | `src/topsport_agent/server/` | HTTP + SSE chat & plan endpoints, RBAC middleware, admin permission API, MCP elicitation broker + reply endpoint |
-| tests | `tests/` | 1153 passing (6 in-process MCP e2e + 234 spec-coverage unit) |
+| tests | `tests/` | 1162 passing (6 in-process MCP e2e + 234 spec-coverage unit) |
 
 ## Quickstart
 
@@ -222,7 +222,8 @@ uv sync --group llm --group api
 ```
 
 Reuses the CLI `.env` (`API_KEY` / `BASE_URL` / `MODEL`). Optional:
-`HOST`, `PORT`, `SESSION_TTL_SECONDS`, `MAX_SESSIONS`.
+`HOST`, `PORT`, `SESSION_TTL_SECONDS`, `MAX_SESSIONS`, `MAX_PLAN_STEPS`,
+`MAX_CHAT_STEPS`, `PLAN_CHECKPOINT_DIR`.
 
 ```bash
 uv run topsport-agent-serve --host 0.0.0.0 --port 8000
@@ -230,9 +231,11 @@ uv run topsport-agent-serve --host 0.0.0.0 --port 8000
 
 ### POST /v1/chat/completions
 
-OpenAI wire format. The `user` field is repurposed as `session_id`
-(auto-generated when omitted). Server-side history is authoritative: only
-the last `role=user` message in the request body is taken as new input.
+OpenAI wire format. The `user` field is repurposed as `session_id`.
+When omitted, each request gets a fresh server-generated session hint
+returned in `X-Session-Hint`; `X-Session-Id` carries the principal-scoped
+session id. Server-side history is authoritative: only the last
+`role=user` message in the request body is taken as new input.
 
 ```bash
 # non-streaming JSON
@@ -290,6 +293,12 @@ are auto-aborted (`PLAN_WAITING` → `ABORT`) to avoid hangs.
 ### Session semantics
 
 - `user` → `session_id`; first request creates an Agent, subsequent requests reuse it.
+- Omit `user` for a fresh per-request session; reuse `X-Session-Hint` as `user`
+  to continue the same conversation.
+- `temperature` and `max_tokens` are forwarded to the provider request for both
+  streaming and non-streaming chat, including HTTP plan execution.
+- `PLAN_CHECKPOINT_DIR` enables file-backed plan checkpoints for HTTP plan mode;
+  embedders can also inject `ServerConfig.plan_checkpointer` directly.
 - Per-session `asyncio.Lock` serializes concurrent requests on the same id.
 - LRU eviction at `MAX_SESSIONS`; TTL sweep at `SESSION_TTL_SECONDS` (default 3600).
 - Eviction calls `agent.close()` (cleans up plugins / browser if enabled).

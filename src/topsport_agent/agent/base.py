@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..engine import Engine, EngineConfig
+from ..engine import Engine, EngineConfig, EngineRunOptions
 from ..engine.hooks import (
     ContextProvider,
     EventSubscriber,
@@ -47,6 +47,7 @@ from .config_parts import (
 )
 
 if TYPE_CHECKING:
+    from ..engine.checkpoint import Checkpointer
     from ..engine.permission.audit import AuditLogger
     from ..engine.permission.filter import ToolVisibilityFilter
     from ..engine.permission.persona_registry import PersonaRegistry
@@ -55,9 +56,9 @@ if TYPE_CHECKING:
         OpenAIImageGenerationClient,
     )
     from ..types.permission import (
-        Persona,
         PermissionAsker,
         PermissionChecker,
+        Persona,
     )
 
 
@@ -131,6 +132,7 @@ class AgentConfig:
     image_generator: "OpenAIImageGenerationClient | None" = None
     # 其它 engine 级选项
     provider_options: dict[str, Any] | None = None
+    plan_checkpointer: Checkpointer | None = None
 
     # -----------------------------------------------------------------
     # Structured views — read-only snapshots assembled from flat fields.
@@ -289,6 +291,9 @@ class Agent:
         mode: str = "react",
         plan: Plan | None = None,
         system: str | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        provider_options: dict[str, Any] | None = None,
     ) -> AsyncIterator[Event]:
         """Unified execution entry — the single public verb for this Agent.
 
@@ -313,11 +318,16 @@ class Agent:
             raise ValueError("session is required")
         if system is not None and system != session.system_prompt:
             session.system_prompt = system
+        run_options = EngineRunOptions(
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            provider_options=provider_options,
+        )
 
         if mode == "plan":
             if plan is None:
                 raise ValueError("mode='plan' requires plan=<Plan>")
-            async for event in self._run_plan(plan, session):
+            async for event in self._run_plan(plan, session, run_options):
                 yield event
             return
         if mode != "react":
@@ -335,12 +345,15 @@ class Agent:
             msg = Message(role=Role.USER, content=user_input)
         session.messages.append(msg)
         session.state = RunState.IDLE
-        async for event in self._engine.run(session):
+        async for event in self._engine.run(session, run_options=run_options):
             yield event
         self._engine.reset_cancel()
 
     async def _run_plan(
-        self, plan: Plan, session: Session
+        self,
+        plan: Plan,
+        session: Session,
+        run_options: EngineRunOptions,
     ) -> AsyncIterator[Event]:
         """Internal: execute a Plan via the Orchestrator strategy.
 
@@ -358,14 +371,16 @@ class Agent:
             max_steps=self._config.max_steps,
             provider_options=self._config.provider_options,
         )
-        orchestrator = Orchestrator(plan, sub_config, parent_agent=self)
-        # Make the session reachable to spawn_child for permission inheritance.
-        self._engine._current_session = session
-        try:
-            async for event in orchestrator.execute():
-                yield event
-        finally:
-            self._engine._current_session = None
+        orchestrator = Orchestrator(
+            plan,
+            sub_config,
+            parent_agent=self,
+            parent_session=session,
+            run_options=run_options,
+            checkpointer=self._config.plan_checkpointer,
+        )
+        async for event in orchestrator.execute():
+            yield event
 
     async def generate_image(
         self,

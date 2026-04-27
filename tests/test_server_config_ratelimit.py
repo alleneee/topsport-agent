@@ -15,6 +15,16 @@ def test_ratelimit_defaults_disabled() -> None:
     assert cfg.ratelimit_routes == {}
     assert cfg.ratelimit_trust_forwarded_for is False
     assert cfg.ratelimit_fail_open is True
+    assert cfg.plan_checkpointer is None
+    assert cfg.plan_checkpoint_dir is None
+
+
+def test_plan_checkpoint_dir_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_KEY", "dummy")
+    monkeypatch.setenv("PLAN_CHECKPOINT_DIR", "/tmp/topsport-agent-checkpoints")
+
+    cfg = ServerConfig.from_env()
+    assert cfg.plan_checkpoint_dir == "/tmp/topsport-agent-checkpoints"
 
 
 def test_ratelimit_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:

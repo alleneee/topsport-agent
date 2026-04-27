@@ -72,6 +72,13 @@ class EngineConfig:
     stream: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class EngineRunOptions:
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    provider_options: dict[str, Any] | None = None
+
+
 class Engine:
     def __init__(
         self,
@@ -300,19 +307,39 @@ class Engine:
     ) -> Event:
         return Event(type=event_type, session_id=session.id, payload=payload)
 
+    def _build_llm_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        run_options: EngineRunOptions | None,
+    ) -> LLMRequest:
+        provider_options = dict(self._config.provider_options or {})
+        overrides = run_options.provider_options if run_options else None
+        for key, value in (overrides or {}).items():
+            if isinstance(value, dict) and isinstance(provider_options.get(key), dict):
+                merged = dict(provider_options[key])
+                merged.update(value)
+                provider_options[key] = merged
+            else:
+                provider_options[key] = value
+        return LLMRequest(
+            model=self._config.model,
+            messages=messages,
+            tools=tools,
+            max_output_tokens=run_options.max_output_tokens if run_options else None,
+            temperature=run_options.temperature if run_options else None,
+            provider_options=provider_options,
+        )
+
     async def _call_llm_with_cancel(
-        self, messages: list[Message], tools: list[ToolSpec]
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        run_options: EngineRunOptions | None,
     ) -> LLMResponse:
         # LLM 调用和取消信号并行等待，谁先结束就按谁的结果收口。
         llm_task = asyncio.create_task(
-            self._provider.complete(
-                LLMRequest(
-                    model=self._config.model,
-                    messages=messages,
-                    tools=tools,
-                    provider_options=dict(self._config.provider_options or {}),
-                )
-            )
+            self._provider.complete(self._build_llm_request(messages, tools, run_options))
         )
         cancel_task = asyncio.create_task(self._cancel_event.wait())
 
@@ -343,6 +370,7 @@ class Engine:
         session: Session,
         step: int,
         final_holder: list[LLMResponse],
+        run_options: EngineRunOptions | None,
     ) -> AsyncIterator[Event]:
         """流式调用路径：yield LLM_TEXT_DELTA 事件给上层，final_holder[0] 回填最终 response。
 
@@ -351,12 +379,7 @@ class Engine:
         """
         assert isinstance(self._provider, StreamingLLMProvider)
 
-        request = LLMRequest(
-            model=self._config.model,
-            messages=messages,
-            tools=tools,
-            provider_options=dict(self._config.provider_options or {}),
-        )
+        request = self._build_llm_request(messages, tools, run_options)
 
         stream = self._provider.stream(request)
         final: LLMResponse | None = None
@@ -397,7 +420,12 @@ class Engine:
             self._raise_if_cancelled()
             await hook.after_step(session, step)
 
-    async def run(self, session: Session) -> AsyncIterator[Event]:
+    async def run(
+        self,
+        session: Session,
+        *,
+        run_options: EngineRunOptions | None = None,
+    ) -> AsyncIterator[Event]:
         # run 负责包住完整生命周期，统一发出 RUN_START / RUN_END。
         run_start = Event(
             type=EventType.RUN_START,
@@ -413,7 +441,7 @@ class Engine:
         yield run_start
 
         final_state = session.state.value
-        async for event in self._run_inner(session):
+        async for event in self._run_inner(session, run_options):
             await self._emit(event)
             yield event
             if event.type == EventType.STATE_CHANGED:
@@ -430,7 +458,11 @@ class Engine:
         await self._emit(run_end)
         yield run_end
 
-    async def _run_inner(self, session: Session) -> AsyncIterator[Event]:
+    async def _run_inner(
+        self,
+        session: Session,
+        run_options: EngineRunOptions | None,
+    ) -> AsyncIterator[Event]:
         # 把 session 挂到 self，确保 _snapshot_tools / 其他 hot-path 方法在被外部
         # 0-arg 测试替身覆盖时仍能看到当前 session（capability filter 需要 session
         # 的 granted_permissions / tenant_id）。run 结束后 finally 中清零避免跨会话泄漏。
@@ -469,13 +501,18 @@ class Engine:
                     if use_stream:
                         final_holder: list[LLMResponse] = []
                         async for evt in self._stream_llm_events(
-                            call_messages, tools_snapshot, session, step, final_holder,
+                            call_messages,
+                            tools_snapshot,
+                            session,
+                            step,
+                            final_holder,
+                            run_options,
                         ):
                             yield evt
                         response = final_holder[0]
                     else:
                         response = await self._call_llm_with_cancel(
-                            call_messages, tools_snapshot
+                            call_messages, tools_snapshot, run_options
                         )
                     yield self._event(
                         EventType.LLM_CALL_END,

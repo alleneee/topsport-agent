@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..engine.checkpoint import Checkpointer
 
 
 @dataclass(slots=True, frozen=True)
@@ -111,6 +115,10 @@ class ServerConfig:
     workspace_delete_on_close: bool = False
     # Plan 执行的硬上限，防止客户端提交超大 max_steps 绕过运营预算
     max_plan_steps: int = 20
+    plan_checkpointer: Checkpointer | None = field(
+        default=None, repr=False, compare=False
+    )
+    plan_checkpoint_dir: str | None = None
     # Chat 路径的 Engine 每会话最大 ReAct 步数（工具调用+LLM 往返次数上限）
     max_chat_steps: int = 20
     # 进程收到 SIGTERM 后等待 in-flight 请求的最大秒数（H-R5 graceful drain）
@@ -213,6 +221,7 @@ class ServerConfig:
             log_format=os.environ.get("LOG_FORMAT", "text").strip().lower() or "text",
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             max_plan_steps=int(os.environ.get("MAX_PLAN_STEPS", "20")),
+            plan_checkpoint_dir=os.environ.get("PLAN_CHECKPOINT_DIR") or None,
             max_chat_steps=int(os.environ.get("MAX_CHAT_STEPS", "20")),
             drain_timeout_seconds=float(
                 os.environ.get("DRAIN_TIMEOUT_SECONDS", "25")

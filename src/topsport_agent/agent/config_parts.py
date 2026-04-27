@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ..engine.checkpoint import Checkpointer
     from ..engine.hooks import (
         ContextProvider,
         EventSubscriber,
@@ -135,6 +136,7 @@ class CapabilityRegistry:
     sanitizer: "ToolResultSanitizer | None" = None
     image_generator: "OpenAIImageGenerationClient | None" = None
     provider_options: dict[str, Any] | None = None
+    plan_checkpointer: Checkpointer | None = None
 
 
 # ---------------------------------------------------------------------------

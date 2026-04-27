@@ -6,7 +6,7 @@ from .hooks import (
     StepConfigurator,
     ToolSource,
 )
-from .loop import BudgetExceeded, Cancelled, Engine, EngineConfig
+from .loop import BudgetExceeded, Cancelled, Engine, EngineConfig, EngineRunOptions
 from .orchestrator import Orchestrator, SubAgentConfig
 from .planner import Planner
 from .prompt import PromptBuilder, PromptSection, SectionPriority
@@ -19,6 +19,7 @@ __all__ = [
     "DefaultSanitizer",
     "Engine",
     "EngineConfig",
+    "EngineRunOptions",
     "EventSubscriber",
     "FailureHandler",
     "Orchestrator",

@@ -5,6 +5,7 @@ fastapi 未安装时跳过整个模块。provider 使用 mock，不触网。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,7 @@ httpx = pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from topsport_agent.agent.base import Agent, AgentConfig  # noqa: E402
+from topsport_agent.engine.checkpoint import MemoryCheckpointer  # noqa: E402
 from topsport_agent.llm.provider import LLMProvider  # noqa: E402
 from topsport_agent.llm.request import LLMRequest  # noqa: E402
 from topsport_agent.llm.response import LLMResponse  # noqa: E402
@@ -57,6 +59,29 @@ class MockStreamProvider:
             response_metadata=None,
         )
         yield LLMStreamChunk(type="done", final_response=final)
+
+
+@dataclass
+class RaisingCompleteProvider:
+    name: str = "mock"
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        del request
+        raise RuntimeError("secret-token-should-not-leak")
+
+
+@dataclass
+class RaisingStreamProvider:
+    name: str = "mock"
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        del request
+        raise AssertionError("stream path expected")
+
+    async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        del request
+        raise RuntimeError("secret-token-should-not-leak")
+        yield LLMStreamChunk(type="text_delta", text_delta="")
 
 
 def _make_test_app(provider: Any, *, auth_required: bool = False) -> Any:
@@ -159,6 +184,8 @@ def test_chat_json_returns_openai_shape() -> None:
         assert body["choices"][0]["message"]["role"] == "assistant"
         assert body["choices"][0]["message"]["content"] == "hello world"
         assert body["choices"][0]["finish_reason"] == "stop"
+        assert r.headers["X-Session-Id"].startswith("anonymous::sess-")
+        assert r.headers["X-Session-Hint"].startswith("sess-")
 
 
 def test_chat_session_state_preserved_across_requests() -> None:
@@ -182,6 +209,66 @@ def test_chat_session_state_preserved_across_requests() -> None:
         entry = store._entries["anonymous::sess-fixed"]
         # 2 轮应追加 2 user + 2 assistant = 至少 4 条消息（不含 engine 内部事件）
         assert len(entry.session.messages) >= 4
+
+
+def test_chat_without_user_creates_fresh_session_each_request() -> None:
+    provider = MockStreamProvider(text="response")
+    app = _make_test_app(provider)
+    with TestClient(app) as client:
+        r1 = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "turn 1"}],
+            },
+        )
+        r2 = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "turn 2"}],
+            },
+        )
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r1.headers["X-Session-Id"] != r2.headers["X-Session-Id"]
+        assert set(app.state.session_store._entries) == {
+            r1.headers["X-Session-Id"],
+            r2.headers["X-Session-Id"],
+        }
+
+
+def test_chat_request_options_forwarded_to_llm_request() -> None:
+    provider = MockStreamProvider(text="ok")
+    app = _make_test_app(provider)
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.2,
+                "max_tokens": 123,
+            },
+        )
+        assert r.status_code == 200
+        assert provider.calls[-1].temperature == 0.2
+        assert provider.calls[-1].max_output_tokens == 123
+
+
+def test_chat_json_error_does_not_leak_raw_exception() -> None:
+    app = _make_test_app(RaisingCompleteProvider())
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert r.status_code == 500
+        assert "chat completion failed" in r.text
+        assert "secret-token-should-not-leak" not in r.text
 
 
 def test_chat_different_sessions_isolated() -> None:
@@ -261,6 +348,24 @@ def test_chat_stream_emits_openai_chunks_and_done() -> None:
     assert penultimate["choices"][0]["finish_reason"] == "stop"
 
 
+def test_chat_stream_error_does_not_leak_raw_exception() -> None:
+    app = _make_test_app(RaisingStreamProvider())
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as resp:
+            body = resp.read().decode()
+            assert resp.status_code == 200
+            assert "chat completion failed" in body
+            assert "secret-token-should-not-leak" not in body
+
+
 # ---------------------------------------------------------------------------
 # Plan execute SSE
 # ---------------------------------------------------------------------------
@@ -303,6 +408,70 @@ def test_plan_execute_streams_named_events() -> None:
     assert events.count("plan_step_start") == 3
     assert events.count("plan_step_end") == 3
     assert events[-1] == "plan_done"
+
+
+def test_chat_plan_mode_writes_server_config_checkpoint() -> None:
+    provider = MockStreamProvider(text="done")
+    checkpointer = MemoryCheckpointer()
+
+    def agent_factory(p: LLMProvider, model: str) -> Agent:
+        return Agent.from_config(
+            p,
+            AgentConfig(
+                name="test",
+                description="",
+                system_prompt="SP",
+                model=model,
+                enable_skills=False,
+                enable_memory=False,
+                enable_plugins=False,
+                enable_browser=False,
+                stream=True,
+            ),
+        )
+
+    app = create_app(
+        ServerConfig(
+            api_key="dummy",
+            default_model="mock/test",
+            auth_required=False,
+            plan_checkpointer=checkpointer,
+        ),
+        provider_name="anthropic",
+        provider=provider,
+        agent_factory=agent_factory,
+    )
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "anthropic/m",
+                "mode": "plan",
+                "plan": {
+                    "id": "checkpoint-plan",
+                    "goal": "run",
+                    "steps": [
+                        {"id": "s1", "title": "a", "instructions": "do a"},
+                    ],
+                },
+            },
+        ) as r:
+            assert r.status_code == 200
+            body = r.read().decode()
+
+    assert "event: plan_done" in body
+    snap = asyncio.run(checkpointer.load("checkpoint-plan"))
+    assert snap is not None
+    assert snap.steps == [
+        {
+            "id": "s1",
+            "status": "done",
+            "result": "done",
+            "error": None,
+            "iterations": 1,
+        }
+    ]
 
 
 def test_plan_execute_rejects_invalid_plan() -> None:

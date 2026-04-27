@@ -45,6 +45,7 @@ from .sse import SSE_DONE_LINE, make_chat_chunk, sse_data, sse_event
 _logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_CHAT_ERROR_MESSAGE = "chat completion failed"
 
 
 def _extract_last_user_message(messages: list) -> str | None:
@@ -140,8 +141,13 @@ async def chat_completions(
             f"got {req_provider!r} in request",
         )
 
+    session_hint = body.user or f"sess-{uuid.uuid4().hex[:12]}"
     # principal 前缀隔离：不同 principal 即便传同一个 body.user 也命中不同 session
-    session_key = namespace_session_id(principal, body.user)
+    session_key = namespace_session_id(principal, session_hint)
+    response_headers = {
+        "X-Session-Id": session_key,
+        "X-Session-Hint": session_hint,
+    }
     # tenant = principal（最简映射）：sandbox / per-tenant quota / 审计都按 principal 维度做。
     _, entry, _ = await store.get_or_create(
         session_key, model_name, tenant_id=principal, principal=principal,
@@ -167,9 +173,13 @@ async def chat_completions(
             )
         plan_obj = _build_plan(body.plan)
         return StreamingResponse(
-            _stream_plan(entry, plan_obj, request),
+            _stream_plan(entry, plan_obj, request, body),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **response_headers,
+            },
         )
 
     # Default: mode == "react"
@@ -181,17 +191,25 @@ async def chat_completions(
 
     if body.stream:
         return StreamingResponse(
-            _stream_chat(entry, user_input, chat_id, body.model, request),
+            _stream_chat(entry, user_input, chat_id, body.model, request, body),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **response_headers,
+            },
         )
-    return JSONResponse(await _complete_chat(entry, user_input, chat_id, body.model))
+    return JSONResponse(
+        await _complete_chat(entry, user_input, chat_id, body.model, body),
+        headers=response_headers,
+    )
 
 
 async def _stream_plan(
     entry: SessionEntry,
     plan: Plan,
     request: Request,
+    body: ChatCompletionRequest | None = None,
 ) -> AsyncIterator[str]:
     """Stream Plan execution events through the unified agent.run entry point.
 
@@ -217,9 +235,17 @@ async def _stream_plan(
 
     async with entry.lock:
         try:
-            async for event in entry.agent.run(
-                session=entry.session, mode="plan", plan=plan,
-            ):
+            run_kwargs: dict[str, Any] = {
+                "session": entry.session,
+                "mode": "plan",
+                "plan": plan,
+            }
+            if body is not None:
+                run_kwargs.update({
+                    "max_output_tokens": body.max_tokens,
+                    "temperature": body.temperature,
+                })
+            async for event in entry.agent.run(**run_kwargs):
                 if await request.is_disconnected():
                     entry.agent.cancel()
                     break
@@ -261,15 +287,58 @@ async def _stream_plan(
 
 
 async def _complete_chat(
-    entry: SessionEntry, user_input: str, chat_id: str, model: str
+    entry: SessionEntry,
+    user_input: str,
+    chat_id: str,
+    model: str,
+    body: ChatCompletionRequest,
 ) -> dict:
     async with entry.lock:
-        errors: list[str] = []
-        async for event in entry.agent.run(user_input, entry.session):
-            if event.type == EventType.ERROR:
-                errors.append(
-                    f"{event.payload.get('kind')}: {event.payload.get('message')}"
-                )
+        error_type: str | None = None
+        try:
+            async for event in entry.agent.run(
+                user_input,
+                entry.session,
+                max_output_tokens=body.max_tokens,
+                temperature=body.temperature,
+            ):
+                if event.type == EventType.ERROR:
+                    error_type = event.payload.get("kind", "error")
+                    _logger.error(
+                        "chat completion failed",
+                        extra={
+                            "event": "chat_completion_failed",
+                            "session_id": entry.session.id,
+                            "tenant_id": entry.session.tenant_id,
+                            "principal": entry.session.principal,
+                            "chat_id": chat_id,
+                            "model": model,
+                            "error_type": error_type,
+                            "error_message": event.payload.get("message", ""),
+                        },
+                    )
+        except Exception as exc:
+            _logger.exception(
+                "chat completion failed",
+                extra={
+                    "event": "chat_completion_exception",
+                    "session_id": entry.session.id,
+                    "tenant_id": entry.session.tenant_id,
+                    "principal": entry.session.principal,
+                    "chat_id": chat_id,
+                    "model": model,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise HTTPException(
+                500,
+                detail={
+                    "error": {
+                        "message": _CHAT_ERROR_MESSAGE,
+                        "type": type(exc).__name__,
+                    }
+                },
+            ) from exc
 
         final_text = ""
         for msg in reversed(entry.session.messages):
@@ -277,8 +346,11 @@ async def _complete_chat(
                 final_text = msg.content
                 break
 
-    if errors and not final_text:
-        raise HTTPException(500, detail={"errors": errors})
+    if error_type is not None and not final_text:
+        raise HTTPException(
+            500,
+            detail={"error": {"message": _CHAT_ERROR_MESSAGE, "type": error_type}},
+        )
 
     resp = ChatCompletionResponse(
         id=chat_id,
@@ -302,6 +374,7 @@ async def _stream_chat(
     chat_id: str,
     model: str,
     request: Request,
+    body: ChatCompletionRequest,
 ) -> AsyncIterator[str]:
     async with entry.lock:
         # 首帧：带 role 的空 delta，OpenAI SSE 协议要求
@@ -344,7 +417,12 @@ async def _stream_chat(
                 })
 
         try:
-            agent_iter = entry.agent.run(user_input, entry.session).__aiter__()
+            agent_iter = entry.agent.run(
+                user_input,
+                entry.session,
+                max_output_tokens=body.max_tokens,
+                temperature=body.temperature,
+            ).__aiter__()
 
             async def _next_event() -> Any:
                 """Wrapper makes the next-event read a real coroutine
@@ -410,10 +488,24 @@ async def _stream_chat(
                                     )
                                 )
                         elif event.type == EventType.ERROR:
+                            error_type = event.payload.get("kind", "error")
+                            _logger.error(
+                                "chat stream agent error",
+                                extra={
+                                    "event": "chat_stream_agent_error",
+                                    "session_id": entry.session.id,
+                                    "tenant_id": entry.session.tenant_id,
+                                    "principal": entry.session.principal,
+                                    "chat_id": chat_id,
+                                    "model": model,
+                                    "error_type": error_type,
+                                    "error_message": event.payload.get("message", ""),
+                                },
+                            )
                             err = {
                                 "error": {
-                                    "message": event.payload.get("message", ""),
-                                    "type": event.payload.get("kind", "error"),
+                                    "message": _CHAT_ERROR_MESSAGE,
+                                    "type": error_type,
                                 }
                             }
                             yield sse_data(err)
@@ -447,7 +539,12 @@ async def _stream_chat(
                     "model": model,
                 },
             )
-            yield sse_data({"error": {"message": str(exc), "type": type(exc).__name__}})
+            yield sse_data({
+                "error": {
+                    "message": _CHAT_ERROR_MESSAGE,
+                    "type": type(exc).__name__,
+                }
+            })
 
         # provider 不支持流式时没有 delta，补发本轮新增的 assistant 文本
         if not saw_delta:

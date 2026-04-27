@@ -121,6 +121,21 @@ def _wrap_with_extras(
     return factory
 
 
+def _wrap_with_plan_checkpointer(
+    inner: Callable[[LLMProvider, str], Agent],
+    checkpointer: Any | None,
+) -> Callable[[LLMProvider, str], Agent]:
+    if checkpointer is None:
+        return inner
+
+    def factory(provider: LLMProvider, model: str) -> Agent:
+        agent = inner(provider, model)
+        agent.config.plan_checkpointer = checkpointer
+        return agent
+
+    return factory
+
+
 def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
     """Load MCP server manager from config file + built-in providers.
 
@@ -232,6 +247,16 @@ def _build_image_client(cfg: ServerConfig) -> Any | None:
         client_factory=_factory,
         default_model=cfg.image_gen_model,
     )
+
+
+def _build_plan_checkpointer(cfg: ServerConfig) -> Any | None:
+    if cfg.plan_checkpointer is not None:
+        return cfg.plan_checkpointer
+    if not cfg.plan_checkpoint_dir:
+        return None
+    from ..engine.checkpoint import FileCheckpointer
+
+    return FileCheckpointer(cfg.plan_checkpoint_dir)
 
 
 def _build_server_system_prompt(cfg: ServerConfig) -> str | None:
@@ -375,6 +400,7 @@ def create_app(
     mcp_manager = _build_mcp_manager(cfg)
     langfuse_tracer = _build_langfuse_tracer(cfg)
     image_client = _build_image_client(cfg)
+    plan_checkpointer = _build_plan_checkpointer(cfg)
 
     extra_tool_sources: list[Any] = []
     if mcp_manager is not None:
@@ -385,6 +411,7 @@ def create_app(
 
     # 叠加装饰：metrics → extras(MCP/Langfuse)
     factory: Callable[[LLMProvider, str], Agent] = raw_factory
+    factory = _wrap_with_plan_checkpointer(factory, plan_checkpointer)
     if metrics is not None:
         factory = _wrap_with_metrics(factory, metrics)
     factory = _wrap_with_extras(factory, extra_tool_sources, extra_event_subs)

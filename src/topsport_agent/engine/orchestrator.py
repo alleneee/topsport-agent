@@ -14,7 +14,7 @@ from ..types.session import RunState, Session
 from ..types.tool import ToolSpec
 from .checkpoint import Checkpointer, build_checkpoint_hook
 from .hooks import ContextProvider, EventSubscriber, FailureHandler, StepConfigurator, ToolSource
-from .loop import Engine, EngineConfig
+from .loop import Engine, EngineConfig, EngineRunOptions
 from .plan_context_tools import PlanContextBridge, PlanContextToolSource
 
 if TYPE_CHECKING:
@@ -52,6 +52,8 @@ class Orchestrator:
         failure_handlers: list[FailureHandler] | None = None,
         event_subscribers: list[EventSubscriber] | None = None,
         parent_agent: Agent | None = None,
+        parent_session: Session | None = None,
+        run_options: EngineRunOptions | None = None,
         checkpointer: Checkpointer | None = None,
     ) -> None:
         """H-A2（Orchestrator 侧）：若给 parent_agent，每个 step 通过
@@ -66,6 +68,8 @@ class Orchestrator:
         self._plan = plan
         self._config = agent_config
         self._parent_agent = parent_agent
+        self._parent_session = parent_session
+        self._run_options = run_options
         self._step_configurators = list(step_configurators or [])
         self._failure_handlers = list(failure_handlers or [])
         self._event_subscribers = list(event_subscribers or [])
@@ -209,7 +213,7 @@ class Orchestrator:
                 session = self._create_session(step)
             self._sub_engines[step.id] = engine
 
-            async for _ in engine.run(session):
+            async for _ in engine.run(session, run_options=self._run_options):
                 pass
 
             self._sub_engines.pop(step.id, None)
@@ -243,6 +247,7 @@ class Orchestrator:
             task=f"## Task: {step.title}\n\n{step.instructions}",
             allowed_tool_names=allowed,
             session_id_prefix=f"{self._plan.id}:{step.id}",
+            parent_session=self._parent_session,
         )
         session.goal = step.title
         # 把 orchestrator 自己订阅者也挂到子引擎（和旧路径一致）

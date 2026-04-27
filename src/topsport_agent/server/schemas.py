@@ -25,8 +25,8 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(default_factory=list)
     stream: bool = False
     user: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, ge=1)
     # 请求级 system prompt 覆盖：非空则替换该 session 的 system_prompt
     # （持久到 session，和 OpenAI messages[0]=role:system 语义一致；两者同时给时
     # 该字段优先，便于多租户显式切换 persona）。
