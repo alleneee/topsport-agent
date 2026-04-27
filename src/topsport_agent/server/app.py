@@ -159,6 +159,28 @@ def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
         roots = [path_to_root(p) for p in cfg.mcp_roots]
         manager.set_roots_provider(static_roots(roots))
 
+    if cfg.mcp_log_level and cfg.mcp_log_level not in {"off", "none"}:
+        from typing import cast
+        from ..mcp.logging_handler import (
+            MCPLogLevel,
+            default_logging_callback,
+        )
+        valid_levels = {
+            "debug", "info", "notice", "warning",
+            "error", "critical", "alert", "emergency",
+        }
+        if cfg.mcp_log_level not in valid_levels:
+            raise RuntimeError(
+                f"MCP_LOG_LEVEL must be one of {sorted(valid_levels)} / 'off' / 'none', "
+                f"got {cfg.mcp_log_level!r}"
+            )
+        level = cast(MCPLogLevel, cfg.mcp_log_level)
+        # 每个 client 用对应名字的 default_logging_callback，便于 ELK 按 server 过滤
+        for client in manager.clients():
+            client.set_logging_callback(
+                default_logging_callback(client.name), level=level,
+            )
+
     return manager
 
 

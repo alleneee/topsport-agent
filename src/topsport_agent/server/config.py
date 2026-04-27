@@ -64,6 +64,12 @@ class ServerConfig:
     # 视为只读：frozen=True 只阻止 rebind，list 自身仍可 mutate；不要在运行期
     # `cfg.mcp_roots.append(...)`，会让 _build_mcp_manager 二次调用看到污染快照。
     mcp_roots: list[str] = field(default_factory=list)
+    # MCP 服务器日志级别。空字符串或 "off" / "none" → 不订阅日志（向后兼容）。
+    # 合法值: debug / info / notice / warning / error / critical / alert / emergency
+    # （MCP spec 8 级 syslog form）。设置后 client 会在每次 initialize 后调
+    # `logging/setLevel(level)`，并把 server 推来的 notifications/message 路由到
+    # `topsport_agent.mcp.server.<client_name>` 日志器。
+    mcp_log_level: str = ""
     # Per-session disk workspace base directory. Each session gets
     # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
     # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
@@ -147,6 +153,7 @@ class ServerConfig:
             ),
             brave_api_key=os.environ.get("BRAVE_API_KEY", ""),
             mcp_roots=_parse_path_list(os.environ.get("MCP_ROOTS")),
+            mcp_log_level=os.environ.get("MCP_LOG_LEVEL", "").strip().lower(),
             workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
             workspace_delete_on_close=_parse_bool(
                 os.environ.get("WORKSPACE_DELETE_ON_CLOSE"), default=False

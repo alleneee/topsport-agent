@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Literal
 
+from .logging_handler import LoggingCallback, MCPLogLevel
 from .roots import Root, RootsProvider, call_roots_provider
 from .types import MCPServerConfig, MCPTransport
 
@@ -56,6 +57,12 @@ class MCPClient:
         # provider via `set_roots_provider` or pass at construction time; the
         # session_factory below converts it into the SDK's list_roots_callback.
         self._roots_provider = roots_provider
+        # logging_callback: receives server's notifications/message events.
+        # None = no callback registered (server still sends notifications but
+        # ClientSession discards them). _logging_level is sent via
+        # session.set_logging_level(...) right after initialize when set.
+        self._logging_callback: LoggingCallback | None = None
+        self._logging_level: MCPLogLevel | None = None
         # clock contract: 必须单调递增。生产默认 time.monotonic（避免 wall-clock
         # 跳变扰动 TTL 判定）；测试可注入可控函数。如果调用方误传非单调函数
         # （如 time.time）导致 age 计算出负值，_is_fresh 会按"已过期"处理（保守
@@ -117,6 +124,56 @@ class MCPClient:
     @property
     def roots_provider(self) -> RootsProvider | None:
         return self._roots_provider
+
+    # -----------------------------------------------------------------
+    # Logging capability (server -> client message stream)
+    # -----------------------------------------------------------------
+
+    def set_logging_callback(
+        self,
+        callback: LoggingCallback | None,
+        *,
+        level: MCPLogLevel | None = None,
+    ) -> None:
+        """Register a callback for `notifications/message` events.
+
+        `callback`: invoked for every server log message
+        (`(LoggingMessageNotificationParams) -> Awaitable[None]`). The
+        session_factory wraps it in an exception-isolating shim so a
+        bad callback can't crash the SDK's notification loop.
+        `level`: when non-None, the next session's `initialize` is
+        followed by `logging/setLevel` to filter at the server side.
+        Pass None to leave the threshold at the server's default.
+
+        Setting `callback=None` disables the capability for subsequent
+        sessions; the threshold stays as last-set until cleared.
+
+        Rationale (callback / level decoupling): operators commonly
+        toggle the callback for temporary muting (debug pause / sampling)
+        and want to re-enable without rewiring level. To clear both,
+        call `set_logging_callback(None)` and `set_logging_level(None)`
+        in sequence. Server may keep emitting at the previous level
+        when only the callback is None — wastes a few bytes but is
+        intentional.
+        """
+        self._logging_callback = callback
+        if level is not None:
+            self._logging_level = level
+
+    def set_logging_level(self, level: MCPLogLevel | None) -> None:
+        """Set the level threshold sent via `logging/setLevel` after
+        each subsequent initialize. Independent from
+        `set_logging_callback` so operators can adjust verbosity without
+        touching the callback chain."""
+        self._logging_level = level
+
+    @property
+    def logging_callback(self) -> LoggingCallback | None:
+        return self._logging_callback
+
+    @property
+    def logging_level(self) -> MCPLogLevel | None:
+        return self._logging_level
 
     async def _list_roots_callback(self, _context: Any) -> Any:
         """Adapter from our RootsProvider → MCP SDK's ListRootsFnT.
@@ -332,6 +389,54 @@ def _make_real_session_factory(
             if client._roots_provider is not None
             else None
         )
+        # Logging callback: wrap user callback in a try/except so a bad
+        # callback can't bring down the SDK's notification dispatch loop
+        # (mirrors notify_list_changed exception isolation).
+        user_logging_cb = client._logging_callback
+        if user_logging_cb is not None:
+            async def _safe_logging_cb(params: Any) -> None:
+                try:
+                    await user_logging_cb(params)
+                except Exception:
+                    _logger.warning(
+                        "mcp client %r logging_callback raised; dropping message",
+                        client._name, exc_info=True,
+                    )
+            logging_cb: Any = _safe_logging_cb
+        else:
+            logging_cb = None
+        # If a level was set, send `logging/setLevel` right after initialize so
+        # the server can pre-filter (avoids cluttering callback chain with
+        # debug spam when operator only wants WARNING+).
+        logging_level = client._logging_level
+
+        async def _post_init(session: Any) -> None:
+            if logging_level is None:
+                return
+            setlevel = getattr(session, "set_logging_level", None)
+            if setlevel is None:
+                # SDK 不支持（旧版本）—— server-side filter 保持默认级别。
+                _logger.info(
+                    "mcp client %r SDK lacks set_logging_level; "
+                    "server will use its default verbosity",
+                    client._name,
+                )
+                return
+            try:
+                await setlevel(logging_level)
+            except AttributeError:
+                # 防御：getattr 已挡，万一 setlevel 内部 AttributeError
+                _logger.info(
+                    "mcp client %r set_logging_level not callable",
+                    client._name,
+                )
+            except Exception as exc:
+                # Server protocol error (拒绝级别 / RPC 失败) - separate from
+                # SDK absence so ops alerting can distinguish.
+                _logger.warning(
+                    "mcp client %r server rejected set_logging_level(%s): %r",
+                    client._name, logging_level, exc, exc_info=True,
+                )
 
         if config.transport == MCPTransport.STDIO:
             stdio_mod = importlib.import_module(stdio_module_name)
@@ -345,9 +450,12 @@ def _make_real_session_factory(
             )
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(
-                    read, write, list_roots_callback=list_roots_cb,
+                    read, write,
+                    list_roots_callback=list_roots_cb,
+                    logging_callback=logging_cb,
                 ) as session:
                     await session.initialize()
+                    await _post_init(session)
                     yield session
             return
 
@@ -370,9 +478,12 @@ def _make_real_session_factory(
                     url=config.url, http_client=http_client
                 ) as (read, write):
                     async with ClientSession(
-                        read, write, list_roots_callback=list_roots_cb,
+                        read, write,
+                        list_roots_callback=list_roots_cb,
+                        logging_callback=logging_cb,
                     ) as session:
                         await session.initialize()
+                        await _post_init(session)
                         yield session
             return
 

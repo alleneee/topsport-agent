@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .client import MCPClient
 from .config import load_mcp_config
+from .logging_handler import LoggingCallback, MCPLogLevel
 from .roots import RootsProvider
 from .tool_bridge import MCPToolSource
 
@@ -54,3 +55,15 @@ class MCPManager:
         """
         for client in self._clients.values():
             client.set_roots_provider(provider)
+
+    def set_logging_callback(
+        self,
+        callback: LoggingCallback | None,
+        *,
+        level: MCPLogLevel | None = None,
+    ) -> None:
+        """Apply the same `LoggingCallback` (and optional initial level) to
+        every registered client. Subsequent `register()` calls do NOT inherit;
+        operators must call again or explicitly pass to the new client."""
+        for client in self._clients.values():
+            client.set_logging_callback(callback, level=level)
