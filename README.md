@@ -20,7 +20,14 @@ server default factory honors every `ENABLE_*` gate, session creation
 always goes through async persona-resolution path, sub-agents inherit
 permission hooks + grants, Assignment CRUD endpoints bind personas to
 tenant/user/group, and built-in file/memory/plugin tools declare their
-required capabilities. 793 tests passing.
+required capabilities. **MCP spec coverage ~98%**: all server-→client
+notifications (`progress`, `logging`, `resources/updated`, all three
+`list_changed`) consumed, all client-→server reverse capabilities
+(`roots`, `sampling`, `elicitation`) implemented with security caps
+(rate-limit / token cap / cross-tenant defence). Long-lived listening
+session with auto-reconnect (capped exponential backoff, replay on
+reconnect). 1153 tests passing including 6 in-process e2e against a
+real `mcp.Server`.
 
 | Module | Location | State |
 | --- | --- | --- |
@@ -33,14 +40,14 @@ required capabilities. 793 tests passing.
 | memory | `src/topsport_agent/memory/` | file store, injector, save/recall/forget tools |
 | skills | `src/topsport_agent/skills/` | registry, loader, matcher, injector, load/unload/list tools |
 | browser | `src/topsport_agent/browser/` | Playwright-based browser control with snapshot/ref interaction model |
-| mcp | `src/topsport_agent/mcp/` | JSON config, lazy client, tool bridge, prompt/resource meta tools |
+| mcp | `src/topsport_agent/mcp/` | JSON config, lazy client, tool bridge, prompt/resource meta tools, TTL list cache, listener for resources/subscribe + listChanged, roots/logging/progress/sampling/elicitation handlers, built-in Brave Search |
 | tools | `src/topsport_agent/tools/` | executor (output cap + blob offload), safe_shell (execFile-only), blob store |
 | observability | `src/topsport_agent/observability/` | Tracer alias, NoOpTracer, LangfuseTracer |
 | plugins | `src/topsport_agent/plugins/` | Claude Code plugin ecosystem: discovery, skills, agents, hooks |
 | agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
-| server | `src/topsport_agent/server/` | HTTP + SSE chat & plan endpoints, RBAC middleware, admin permission API |
-| tests | `tests/` | 793 passing |
+| server | `src/topsport_agent/server/` | HTTP + SSE chat & plan endpoints, RBAC middleware, admin permission API, MCP elicitation broker + reply endpoint |
+| tests | `tests/` | 1153 passing (6 in-process MCP e2e + 234 spec-coverage unit) |
 
 ## Quickstart
 
@@ -853,6 +860,101 @@ Lifecycle:
 - **Testable in isolation**: `MCPClient(name, session_factory)` takes any async
   context manager that yields a session-shaped object, so tests run without the
   real `mcp` package installed.
+
+### MCP capability coverage (Anthropic spec 2025-11-25)
+
+| Capability | Direction | Topsport support | Env switch |
+|---|---|---|---|
+| `tools` | server → client | ✅ auto-bridged via `MCPToolSource` | always on |
+| `prompts` | server → client | ✅ via meta-tools `list_mcp_prompts` / `get_mcp_prompt` | always on |
+| `resources` (read) | server → client | ✅ via meta-tools `list_mcp_resources` / `read_mcp_resource` | always on |
+| `resources/subscribe` + `notifications/resources/updated` | server → client | ✅ via `MCPClient.subscribe_resource(uri, callback)` | always on |
+| `notifications/{tools,prompts,resources}/list_changed` | server → client | ✅ auto-invalidates list caches via `MCPClient.subscribe_list_changed(callback)` | always on |
+| TTL list cache | client | ✅ default 60s; configurable per server via `cache_ttl` JSON field | always on |
+| `roots` | client → server | ✅ via `MCPClient.set_roots_provider(static_roots(...))` | `MCP_ROOTS=/path1:/path2` |
+| `logging` | server → client | ✅ default routes server logs to `topsport_agent.mcp.server.<name>` Python logger | `MCP_LOG_LEVEL=info` |
+| `progress` | server → client | ✅ default callback logs progress with optional sampling | `ENABLE_MCP_PROGRESS=true` |
+| `sampling` | server → client | ✅ via `LLMProviderSamplingHandler` with token-bucket rate limit + max_tokens cap | `ENABLE_MCP_SAMPLING=true` |
+| `elicitation` | server → client | ✅ form/url modes routed through chat SSE → `POST /v1/elicitations/<id>` | `ENABLE_MCP_ELICITATION=true` |
+| `completions` | server → client | ❌ deferred (low value in agent context) | — |
+
+### Reverse capabilities — security model
+
+Server-initiated reverse RPCs (sampling / elicitation / roots) lend the
+client's resources to whoever the client has connected to. Defaults are
+all opt-in:
+
+- **`sampling`**: `LLMProviderSamplingHandler` enforces a hard
+  `max_tokens_cap` per call (default 4096) plus a per-client
+  `TokenBucketRateLimit` (default 60 calls/min). MCP server cannot
+  drain the LLM budget regardless of how aggressive its requests are.
+- **`elicitation`**: `HTTPElicitationBroker` enforces session-id
+  routing (`X-Session-Id` header on `POST /v1/elicitations/<id>`)
+  so an authenticated user can't answer prompts addressed to other
+  users in the same deployment. Timeout (default 60s) auto-cancels.
+- **`roots`**: client only ever advertises the explicit list it was
+  configured with — server can't enumerate beyond what the operator
+  declared.
+
+Long-lived server notifications (`updated` / `list_changed`) require
+the listening session to be running; the listener auto-reconnects on
+disconnect via `ExponentialBackoff` (default cap 60s, max_attempts=20
+fail-soft to avoid runaway reconnect loops).
+
+### Server config example with all capabilities
+
+```bash
+# Core
+MCP_CONFIG_PATH=./mcp.json
+ENABLE_BRAVE_SEARCH=true
+BRAVE_API_KEY=...
+
+# Roots (UNIX path-style separator)
+MCP_ROOTS=/srv/proj-a:/srv/proj-b
+
+# Server log routing
+MCP_LOG_LEVEL=info
+
+# Progress notifications (long-running tools)
+ENABLE_MCP_PROGRESS=true
+
+# Reverse LLM calls (sampling) — hard caps live in server
+ENABLE_MCP_SAMPLING=true
+MCP_SAMPLING_MAX_TOKENS=4096
+MCP_SAMPLING_RATE_LIMIT_PER_MIN=60
+
+# User-input prompts (elicitation) — front-end must handle
+# event: elicitation frames on the chat SSE stream
+ENABLE_MCP_ELICITATION=true
+MCP_ELICITATION_TIMEOUT_SECONDS=60
+```
+
+### Front-end integration: elicitation
+
+When `ENABLE_MCP_ELICITATION=true`, the chat SSE stream may emit
+`event: elicitation` frames in addition to standard chat chunks:
+
+```
+event: elicitation
+data: {"id": "abc-123", "message": "DB password?", "mode": "form",
+       "requested_schema": {"type": "object", "properties": {...}},
+       "url": null}
+```
+
+Front-end renders the prompt and POSTs the answer:
+
+```http
+POST /v1/elicitations/abc-123
+Authorization: Bearer <token>
+X-Session-Id: <chat-session-id>
+Content-Type: application/json
+
+{"action": "accept", "content": {"password": "..."}}
+```
+
+`action` is `accept` / `decline` / `cancel` per MCP spec. The chat
+stream keeps flowing while the prompt is pending; multiple prompts
+can stack (the front-end queues them).
 
 ## Structured Logging
 
