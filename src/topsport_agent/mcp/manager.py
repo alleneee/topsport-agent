@@ -86,3 +86,20 @@ class MCPManager:
         usually paired with a token cap on the underlying handler."""
         for client in self._clients.values():
             client.set_sampling_handler(handler)
+
+    async def close_all(self) -> None:
+        """Stop every registered client's listener (if any). Failures
+        are isolated; one client's stop hang/raise doesn't block others.
+        Idempotent."""
+        import asyncio
+        results = await asyncio.gather(
+            *(c.close() for c in self._clients.values()),
+            return_exceptions=True,
+        )
+        for client, res in zip(self._clients.values(), results):
+            if isinstance(res, Exception):
+                import logging
+                logging.getLogger(__name__).warning(
+                    "MCPManager.close_all: client %r close raised: %r",
+                    client.name, res,
+                )

@@ -88,6 +88,12 @@ class MCPClient:
         # client does NOT declare the `sampling` capability (legacy + safe
         # default — server can't co-opt operator's LLM credit).
         self._sampling_handler: SamplingHandler | None = None
+        # MCPListener for resources/subscribe + list_changed notifications
+        # (lazy-created by subscribe_resource). Requires _listener_config
+        # to be set by `from_config`; bypassing from_config (test mocks)
+        # leaves both as None and subscription is unavailable.
+        self._listener: Any = None
+        self._listener_config: MCPServerConfig | None = None
         # clock contract: 必须单调递增。生产默认 time.monotonic（避免 wall-clock
         # 跳变扰动 TTL 判定）；测试可注入可控函数。如果调用方误传非单调函数
         # （如 time.time）导致 age 计算出负值，_is_fresh 会按"已过期"处理（保守
@@ -127,6 +133,14 @@ class MCPClient:
             cache_ttl=config.cache_ttl,
         )
         client._session_factory = _make_real_session_factory(config, client)
+        # Stash a deep-frozen snapshot of the config (P2-3 review): if
+        # callers mutate `config.env` etc. after `from_config`, the
+        # listener should NOT silently pick up those changes on next
+        # reconnect — that's a debug nightmare. dataclasses.replace is
+        # a shallow copy, paired with the dataclass being declared
+        # frozen on the relevant fields keeps the snapshot stable.
+        import dataclasses as _dc
+        client._listener_config = _dc.replace(config)
         return client
 
     # -----------------------------------------------------------------
@@ -184,6 +198,54 @@ class MCPClient:
         self._logging_callback = callback
         if level is not None:
             self._logging_level = level
+
+    # -----------------------------------------------------------------
+    # Resource subscription (long-lived listening session)
+    # -----------------------------------------------------------------
+
+    async def subscribe_resource(
+        self,
+        uri: str,
+        callback: Callable[[str], Any],
+    ) -> Callable[[], Awaitable[None]]:
+        """Subscribe to `notifications/resources/updated` for `uri`.
+
+        Returns an async disposer; awaiting unsubscribes (decrements
+        refcount, releases server-side subscription when last subscriber
+        for the URI removes itself).
+
+        Lazy: first call constructs the long-lived `MCPListener` and
+        starts the listening session. Reconnect on session failure is
+        automatic via `ExponentialBackoff` strategy by default. The
+        returned disposer is idempotent — calling it twice is safe.
+
+        Server pushes only the URI on update; callbacks must call
+        `read_resource(uri)` themselves to fetch the new content (MCP
+        spec hint-then-pull design).
+        """
+        if self._listener_config is None:
+            raise RuntimeError(
+                "MCPClient.subscribe_resource requires construction via "
+                "MCPClient.from_config(...); test fixtures using __init__ "
+                "directly cannot use this capability"
+            )
+        if self._listener is None:
+            from .listener import MCPListener
+            self._listener = MCPListener(self)
+        return await self._listener.subscribe_resource(uri, callback)
+
+    async def close(self) -> None:
+        """Stop the listener (if running) and release any background
+        resources. Safe to call multiple times. Per-call short-lived
+        sessions don't need explicit close — they're context-managed."""
+        if self._listener is not None:
+            try:
+                await self._listener.stop()
+            except Exception:
+                _logger.warning(
+                    "mcp client %r listener stop failed", self._name,
+                    exc_info=True,
+                )
 
     # -----------------------------------------------------------------
     # Sampling capability (server -> client LLM-call advertisement)

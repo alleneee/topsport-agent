@@ -585,6 +585,14 @@ def create_app(
                     app.state.inflight,
                 )
             await store.close_all()
+            # Close MCP listening sessions (if any client subscribed).
+            if mcp_manager is not None:
+                try:
+                    await mcp_manager.close_all()
+                except Exception as exc:
+                    _logger.warning(
+                        "mcp manager close_all failed: %r", exc,
+                    )
             if pool is not None:
                 try:
                     await pool.close_all()
