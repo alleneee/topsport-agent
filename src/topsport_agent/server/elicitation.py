@@ -88,6 +88,14 @@ class HTTPElicitationBroker:
         # walking the full broker dict each cycle.
         self._by_session: dict[str, list[str]] = {}
         self._lock = asyncio.Lock()
+        # Per-session asyncio.Event: set whenever a new elicitation arrives
+        # for that session, so chat SSE streams can `asyncio.wait` on it
+        # alongside the agent event iterator and respond immediately —
+        # critical because LLM thinking time (no agent events emitted)
+        # would otherwise let elicitations sit in the queue past the
+        # broker's timeout. Lazily allocated; `signal_for` doubles as
+        # "subscribe" + getter.
+        self._session_signals: dict[str, asyncio.Event] = {}
 
     @property
     def default_timeout(self) -> float:
@@ -124,6 +132,12 @@ class HTTPElicitationBroker:
         async with self._lock:
             self._pending[request.id] = pending
             self._by_session.setdefault(sid, []).append(request.id)
+            # Wake up any chat SSE stream awaiting this session's signal
+            # so the new elicitation frame surfaces immediately rather
+            # than waiting on the next agent event.
+            sig = self._session_signals.get(sid)
+            if sig is not None:
+                sig.set()
 
         try:
             return await asyncio.wait_for(
@@ -148,6 +162,26 @@ class HTTPElicitationBroker:
                         pass
                     if not ids:
                         self._by_session.pop(sid, None)
+
+    def signal_for(self, session_id: str) -> asyncio.Event:
+        """Subscribe a session to a wakeup `asyncio.Event` set whenever
+        a new elicitation arrives for that session.
+
+        Chat SSE stream pattern:
+            sig = broker.signal_for(sid)
+            ...
+            done, _ = await asyncio.wait([agent_iter_task, sig.wait_task],
+                                          return_when=FIRST_COMPLETED)
+            if signal task done:
+                sig.clear()
+                yield from broker.pending_for_session(sid)
+            ...
+
+        The Event is lazily created and shared across subscribers (single
+        listener per session is the typical pattern; multiple listeners
+        share the same wakeup which is fine since `pending_for_session`
+        marks delivered to prevent duplicate sends)."""
+        return self._session_signals.setdefault(session_id, asyncio.Event())
 
     async def pending_for_session(
         self, session_id: str,

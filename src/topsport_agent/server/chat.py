@@ -11,10 +11,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from typing import Any
+
+# Sentinel value returned by `_next_event` when the agent iterator is
+# exhausted — lets us detect end-of-stream without StopAsyncIteration
+# propagating across the asyncio.wait boundary.
+_END = object()
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -304,13 +311,17 @@ async def _stream_chat(
         baseline_msg_count = len(entry.session.messages)
 
         # Server-initiated elicitation: drain pending requests for this
-        # session before/between events. Yielding `event: elicitation`
-        # frames in-band lets the existing chat SSE channel carry both
-        # assistant deltas and user-input requests; front-end identifies
-        # the prompt by event name and POSTs the answer to
-        # /v1/elicitations/<id>.
+        # session ASAP after they arrive. Two wake-up sources merged via
+        # asyncio.wait(FIRST_COMPLETED):
+        #   1. agent.run iterator's next event (chat content / tool / error)
+        #   2. broker's per-session signal (set whenever new elicitation
+        #      arrives — wakes us up even during long LLM thinking
+        #      where no agent events would surface).
+        # Without (2), elicitation frames would queue up and time out
+        # while the LLM is mid-call.
         broker = getattr(request.app.state, "elicitation_broker", None)
         sid = entry.session.id
+        elicit_signal = broker.signal_for(sid) if broker is not None else None
 
         async def _drain_elicitations() -> AsyncIterator[str]:
             if broker is None:
@@ -318,8 +329,6 @@ async def _stream_chat(
             try:
                 pending = await broker.pending_for_session(sid)
             except Exception as exc:
-                # Elicitation is best-effort; broker failure must not
-                # break the main chat stream.
                 _logger.warning(
                     "elicitation drain failed for session=%s: %r",
                     sid, exc, exc_info=True,
@@ -335,32 +344,92 @@ async def _stream_chat(
                 })
 
         try:
-            async for event in entry.agent.run(user_input, entry.session):
-                if await request.is_disconnected():
-                    entry.agent.cancel()
-                    break
-                # Drain elicitation queue between every agent event so
-                # server prompts surface promptly (rather than waiting
-                # for the next LLM_TEXT_DELTA).
-                async for frame in _drain_elicitations():
-                    yield frame
-                if event.type == EventType.LLM_TEXT_DELTA:
-                    delta = event.payload.get("delta", "")
-                    if delta:
-                        saw_delta = True
-                        yield sse_data(
-                            make_chat_chunk(chat_id, model, delta={"content": delta})
+            agent_iter = entry.agent.run(user_input, entry.session).__aiter__()
+
+            async def _next_event() -> Any:
+                """Wrapper makes the next-event read a real coroutine
+                (Pyright requires create_task input to be Coroutine, not
+                bare Awaitable). Returns the sentinel `_END` when iter
+                is exhausted so we can detect that without exception
+                propagation across the asyncio.wait boundary."""
+                try:
+                    return await agent_iter.__anext__()
+                except StopAsyncIteration:
+                    return _END
+
+            agent_task: asyncio.Task | None = asyncio.create_task(_next_event())
+            signal_task: asyncio.Task | None = (
+                asyncio.create_task(elicit_signal.wait())
+                if elicit_signal is not None else None
+            )
+
+            try:
+                while agent_task is not None:
+                    if await request.is_disconnected():
+                        entry.agent.cancel()
+                        break
+
+                    waiting: list[asyncio.Task] = [agent_task]
+                    if signal_task is not None:
+                        waiting.append(signal_task)
+
+                    done, _pending = await asyncio.wait(
+                        waiting, return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    # Process signal first so any new elicitation frame
+                    # is interleaved before the next agent event.
+                    if signal_task is not None and signal_task in done:
+                        # Clear before draining so a concurrent push
+                        # re-sets and triggers another wake-up.
+                        if elicit_signal is not None:
+                            elicit_signal.clear()
+                        async for frame in _drain_elicitations():
+                            yield frame
+                        signal_task = (
+                            asyncio.create_task(elicit_signal.wait())
+                            if elicit_signal is not None else None
                         )
-                elif event.type == EventType.ERROR:
-                    err = {
-                        "error": {
-                            "message": event.payload.get("message", ""),
-                            "type": event.payload.get("kind", "error"),
-                        }
-                    }
-                    yield sse_data(err)
-            # Final drain: if elicitation arrived after the last agent
-            # event but before stream close, still surface it.
+
+                    if agent_task in done:
+                        event = agent_task.result()
+                        if event is _END:
+                            agent_task = None
+                            continue
+                        # Schedule next event read before processing this
+                        # one so signal + next-event always race.
+                        agent_task = asyncio.create_task(_next_event())
+
+                        if event.type == EventType.LLM_TEXT_DELTA:
+                            delta = event.payload.get("delta", "")
+                            if delta:
+                                saw_delta = True
+                                yield sse_data(
+                                    make_chat_chunk(
+                                        chat_id, model, delta={"content": delta},
+                                    )
+                                )
+                        elif event.type == EventType.ERROR:
+                            err = {
+                                "error": {
+                                    "message": event.payload.get("message", ""),
+                                    "type": event.payload.get("kind", "error"),
+                                }
+                            }
+                            yield sse_data(err)
+            finally:
+                # Cancel any in-flight tasks before exiting (iterator's
+                # __aclose__ is implicit on context exit).
+                for t in (agent_task, signal_task):
+                    if t is not None and not t.done():
+                        t.cancel()
+                        with contextlib.suppress(
+                            asyncio.CancelledError, Exception,
+                        ):
+                            await t
+
+            # Final drain — covers elicitations that arrived after the
+            # last agent event finished but before stream close.
             async for frame in _drain_elicitations():
                 yield frame
         except asyncio.CancelledError:

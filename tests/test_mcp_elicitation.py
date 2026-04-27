@@ -319,6 +319,61 @@ async def test_broker_resolve_after_already_resolved_returns_false() -> None:
     assert ok2 is False
 
 
+async def test_broker_signal_for_session_lazily_creates_event() -> None:
+    """First signal_for() call creates the Event; later calls return same."""
+    broker = HTTPElicitationBroker()
+    sig1 = broker.signal_for("session-A")
+    sig2 = broker.signal_for("session-A")
+    assert sig1 is sig2  # cached
+    sig3 = broker.signal_for("session-B")
+    assert sig3 is not sig1
+
+
+async def test_broker_handle_sets_session_signal() -> None:
+    """handle() must set the per-session asyncio.Event so listeners
+    awaiting it wake up immediately when a new elicitation arrives."""
+    broker = HTTPElicitationBroker(default_timeout_seconds=5.0)
+    sig = broker.signal_for("session-A")
+    assert not sig.is_set()
+
+    req = ElicitationRequest(
+        id="r1", message="?", mode="form", session_id="session-A",
+    )
+    handle_task = asyncio.create_task(broker.handle(req))
+    # Wait for handle to register pending — small grace period
+    await asyncio.sleep(0.01)
+
+    assert sig.is_set(), "signal must be set after handle registers pending"
+
+    # Cleanup
+    await broker.resolve(
+        "r1", ElicitationResponse(action="cancel"),
+        expected_session_id="session-A",
+    )
+    await handle_task
+
+
+async def test_broker_signal_does_not_fire_for_other_sessions() -> None:
+    broker = HTTPElicitationBroker(default_timeout_seconds=5.0)
+    sig_a = broker.signal_for("session-A")
+    sig_b = broker.signal_for("session-B")
+
+    req = ElicitationRequest(
+        id="r1", message="?", mode="form", session_id="session-A",
+    )
+    handle_task = asyncio.create_task(broker.handle(req))
+    await asyncio.sleep(0.01)
+
+    assert sig_a.is_set()
+    assert not sig_b.is_set(), "session-B signal must NOT fire on session-A elicit"
+
+    await broker.resolve(
+        "r1", ElicitationResponse(action="cancel"),
+        expected_session_id="session-A",
+    )
+    await handle_task
+
+
 def test_broker_rejects_invalid_timeout() -> None:
     with pytest.raises(ValueError):
         HTTPElicitationBroker(default_timeout_seconds=0)
