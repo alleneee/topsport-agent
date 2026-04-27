@@ -12,7 +12,16 @@ class MCPManager:
     def __init__(self) -> None:
         self._clients: dict[str, MCPClient] = {}
 
-    def register(self, client: MCPClient) -> None:
+    def register(self, client: MCPClient, *, replace: bool = False) -> None:
+        """注册 MCPClient。同名已存在时默认 raise（避免静默覆盖丢能力 + 旧 client
+        资源泄漏）。`replace=True` 时显式允许替换，但 caller 自己负责关旧 client。
+        """
+        existing = self._clients.get(client.name)
+        if existing is not None and not replace:
+            raise ValueError(
+                f"MCP client name {client.name!r} already registered; "
+                f"pass replace=True if intentional"
+            )
         self._clients[client.name] = client
 
     @classmethod

@@ -120,16 +120,41 @@ def _wrap_with_extras(
 
 
 def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
-    """Load MCP server manager from config file if MCP_CONFIG_PATH is set.
+    """Load MCP server manager from config file + built-in providers.
 
-    Returns None when path unset. Fails fast on a bad path so operators see
-    the misconfiguration at startup rather than at first tool call.
+    Sources merged into a single MCPManager:
+      1. JSON config file at MCP_CONFIG_PATH (claude-desktop format)
+      2. Built-in Brave Search server when ENABLE_BRAVE_SEARCH=true
+
+    Returns None when no source is configured. Fails fast on bad paths /
+    missing API keys so operators see misconfigurations at startup rather
+    than at first tool call.
     """
-    if not cfg.mcp_config_path:
+    if not cfg.mcp_config_path and not cfg.enable_brave_search:
         return None
+    from ..mcp.builtin import brave_search_config
+    from ..mcp.client import MCPClient
     from ..mcp.manager import MCPManager
 
-    return MCPManager.from_config_file(cfg.mcp_config_path)
+    if cfg.mcp_config_path:
+        manager = MCPManager.from_config_file(cfg.mcp_config_path)
+    else:
+        manager = MCPManager()
+
+    if cfg.enable_brave_search:
+        if not cfg.brave_api_key:
+            raise RuntimeError(
+                "ENABLE_BRAVE_SEARCH=true but BRAVE_API_KEY is empty"
+            )
+        brave_cfg = brave_search_config(cfg.brave_api_key)
+        if manager.get(brave_cfg.name) is not None:
+            raise RuntimeError(
+                f"MCP server name {brave_cfg.name!r} already registered "
+                f"via MCP_CONFIG_PATH; cannot also enable built-in Brave"
+            )
+        manager.register(MCPClient.from_config(brave_cfg))
+
+    return manager
 
 
 def _build_langfuse_tracer(cfg: ServerConfig) -> Any | None:

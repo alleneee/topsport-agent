@@ -17,7 +17,9 @@ class ServerConfig:
 
     host: str = "127.0.0.1"
     port: int = 8000
-    api_key: str = ""
+    # api_key 是 LLM provider 凭证；repr=False 防止启动 log / Langfuse trace
+    # / FastAPI debug traceback 把它打到日志或前端。
+    api_key: str = field(default="", repr=False)
     base_url: str | None = None
     default_model: str = ""
     session_ttl_seconds: int = 3600
@@ -25,7 +27,7 @@ class ServerConfig:
 
     # 鉴权
     auth_required: bool = True
-    auth_token: str = ""  # 单 token 简易模式，principal 恒为 "default"
+    auth_token: str = field(default="", repr=False)  # 单 token 简易模式，principal 恒为 "default"
     auth_tokens_file: str = ""  # 多租户：JSON {token: principal}
     # 对外服务的 Agent 能力闸门 —— 默认全关，避免 CR-01 默认暴露文件/插件能力。
     # enable_memory 从 default_agent 的硬编码 True 迁移过来：server 部署默认关，
@@ -47,6 +49,14 @@ class ServerConfig:
     # MCP（Model Context Protocol）tool sources。指向 claude-desktop 兼容的 JSON 配置；
     # 启动时加载，server 端对所有 session 生效。当前不支持 per-tenant 不同 MCP。
     mcp_config_path: str | None = None
+    # Built-in Brave Search MCP server（@brave/brave-search-mcp-server via npx）。
+    # enable_brave_search=True 且 brave_api_key 非空时，server 启动期自动注册到
+    # MCPManager；与 mcp_config_path 共存（同一 MCPManager 同时持有）。
+    # API key 不要硬编码到源码 / git；从 BRAVE_API_KEY env 读取。
+    enable_brave_search: bool = False
+    # repr=False：防止 logger.info("starting cfg=%s", cfg) / debug traceback
+    # / Langfuse 配置 dump 把 API key 暴露到日志或前端。
+    brave_api_key: str = field(default="", repr=False)
     # Per-session disk workspace base directory. Each session gets
     # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
     # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
@@ -125,6 +135,10 @@ class ServerConfig:
             image_gen_base_url=os.environ.get("IMAGE_GEN_BASE_URL") or None,
             enable_langfuse=_parse_bool(os.environ.get("ENABLE_LANGFUSE"), default=False),
             mcp_config_path=os.environ.get("MCP_CONFIG_PATH") or None,
+            enable_brave_search=_parse_bool(
+                os.environ.get("ENABLE_BRAVE_SEARCH"), default=False
+            ),
+            brave_api_key=os.environ.get("BRAVE_API_KEY", ""),
             workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
             workspace_delete_on_close=_parse_bool(
                 os.environ.get("WORKSPACE_DELETE_ON_CLOSE"), default=False

@@ -802,6 +802,37 @@ engine = Engine(
 )
 ```
 
+### Built-in: Brave Search
+
+The Brave Search MCP server (`@brave/brave-search-mcp-server` via `npx`) is
+wired in as a built-in. Enable it via two env vars on `topsport-agent-serve`:
+
+```bash
+export ENABLE_BRAVE_SEARCH=true
+export BRAVE_API_KEY=<your-key>  # https://api.search.brave.com/app/dashboard
+```
+
+Tools appear in the agent's pool as `brave-search.brave_web_search`,
+`brave-search.brave_image_search`, etc. (each MCP tool gets the
+`<server-name>.<tool-name>` prefix from `MCPToolSource`). Combines cleanly
+with `MCP_CONFIG_PATH` — built-in Brave is appended to whatever the JSON
+config registers, with a duplicate-name fail-fast check at startup.
+
+Library-style usage (CLI / SDK):
+
+```python
+from topsport_agent.mcp import (
+    MCPClient, MCPManager, MCPToolSource, brave_search_config,
+)
+
+mcp = MCPManager()
+mcp.register(MCPClient.from_config(brave_search_config(api_key="...")))
+# Then plug mcp.tool_sources() into Engine(tool_sources=...) as above.
+```
+
+Requires `npx` (Node ≥18) in `PATH`. The factory emits a startup warning if
+`npx` is missing so operators see misconfiguration before the first tool call.
+
 What the bridge exposes:
 
 - **MCP tools** → auto-merged into the per-step tool snapshot as

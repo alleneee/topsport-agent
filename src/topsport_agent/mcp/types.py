@@ -11,14 +11,20 @@ class MCPTransport(StrEnum):
 
 @dataclass(slots=True)
 class MCPServerConfig:
-    """直接复用 Claude Desktop 的 JSON 配置结构，省去格式转换和迁移成本。"""
+    """直接复用 Claude Desktop 的 JSON 配置结构，省去格式转换和迁移成本。
+
+    敏感字段 (`env`, `headers`) 用 `repr=False`：env 常含 BRAVE_API_KEY 等
+    第三方凭证、headers 常含 `Authorization: Bearer <token>`，dataclass 默认
+    repr 会让 `logger.debug("registering %r", cfg)` / FastAPI debug traceback
+    把这些直接 dump 到日志或前端。
+    """
     name: str
     transport: MCPTransport
     command: str | None = None
     args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict, repr=False)
     url: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
     timeout: float = 30.0
     # Capability requirements contributed to every bridged ToolSpec from this
     # server. Empty means the MCP server's tools are visible to any session.
