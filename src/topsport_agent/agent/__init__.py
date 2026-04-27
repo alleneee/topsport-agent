@@ -9,6 +9,7 @@
 
 from .base import Agent, AgentConfig, extract_assistant_text
 from .browser import BROWSER_SYSTEM_PROMPT, BrowserUnavailableError, browser_agent
+from .config_parts import AgentIdentity, CapabilityRegistry, CapabilityToggles
 from .default import DEFAULT_SYSTEM_PROMPT, default_agent
 
 __all__ = [
@@ -16,7 +17,10 @@ __all__ = [
     "DEFAULT_SYSTEM_PROMPT",
     "Agent",
     "AgentConfig",
+    "AgentIdentity",
     "BrowserUnavailableError",
+    "CapabilityRegistry",
+    "CapabilityToggles",
     "browser_agent",
     "default_agent",
     "extract_assistant_text",

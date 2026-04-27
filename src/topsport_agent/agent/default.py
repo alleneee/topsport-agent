@@ -11,6 +11,7 @@ from ..engine.sanitizer import DefaultSanitizer, ToolResultSanitizer
 from ..llm.provider import LLMProvider
 from ..types.tool import ToolSpec
 from .base import Agent, AgentConfig
+from .config_parts import AgentIdentity, CapabilityRegistry, CapabilityToggles
 
 # sentinel：区分"未传 sanitizer"和"显式传 None 关闭"。
 _DEFAULT = object()
@@ -66,26 +67,39 @@ def default_agent(
         effective_sanitizer = DefaultSanitizer()
     else:
         effective_sanitizer = sanitizer
-    config_kwargs: dict[str, Any] = dict(
+
+    # Reference impl of the structured AgentConfig.from_parts API: instead of
+    # passing 12+ flat keywords, assemble three concern-aligned dataclasses.
+    # Identical behavior — `from_parts` populates the same flat fields under
+    # the hood — but readers can scan identity / toggles / registry separately.
+    identity_kwargs: dict[str, Any] = dict(
         name=name,
         description=description,
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
         model=model,
-        enable_skills=enable_skills,
-        enable_memory=enable_memory,
-        enable_plugins=enable_plugins,
-        enable_browser=enable_browser,
-        enable_file_ops=enable_file_ops,
-        stream=stream,
-        memory_base_path=memory_base_path,
-        local_skill_dirs=local_skill_dirs or [Path.home() / ".claude" / "skills"],
-        extra_tools=list(extra_tools or []),
-        extra_tool_sources=list(extra_tool_sources or []),
-        sanitizer=effective_sanitizer,
     )
     if max_steps is not None:
-        config_kwargs["max_steps"] = max_steps
-    if extra_event_subscribers:
-        config_kwargs["extra_event_subscribers"] = list(extra_event_subscribers)
-    config = AgentConfig(**config_kwargs)
+        identity_kwargs["max_steps"] = max_steps
+
+    config = AgentConfig.from_parts(
+        identity=AgentIdentity(**identity_kwargs),
+        toggles=CapabilityToggles(
+            enable_skills=enable_skills,
+            enable_memory=enable_memory,
+            enable_plugins=enable_plugins,
+            enable_browser=enable_browser,
+            enable_file_ops=enable_file_ops,
+            stream=stream,
+            memory_base_path=memory_base_path,
+            local_skill_dirs=(
+                local_skill_dirs or [Path.home() / ".claude" / "skills"]
+            ),
+        ),
+        registry=CapabilityRegistry(
+            extra_tools=list(extra_tools or []),
+            extra_tool_sources=list(extra_tool_sources or []),
+            extra_event_subscribers=list(extra_event_subscribers or []),
+            sanitizer=effective_sanitizer,
+        ),
+    )
     return Agent.from_config(provider, config)

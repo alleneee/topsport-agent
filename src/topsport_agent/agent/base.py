@@ -35,6 +35,16 @@ from ..types.plan import Plan
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
 from .capabilities import CapabilityBundle, CapabilityModule
+from .config_parts import (
+    DEFAULT_MAX_STEPS,
+    AgentIdentity,
+    CapabilityRegistry,
+    CapabilityToggles,
+    identity_field_names,
+    isolate_value,
+    registry_field_names,
+    toggle_field_names,
+)
 
 if TYPE_CHECKING:
     from ..engine.permission.audit import AuditLogger
@@ -53,18 +63,25 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class AgentConfig:
-    """Agent 的身份与能力声明。
+    """Agent 的身份 + 能力声明 + 注册表（合一入口）。
 
-    name/description 区分不同 Agent；能力开关决定初始化时挂载哪些子系统。
+    Phase 4 后这个类被划分成三个概念组（identity / toggles / registry），
+    通过 `config.identity` / `.toggles` / `.registry` 属性产出对应的子
+    dataclass 视图（`AgentIdentity` / `CapabilityToggles` /
+    `CapabilityRegistry`），方便 mock、testing、operator 阅读。
+    构造路径仍兼容原 flat keyword 形式；新代码可通过
+    `AgentConfig.from_parts(identity=..., toggles=..., registry=...)`
+    走结构化路径。flat 字段是当前 PR 的存储真理来源；后续 PR 再考虑反转。
     """
 
+    # ── Identity (see AgentIdentity) ──────────────────────────────────
     name: str = ""
     description: str = ""
     system_prompt: str = ""
     model: str = ""
-    max_steps: int = 20
+    max_steps: int = DEFAULT_MAX_STEPS
 
-    # 能力开关
+    # ── Toggles (see CapabilityToggles) ───────────────────────────────
     enable_skills: bool = True
     enable_memory: bool = True
     enable_plugins: bool = True
@@ -75,12 +92,11 @@ class AgentConfig:
     enable_file_ops: bool = False
     # 启用流式输出（需要 provider 实现 StreamingLLMProvider）
     stream: bool = False
-
     # 目录配置（只在启用对应能力时生效）
     memory_base_path: Path | None = None
     local_skill_dirs: list[Path] = field(default_factory=list)
 
-    # 自定义扩展
+    # ── Registry: extras (see CapabilityRegistry) ─────────────────────
     extra_tools: list[ToolSpec] = field(default_factory=list)
     extra_context_providers: list[ContextProvider] = field(default_factory=list)
     extra_tool_sources: list[ToolSource] = field(default_factory=list)
@@ -96,30 +112,85 @@ class AgentConfig:
     # 来精确插队，不必 fork default_capability_modules() 也不必 monkey-patch。
     extra_capability_modules: list["CapabilityModule"] = field(default_factory=list)
 
-    # Prompt injection 防御：None 表示禁用（Engine 对 untrusted 工具结果不做消毒）。
-    # 非 None 时 Engine 对 untrusted 工具结果做消毒并注入 security guard。
-    sanitizer: ToolResultSanitizer | None = None
-
-    # 其它 engine 级选项
-    provider_options: dict[str, Any] | None = None
-
-    # Permission wiring (optional). When `persona` is set, Agent.new_session_async
-    # resolves it and copies permissions into the new Session.
+    # ── Registry: permission / audit ──────────────────────────────────
     persona: "Persona | str | None" = None
     persona_registry: "PersonaRegistry | None" = None
     tenant_id: str | None = None
-
-    # v2 capability-ACL hooks. Propagated to Engine as-is; Engine interprets None
-    # as "disabled" for each, preserving back-compat.
     permission_filter: "ToolVisibilityFilter | None" = None
     audit_logger: "AuditLogger | None" = None
     permission_checker: "PermissionChecker | None" = None
     permission_asker: "PermissionAsker | None" = None
 
+    # ── Registry: engine-level singletons ─────────────────────────────
+    # Prompt injection 防御：None 表示禁用（Engine 对 untrusted 工具结果不做消毒）。
+    # 非 None 时 Engine 对 untrusted 工具结果做消毒并注入 security guard。
+    sanitizer: ToolResultSanitizer | None = None
     # Multimodal: optional image generation client (e.g. OpenAI DALL-E).
     # When set, Agent.generate_image(...) delegates here. Threaded through
     # from_config → Agent() so operators only need to populate the config.
     image_generator: "OpenAIImageGenerationClient | None" = None
+    # 其它 engine 级选项
+    provider_options: dict[str, Any] | None = None
+
+    # -----------------------------------------------------------------
+    # Structured views — read-only snapshots assembled from flat fields.
+    # Three guarantees:
+    #   1. Each call returns a fresh sub-dataclass instance (no caching).
+    #   2. Sub-dataclasses are frozen — mutating scalars on the view
+    #      raises FrozenInstanceError instead of silently no-oping.
+    #   3. Mutable container fields (list / dict) are shallow-copied via
+    #      isolate_value, so list mutations on the view don't write through
+    #      to AgentConfig and vice versa. Operators get snapshot semantics
+    #      end-to-end; nested objects (ToolSpec, hook instances) remain
+    #      shared by reference, matching Python's general "don't deep-copy
+    #      unless asked" principle.
+    # -----------------------------------------------------------------
+
+    @property
+    def identity(self) -> AgentIdentity:
+        return AgentIdentity(
+            **{n: isolate_value(getattr(self, n)) for n in identity_field_names()}
+        )
+
+    @property
+    def toggles(self) -> CapabilityToggles:
+        return CapabilityToggles(
+            **{n: isolate_value(getattr(self, n)) for n in toggle_field_names()}
+        )
+
+    @property
+    def registry(self) -> CapabilityRegistry:
+        return CapabilityRegistry(
+            **{n: isolate_value(getattr(self, n)) for n in registry_field_names()}
+        )
+
+    @classmethod
+    def from_parts(
+        cls,
+        *,
+        identity: AgentIdentity | None = None,
+        toggles: CapabilityToggles | None = None,
+        registry: CapabilityRegistry | None = None,
+    ) -> "AgentConfig":
+        """Construct an AgentConfig from structured sub-dataclass parts.
+
+        Any part not provided uses its dataclass defaults. Mutable fields
+        (lists/dicts) are shallow-copied so subsequent mutation on the
+        provided parts doesn't leak into the constructed AgentConfig and
+        vice versa — same snapshot guarantee as the view properties.
+        """
+        ident = identity if identity is not None else AgentIdentity()
+        togs = toggles if toggles is not None else CapabilityToggles()
+        reg = registry if registry is not None else CapabilityRegistry()
+
+        kwargs: dict[str, Any] = {}
+        for n in identity_field_names():
+            kwargs[n] = isolate_value(getattr(ident, n))
+        for n in toggle_field_names():
+            kwargs[n] = isolate_value(getattr(togs, n))
+        for n in registry_field_names():
+            kwargs[n] = isolate_value(getattr(reg, n))
+        return cls(**kwargs)
 
 
 class Agent:
