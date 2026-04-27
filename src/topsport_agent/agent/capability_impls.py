@@ -2,7 +2,10 @@
 
 Each class here is a one-file migration of a branch that previously lived
 inline in `Agent.from_config`. Adding a new capability should follow the
-same template: implement the protocol, register in _default_capability_modules.
+same template: implement the protocol, declare `depends_on`, register in
+default_capability_modules. The factory uses `order_capability_modules`
+for topo-sort, so module order in the registry list is no longer
+load-bearing — only `depends_on` edges matter.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ def _async_wrap(func: Callable[..., Any]) -> Callable[[], Awaitable[None]]:
 
 class PluginsModule:
     name = "plugins"
+    depends_on: tuple[str, ...] = ()
 
     def is_enabled(self, ctx: InstallContext) -> bool:
         return ctx.config.enable_plugins
@@ -73,6 +77,9 @@ class PluginsModule:
 
 class SkillsModule:
     name = "skills"
+    # 读 ctx.shared["plugin_manager"] 以收集 plugin 提供的 skill_dirs，因此必须
+    # 在 PluginsModule 之后跑；显式声明依赖，topo-sort 自动安排顺序。
+    depends_on: tuple[str, ...] = ("plugins",)
 
     def is_enabled(self, ctx: InstallContext) -> bool:
         return ctx.config.enable_skills
@@ -109,6 +116,7 @@ class SkillsModule:
 
 class MemoryModule:
     name = "memory"
+    depends_on: tuple[str, ...] = ()
 
     def is_enabled(self, ctx: InstallContext) -> bool:
         return ctx.config.enable_memory
@@ -138,6 +146,7 @@ class MemoryModule:
 
 class FileOpsModule:
     name = "file_ops"
+    depends_on: tuple[str, ...] = ()
 
     def is_enabled(self, ctx: InstallContext) -> bool:
         return ctx.config.enable_file_ops
@@ -158,6 +167,7 @@ class FileOpsModule:
 
 class BrowserModule:
     name = "browser"
+    depends_on: tuple[str, ...] = ()
 
     def is_enabled(self, ctx: InstallContext) -> bool:
         return ctx.config.enable_browser
@@ -180,11 +190,14 @@ class BrowserModule:
 
 
 def default_capability_modules() -> list[Any]:
-    """Ordered list of modules executed by Agent.from_config.
+    """Default capability modules registered for `Agent.from_config`.
 
-    Order matters: Plugins publishes `plugin_manager` which Skills reads. Add
-    new modules in dependency order; the linearity is deliberate — we don't
-    want the implicit topo-sort complexity of a DAG here.
+    The list order is **not** load-bearing for execution: `from_config`
+    runs `order_capability_modules()` to topo-sort by `depends_on`,
+    breaking ties on the order below. To make a new module run before
+    another, declare `depends_on` explicitly rather than reordering this
+    list. Tie-break order kept stable for backward-compatible behavior
+    when no new edges are introduced.
     """
     return [
         PluginsModule(),

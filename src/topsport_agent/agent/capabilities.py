@@ -8,19 +8,21 @@ and remembering which list to append to.
 
 After: each capability is a `CapabilityModule` — one method `install(ctx)`
 that returns a `CapabilityBundle`. The factory just asks each registered
-module "are you enabled?" and merges their bundles in order. Adding a new
-capability = one new module class, zero factory changes.
+module "are you enabled?" and merges their bundles in dependency order.
+Adding a new capability = one new module class, zero factory changes.
 
-Dependency ordering: modules execute in their registered order. A module
-that publishes state (e.g. PluginsModule publishes `plugin_manager`) must
-be registered before any module that consumes it via `ctx.shared`. For now
-the ordering is a simple list in `_default_capability_modules()`; if the
-module count grows past a handful, swap to explicit `depends_on` + topo-sort.
+Dependency ordering: each module declares its prerequisites via
+`depends_on: tuple[str, ...]` (names of other modules that must publish
+state into `ctx.shared` before this one runs). `Agent.from_config` runs a
+`graphlib.TopologicalSorter` over the registered set, falling back to
+registration order for ties. Missing or cyclic dependencies fail fast
+with `CapabilityWiringError` rather than silently shipping a broken Agent.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import graphlib
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -132,11 +134,112 @@ class CapabilityModule(Protocol):
       - idempotent up to external resources (a second install() call on the
         same context may re-create disk layouts but shouldn't double-wire
         hooks on the same Agent)
+
+    Dependency declaration:
+      `depends_on` lists names of other modules that must run first because
+      this module reads `ctx.shared[<key>]` written by them. Implementations
+      must declare it (use empty `()` for no dependencies) — `name` and
+      `depends_on` are class-level attributes; Protocol attribute form here
+      stays compatible with the `name = "..."` / `depends_on = ()` style
+      used by every in-tree module under capability_impls.
     """
 
-    @property
-    def name(self) -> str: ...
+    name: str
+    depends_on: tuple[str, ...]
 
     def is_enabled(self, ctx: InstallContext) -> bool: ...
 
     def install(self, ctx: InstallContext) -> CapabilityBundle: ...
+
+
+class CapabilityWiringError(RuntimeError):
+    """Raised when registered CapabilityModules cannot be ordered.
+
+    Two failure modes:
+      - Unknown dependency: a module declares depends_on=("foo",) but no
+        registered module has name "foo".
+      - Cycle: depends_on edges form a directed cycle.
+
+    Both are configuration bugs; `from_config` fails fast so the operator
+    sees the misconfiguration at startup rather than at first tool call.
+    """
+
+
+def order_capability_modules(
+    modules: Sequence[CapabilityModule],
+) -> list[CapabilityModule]:
+    """Topologically sort modules by `depends_on`, breaking ties on the
+    original registration order.
+
+    Tie-break rule: when several modules are simultaneously ready (no
+    remaining unmet deps), they are emitted in the order they appear in
+    `modules`. This keeps the user-visible install order stable as long
+    as no new dependency edges are introduced.
+
+    Raises `CapabilityWiringError` on unknown dependency names or cycles.
+    Empty input returns []; a single module returns [module] regardless
+    of declared deps (only checked against the registered set).
+    """
+    if not modules:
+        return []
+
+    by_name: dict[str, CapabilityModule] = {}
+    registration_index: dict[str, int] = {}
+    for idx, mod in enumerate(modules):
+        name = mod.name
+        if name in by_name:
+            existing_idx = registration_index[name]
+            raise CapabilityWiringError(
+                f"duplicate CapabilityModule name {name!r}: "
+                f"already registered at position {existing_idx}, "
+                f"cannot register again at position {idx}. Common cause: "
+                f"`AgentConfig.extra_capability_modules` contains a module "
+                f"whose `name` collides with a default module."
+            )
+        by_name[name] = mod
+        registration_index[name] = idx
+
+    sorter: graphlib.TopologicalSorter[str] = graphlib.TopologicalSorter()
+    for mod in modules:
+        # depends_on is required by the Protocol; missing attribute treated as
+        # `()` so legacy / third-party duck-typed modules don't break, but
+        # explicit declaration is preferred (see Protocol docstring).
+        deps = tuple(getattr(mod, "depends_on", ()) or ())
+        if mod.name in deps:
+            raise CapabilityWiringError(
+                f"CapabilityModule {mod.name!r} declares a self-dependency "
+                f"(depends_on contains its own name)"
+            )
+        for dep in deps:
+            if dep not in by_name:
+                raise CapabilityWiringError(
+                    f"CapabilityModule {mod.name!r} depends on {dep!r}, "
+                    f"but no module with that name is registered"
+                )
+        sorter.add(mod.name, *deps)
+
+    try:
+        sorter.prepare()
+    except graphlib.CycleError as exc:
+        # graphlib.CycleError.args[1] holds the cycle path when present;
+        # keep a defensive fallback that surfaces the raw args so the
+        # operator still sees which modules are involved instead of an
+        # opaque "unknown" placeholder.
+        if len(exc.args) > 1 and isinstance(exc.args[1], (list, tuple)):
+            cycle_repr = " -> ".join(str(n) for n in exc.args[1])
+        else:
+            cycle_repr = repr(exc.args)
+        raise CapabilityWiringError(
+            f"CapabilityModule dependency cycle detected: {cycle_repr}"
+        ) from exc
+
+    ordered: list[CapabilityModule] = []
+    while sorter.is_active():
+        ready = list(sorter.get_ready())
+        # Stable tie-break: among simultaneously-ready modules, emit in
+        # the order the operator originally registered them.
+        ready.sort(key=lambda n: registration_index[n])
+        for name in ready:
+            ordered.append(by_name[name])
+            sorter.done(name)
+    return ordered

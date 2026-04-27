@@ -34,7 +34,7 @@ from ..types.message import ContentPart, Message, Role
 from ..types.plan import Plan
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
-from .capabilities import CapabilityBundle
+from .capabilities import CapabilityBundle, CapabilityModule
 
 if TYPE_CHECKING:
     from ..engine.permission.audit import AuditLogger
@@ -90,6 +90,11 @@ class AgentConfig:
     # 的 PreToolUse / PostToolUse hook（拒绝/改写/审计）。
     extra_pre_tool_hooks: list[PreToolUseHook] = field(default_factory=list)
     extra_post_tool_hooks: list[PostToolUseHook] = field(default_factory=list)
+    # 第三方 / 应用级 CapabilityModule。Agent.from_config 把它们追加到默认列表
+    # 之后，再走 order_capability_modules() 拓扑排序——`depends_on` 可以引用任何
+    # 默认 module 名（"plugins" / "skills" / "memory" / "file_ops" / "browser"）
+    # 来精确插队，不必 fork default_capability_modules() 也不必 monkey-patch。
+    extra_capability_modules: list["CapabilityModule"] = field(default_factory=list)
 
     # Prompt injection 防御：None 表示禁用（Engine 对 untrusted 工具结果不做消毒）。
     # 非 None 时 Engine 对 untrusted 工具结果做消毒并注入 security guard。
@@ -343,7 +348,7 @@ class Agent:
         Adding a new capability = one new module class in capability_impls.py,
         zero edits to this method.
         """
-        from .capabilities import InstallContext
+        from .capabilities import InstallContext, order_capability_modules
         from .capability_impls import default_capability_modules
 
         # Single aggregator. Pre-seeded with the operator's `extra_*` lists,
@@ -365,7 +370,16 @@ class Agent:
         parent_ref: list[Agent] = []
         ctx = InstallContext(config=config, provider=provider, parent_ref=parent_ref)
 
-        for module in default_capability_modules():
+        # Topo-sort by `depends_on` (ties broken on registration order).
+        # Lets modules consume `ctx.shared[<key>]` published by their
+        # declared dependencies without anyone hand-curating list order.
+        # `extra_capability_modules` from AgentConfig append after defaults;
+        # they can declare depends_on=("memory",) etc. to insert anywhere
+        # in the topo order without forking default_capability_modules().
+        ordered_modules = order_capability_modules(
+            [*default_capability_modules(), *config.extra_capability_modules]
+        )
+        for module in ordered_modules:
             if not module.is_enabled(ctx):
                 continue
             module_bundle = module.install(ctx)
@@ -440,7 +454,12 @@ class Agent:
         - tool_sources（MCP 桥接 / browser）
         - post_step_hooks（compaction 等）
         - event_subscribers（Langfuse / metrics / plugin hooks）
+        - pre_tool_hooks / post_tool_hooks（PreToolUse / PostToolUse 链）
         - permission_filter / audit_logger / permission_checker / permission_asker
+
+        AgentConfig.extra_capability_modules 注册的第三方模块通过这条路径间接
+        继承——它们的 install 输出在父 Agent 构造时已经合并进 self._bundle，
+        这里只是把 bundle 的内容传给子 Engine，子代理不会重跑 module install。
 
         parent_session：若提供，子 session 继承其 tenant_id / principal /
         granted_permissions / persona_id。未提供则回退到父 engine 的当前运行
