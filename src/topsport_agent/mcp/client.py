@@ -10,6 +10,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import Any, Literal
 
 from .logging_handler import LoggingCallback, MCPLogLevel
+from .progress import ProgressCallback, wrap_progress_callback
 from .roots import Root, RootsProvider, call_roots_provider
 from .types import MCPServerConfig, MCPTransport
 
@@ -17,6 +18,16 @@ _logger = logging.getLogger(__name__)
 
 SessionFactory = Callable[[], AbstractAsyncContextManager[Any]]
 ListKind = Literal["tools", "prompts", "resources"]
+
+
+class _Unset:
+    """Sentinel type for `call_tool(progress_callback=...)`: distinguishes
+    "param not passed → use client default" from "explicit None → disable
+    for this call". Singleton instance `_UNSET` is the only intended value.
+    """
+
+
+_UNSET = _Unset()
 # 回调可同步可异步：listening session 触发时是 async 上下文，应用层手动
 # notify 也兼容；inspect.iscoroutine 在 dispatch 时分流。
 ListChangedCallback = Callable[[ListKind], "Awaitable[None] | None"]
@@ -63,6 +74,10 @@ class MCPClient:
         # session.set_logging_level(...) right after initialize when set.
         self._logging_callback: LoggingCallback | None = None
         self._logging_level: MCPLogLevel | None = None
+        # progress_callback: per-call hook injected when the bridged
+        # MCPToolSource invokes call_tool. None disables the capability
+        # (no `_meta.progressToken` sent → server cannot emit progress).
+        self._progress_callback: ProgressCallback | None = None
         # clock contract: 必须单调递增。生产默认 time.monotonic（避免 wall-clock
         # 跳变扰动 TTL 判定）；测试可注入可控函数。如果调用方误传非单调函数
         # （如 time.time）导致 age 计算出负值，_is_fresh 会按"已过期"处理（保守
@@ -159,6 +174,23 @@ class MCPClient:
         self._logging_callback = callback
         if level is not None:
             self._logging_level = level
+
+    def set_progress_callback(self, callback: ProgressCallback | None) -> None:
+        """Register a progress callback used for every `call_tool` invocation.
+
+        Per MCP spec the callback is per-call (each request opts into
+        progress via its own `_meta.progressToken`). Setting it here is
+        a convenience: subsequent call_tool calls automatically pass the
+        callback, so MCPToolSource's auto-bridged tools get progress
+        reporting without each call site wiring it up.
+
+        None disables progress reporting (no progressToken sent → server
+        cannot emit notifications/progress)."""
+        self._progress_callback = callback
+
+    @property
+    def progress_callback(self) -> ProgressCallback | None:
+        return self._progress_callback
 
     def set_logging_level(self, level: MCPLogLevel | None) -> None:
         """Set the level threshold sent via `logging/setLevel` after
@@ -302,10 +334,36 @@ class MCPClient:
         # （用本地变量替代 assert，兼容 python -O）
         return list(cache[0]) if cache is not None else []
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        """写操作不走缓存，每次新建 session 保证 task 安全。"""
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_callback: ProgressCallback | None | _Unset = _UNSET,
+    ) -> Any:
+        """写操作不走缓存，每次新建 session 保证 task 安全。
+
+        `progress_callback` 三态语义（避免 Phase 4 抓过的"None 被 or 默认值覆盖"
+        模式 + Phase 5.1 的"None 显式有意义"约定）：
+          - 不传（默认 _UNSET）：使用 client._progress_callback（即
+            `set_progress_callback` 设的全局 default）。
+          - 显式 None：本次禁用 progress（即便 client default 已设）。
+          - 非 None ProgressCallback：本次专用，覆盖 client default。
+        最终生效的 callback 由 wrap_progress_callback 包一层做异常隔离。
+        """
+        if isinstance(progress_callback, _Unset):
+            effective_cb = self._progress_callback
+        else:
+            effective_cb = progress_callback  # 含显式 None
+        sdk_cb = (
+            wrap_progress_callback(effective_cb, client_name=self._name)
+            if effective_cb is not None else None
+        )
         async with self._session_factory() as session:
-            return await session.call_tool(name, arguments=arguments)
+            kwargs: dict[str, Any] = {"arguments": arguments}
+            if sdk_cb is not None:
+                kwargs["progress_callback"] = sdk_cb
+            return await session.call_tool(name, **kwargs)
 
     async def list_prompts(self, *, force_refresh: bool = False) -> list[Any]:
         """返回 prompt 列表（浅拷贝；同 list_tools 注释）。"""

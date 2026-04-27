@@ -70,6 +70,16 @@ class ServerConfig:
     # `logging/setLevel(level)`，并把 server 推来的 notifications/message 路由到
     # `topsport_agent.mcp.server.<client_name>` 日志器。
     mcp_log_level: str = ""
+    # 启用 MCP `progress` 通知消费：每次 call_tool 自动带上 progress_callback，
+    # server 推来的 notifications/progress 流入 `topsport_agent.mcp.progress.<client>`
+    # 日志器。默认关闭——长时工具的进度可观测性是 opt-in（额外日志量）。
+    #
+    # 与 mcp_log_level 的关系：两个 capability 正交。progress 走
+    # `topsport_agent.mcp.progress.<client>`，server 普通 log 走
+    # `topsport_agent.mcp.server.<client>`。某些 server 把进度写成
+    # logging notification 而非 progress notification，此时两者都开会让
+    # 同一进度信息出现在两个日志树（运营侧自行去重）。
+    enable_mcp_progress: bool = False
     # Per-session disk workspace base directory. Each session gets
     # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
     # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
@@ -154,6 +164,9 @@ class ServerConfig:
             brave_api_key=os.environ.get("BRAVE_API_KEY", ""),
             mcp_roots=_parse_path_list(os.environ.get("MCP_ROOTS")),
             mcp_log_level=os.environ.get("MCP_LOG_LEVEL", "").strip().lower(),
+            enable_mcp_progress=_parse_bool(
+                os.environ.get("ENABLE_MCP_PROGRESS"), default=False
+            ),
             workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
             workspace_delete_on_close=_parse_bool(
                 os.environ.get("WORKSPACE_DELETE_ON_CLOSE"), default=False

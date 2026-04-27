@@ -181,6 +181,11 @@ def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
                 default_logging_callback(client.name), level=level,
             )
 
+    if cfg.enable_mcp_progress:
+        from ..mcp.progress import default_progress_callback
+        for client in manager.clients():
+            client.set_progress_callback(default_progress_callback(client.name))
+
     return manager
 
 

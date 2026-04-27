@@ -5,6 +5,7 @@ from pathlib import Path
 from .client import MCPClient
 from .config import load_mcp_config
 from .logging_handler import LoggingCallback, MCPLogLevel
+from .progress import ProgressCallback
 from .roots import RootsProvider
 from .tool_bridge import MCPToolSource
 
@@ -67,3 +68,11 @@ class MCPManager:
         operators must call again or explicitly pass to the new client."""
         for client in self._clients.values():
             client.set_logging_callback(callback, level=level)
+
+    def set_progress_callback(self, callback: ProgressCallback | None) -> None:
+        """Apply the same `ProgressCallback` to every registered client.
+
+        Subsequent `register()` calls do NOT inherit. Setting None disables
+        progress reporting on all clients."""
+        for client in self._clients.values():
+            client.set_progress_callback(callback)

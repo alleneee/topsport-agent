@@ -57,6 +57,10 @@ class MCPToolSource:
             args: dict[str, Any], ctx: ToolContext
         ) -> dict[str, Any]:
             # 统一返回结构，屏蔽底层 MCP 返回对象差异。
+            # client.call_tool 内部从 client._progress_callback 取缺省回调，
+            # 此处不显式传 progress_callback —— 让 manager.set_progress_callback
+            # 设的全局 callback 生效。需要 per-call override 的高级用例可在
+            # 上游构造工具时改写此 closure。
             try:
                 result = await client.call_tool(raw_name, args)
             except Exception as exc:

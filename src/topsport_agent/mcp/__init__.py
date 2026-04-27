@@ -10,6 +10,11 @@ from .logging_handler import (
 from .manager import MCPManager
 from .meta_tools import build_mcp_meta_tools
 from .policy import AllowEntry, MCPPolicyViolation, MCPSecurityPolicy
+from .progress import (
+    ProgressCallback,
+    default_progress_callback,
+    wrap_progress_callback,
+)
 from .roots import Root, RootsProvider, path_to_root, static_roots
 from .tool_bridge import MCPToolSource
 from .types import MCPServerConfig, MCPTransport
@@ -27,14 +32,17 @@ __all__ = [
     "MCPServerConfig",
     "MCPToolSource",
     "MCPTransport",
+    "ProgressCallback",
     "Root",
     "RootsProvider",
     "SessionFactory",
     "brave_search_config",
     "build_mcp_meta_tools",
     "default_logging_callback",
+    "default_progress_callback",
     "load_mcp_config",
     "mcp_level_to_python",
     "path_to_root",
     "static_roots",
+    "wrap_progress_callback",
 ]
