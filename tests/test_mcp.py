@@ -749,7 +749,12 @@ def test_mcp_http_transport_disables_redirects(monkeypatch) -> None:
         headers={"Authorization": "Bearer secret"},
         timeout=10.0,
     )
-    factory = client_mod._make_real_session_factory(cfg)
+    # MCPClient instance needed for the factory's list_roots_callback dispatch;
+    # placeholder client suffices because no roots_provider is set on it.
+    placeholder_client = client_mod.MCPClient(
+        cfg.name, client_mod._make_real_session_factory_placeholder(cfg),
+    )
+    factory = client_mod._make_real_session_factory(cfg, placeholder_client)
 
     async def _run():
         async with factory():

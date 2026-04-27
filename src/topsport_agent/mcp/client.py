@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Literal
 
+from .roots import Root, RootsProvider, call_roots_provider
 from .types import MCPServerConfig, MCPTransport
 
 _logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class MCPClient:
         permissions: frozenset[str] = frozenset(),
         cache_ttl: float | None = 60.0,
         clock: Callable[[], float] = time.monotonic,
+        roots_provider: RootsProvider | None = None,
     ) -> None:
         self._name = name
         self._session_factory = session_factory
@@ -49,6 +51,11 @@ class MCPClient:
                 f"cache_ttl must be >= 0 or None, got {cache_ttl!r}"
             )
         self._cache_ttl = cache_ttl
+        # roots_provider: server-side fs root advertisement. None means client
+        # does NOT declare the `roots` capability (legacy behavior). Set to a
+        # provider via `set_roots_provider` or pass at construction time; the
+        # session_factory below converts it into the SDK's list_roots_callback.
+        self._roots_provider = roots_provider
         # clock contract: 必须单调递增。生产默认 time.monotonic（避免 wall-clock
         # 跳变扰动 TTL 判定）；测试可注入可控函数。如果调用方误传非单调函数
         # （如 time.time）导致 age 计算出负值，_is_fresh 会按"已过期"处理（保守
@@ -71,13 +78,73 @@ class MCPClient:
 
     @classmethod
     def from_config(cls, config: MCPServerConfig) -> MCPClient:
-        """生产入口；测试走 __init__ 直接注入 mock factory，不触碰真实 MCP 依赖。"""
-        return cls(
+        """生产入口；测试走 __init__ 直接注入 mock factory，不触碰真实 MCP 依赖。
+
+        Roots provider 是运行时绑定（不在 server config 文件里），通过
+        `set_roots_provider` 设置；这里构造的 client 默认无 roots 声明。
+        """
+        # NOTE on the placeholder dance: 真正的 session_factory 闭包需要 client
+        # 引用（用于 list_roots_callback dispatch 到当前的 _roots_provider），
+        # 而 client 又需要一个 session_factory 才能构造。两步必须**紧贴执行**：
+        # 不要在 cls(...) 与 swap 之间插入任何会 await 或可能调 list_tools/_call
+        # 等访问 _session_factory 的逻辑——placeholder 被调用即抛 RuntimeError。
+        client = cls(
             config.name,
-            _make_real_session_factory(config),
+            _make_real_session_factory_placeholder(config),
             permissions=config.permissions,
             cache_ttl=config.cache_ttl,
         )
+        client._session_factory = _make_real_session_factory(config, client)
+        return client
+
+    # -----------------------------------------------------------------
+    # Roots capability (client → server fs boundary advertisement)
+    # -----------------------------------------------------------------
+
+    def set_roots_provider(self, provider: RootsProvider | None) -> None:
+        """Replace the active roots provider. None disables the capability
+        (the next initialize handshake will not declare `roots`).
+
+        Limitation: this currently does NOT emit the spec's
+        `notifications/roots/list_changed`. Servers that issue a fresh
+        `roots/list` (per-session, after each connect) see the new
+        provider; servers that cached results from an earlier session
+        won't refresh until reconnect. Tied to the Phase 5.1 listening-
+        session follow-up — once a long-lived session exists, this
+        method should also push the change notification."""
+        self._roots_provider = provider
+
+    @property
+    def roots_provider(self) -> RootsProvider | None:
+        return self._roots_provider
+
+    async def _list_roots_callback(self, _context: Any) -> Any:
+        """Adapter from our RootsProvider → MCP SDK's ListRootsFnT.
+
+        Imports MCP SDK types lazily so test code that mocks session_factory
+        can avoid pulling the SDK. SDK errors and provider errors both turn
+        into ErrorData responses to the server (per spec; raising here would
+        deadlock the server's roots/list call)."""
+        provider = self._roots_provider
+        if provider is None:
+            mcp_types = importlib.import_module("mcp.types")
+            return mcp_types.ErrorData(
+                code=-32601,  # Method not found
+                message="client did not register a roots provider",
+            )
+        try:
+            roots: list[Root] = await call_roots_provider(provider)
+        except Exception as exc:
+            mcp_types = importlib.import_module("mcp.types")
+            _logger.warning(
+                "mcp client %r roots_provider raised %r", self._name, exc,
+                exc_info=True,
+            )
+            return mcp_types.ErrorData(
+                code=-32603,  # Internal error
+                message=f"roots provider failed: {type(exc).__name__}: {exc}",
+            )
+        return _to_list_roots_result(roots)
 
     # -----------------------------------------------------------------
     # listChanged 订阅
@@ -217,10 +284,36 @@ class MCPClient:
         self._cache_resources = None
 
 
-def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
+def _make_real_session_factory_placeholder(
+    config: MCPServerConfig,
+) -> SessionFactory:
+    """Boot-time placeholder; replaced inside `from_config` once the client
+    instance exists (so `list_roots_callback` can dispatch into the live
+    `_roots_provider`)."""
+    del config
+
+    @contextlib.asynccontextmanager
+    async def _placeholder() -> AsyncIterator[Any]:
+        raise RuntimeError(
+            "MCPClient session_factory accessed before from_config bound the "
+            "real factory; this is a programming error"
+        )
+        yield  # pragma: no cover  (unreachable, keeps generator type)
+
+    return _placeholder
+
+
+def _make_real_session_factory(
+    config: MCPServerConfig,
+    client: "MCPClient",
+) -> SessionFactory:
     """通过变量间接 importlib.import_module 绕过 Pyright 的 reportMissingImports。
 
     mcp / httpx 都是可选依赖，只在 from_config 路径上触发导入。
+    `client` reference is captured so the per-session list_roots_callback
+    dispatches through the client's *current* roots_provider — operators
+    can swap the provider after registration and the next session reflects
+    it (no need to rebuild the manager).
     """
     mcp_module_name = "mcp"
     stdio_module_name = "mcp.client.stdio"
@@ -231,6 +324,14 @@ def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
     async def factory() -> AsyncIterator[Any]:
         mcp_module = importlib.import_module(mcp_module_name)
         ClientSession = mcp_module.ClientSession
+
+        # Only attach the callback when a provider is set; otherwise leave
+        # ClientSession's default behavior (roots capability not declared).
+        list_roots_cb = (
+            client._list_roots_callback
+            if client._roots_provider is not None
+            else None
+        )
 
         if config.transport == MCPTransport.STDIO:
             stdio_mod = importlib.import_module(stdio_module_name)
@@ -243,7 +344,9 @@ def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
                 env=dict(config.env) if config.env else None,
             )
             async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(
+                    read, write, list_roots_callback=list_roots_cb,
+                ) as session:
                     await session.initialize()
                     yield session
             return
@@ -266,7 +369,9 @@ def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
                 async with streamable_http_client(
                     url=config.url, http_client=http_client
                 ) as (read, write):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(
+                        read, write, list_roots_callback=list_roots_cb,
+                    ) as session:
                         await session.initialize()
                         yield session
             return
@@ -274,3 +379,21 @@ def _make_real_session_factory(config: MCPServerConfig) -> SessionFactory:
         raise ValueError(f"unsupported MCP transport: {config.transport}")
 
     return factory
+
+
+def _to_list_roots_result(roots: list[Root]) -> Any:
+    """Convert our `Root` dataclass list into MCP SDK's `ListRootsResult`.
+
+    Lazy import keeps mcp SDK out of the import path of callers that don't
+    use real transports (e.g. tests with mock session factories).
+    """
+    mcp_types = importlib.import_module("mcp.types")
+    sdk_roots = []
+    for r in roots:
+        kwargs: dict[str, Any] = {"uri": r.uri}
+        if r.name is not None:
+            kwargs["name"] = r.name
+        if r.meta is not None:
+            kwargs["meta"] = r.meta
+        sdk_roots.append(mcp_types.Root(**kwargs))
+    return mcp_types.ListRootsResult(roots=sdk_roots)

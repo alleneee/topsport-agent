@@ -154,6 +154,11 @@ def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
             )
         manager.register(MCPClient.from_config(brave_cfg))
 
+    if cfg.mcp_roots:
+        from ..mcp.roots import path_to_root, static_roots
+        roots = [path_to_root(p) for p in cfg.mcp_roots]
+        manager.set_roots_provider(static_roots(roots))
+
     return manager
 
 

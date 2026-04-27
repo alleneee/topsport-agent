@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .client import MCPClient
 from .config import load_mcp_config
+from .roots import RootsProvider
 from .tool_bridge import MCPToolSource
 
 
@@ -40,3 +41,16 @@ class MCPManager:
     def tool_sources(self) -> list[MCPToolSource]:
         """每次调用都新建 MCPToolSource，引擎每步重新快照工具列表时自然拿到最新状态。"""
         return [MCPToolSource(client) for client in self._clients.values()]
+
+    def set_roots_provider(self, provider: RootsProvider | None) -> None:
+        """Apply the same `RootsProvider` to every registered client.
+
+        The provider is what MCP servers see when they call `roots/list`.
+        Setting None clears the provider on every client (next session
+        won't declare the `roots` capability). Subsequent `register()`
+        calls do NOT inherit this provider — operators must set the
+        provider after the manager is fully populated, or call
+        set_roots_provider again.
+        """
+        for client in self._clients.values():
+            client.set_roots_provider(provider)

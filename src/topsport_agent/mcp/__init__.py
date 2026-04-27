@@ -4,6 +4,7 @@ from .config import load_mcp_config
 from .manager import MCPManager
 from .meta_tools import build_mcp_meta_tools
 from .policy import AllowEntry, MCPPolicyViolation, MCPSecurityPolicy
+from .roots import Root, RootsProvider, path_to_root, static_roots
 from .tool_bridge import MCPToolSource
 from .types import MCPServerConfig, MCPTransport
 
@@ -18,8 +19,12 @@ __all__ = [
     "MCPServerConfig",
     "MCPToolSource",
     "MCPTransport",
+    "Root",
+    "RootsProvider",
     "SessionFactory",
     "brave_search_config",
     "build_mcp_meta_tools",
     "load_mcp_config",
+    "path_to_root",
+    "static_roots",
 ]

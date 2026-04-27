@@ -57,6 +57,13 @@ class ServerConfig:
     # repr=False：防止 logger.info("starting cfg=%s", cfg) / debug traceback
     # / Langfuse 配置 dump 把 API key 暴露到日志或前端。
     brave_api_key: str = field(default="", repr=False)
+    # 通过 MCP `roots` capability 暴露给所有 MCP server 的文件系统根（绝对路径）。
+    # 空表示不声明 roots 能力（向后兼容）。每个路径在启动期 resolve 到 file:// URI；
+    # 不存在的路径仍会注册（server 端自行处理），但相对路径会按当前 cwd 展开
+    # —— 推荐都用绝对路径写到 env / config，避免 deployment 漂移。
+    # 视为只读：frozen=True 只阻止 rebind，list 自身仍可 mutate；不要在运行期
+    # `cfg.mcp_roots.append(...)`，会让 _build_mcp_manager 二次调用看到污染快照。
+    mcp_roots: list[str] = field(default_factory=list)
     # Per-session disk workspace base directory. Each session gets
     # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
     # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
@@ -139,6 +146,7 @@ class ServerConfig:
                 os.environ.get("ENABLE_BRAVE_SEARCH"), default=False
             ),
             brave_api_key=os.environ.get("BRAVE_API_KEY", ""),
+            mcp_roots=_parse_path_list(os.environ.get("MCP_ROOTS")),
             workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
             workspace_delete_on_close=_parse_bool(
                 os.environ.get("WORKSPACE_DELETE_ON_CLOSE"), default=False
@@ -228,6 +236,18 @@ def _parse_optional_float(raw: str | None, *, default: float | None = None) -> f
     if s in {"none", "null", "off", "false", "disable", "disabled"}:
         return None
     return float(raw)
+
+
+def _parse_path_list(raw: str | None) -> list[str]:
+    """`MCP_ROOTS=/a:/b:/c` 风格分隔（os.pathsep — Unix `:` / Windows `;`）。
+    空字符串 / 未设置 → 空列表。
+
+    Windows 注意：路径含驱动盘符（`C:\\proj`）时不要用 `:` 分隔；用
+    Windows 默认的 `;`，或者把每个 root 单独配置。
+    """
+    if raw is None or not raw.strip():
+        return []
+    return [seg.strip() for seg in raw.split(os.pathsep) if seg.strip()]
 
 
 def _parse_route_limits(raw: str | None) -> dict[str, int]:
