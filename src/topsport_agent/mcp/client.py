@@ -12,6 +12,12 @@ from typing import Any, Literal
 from .logging_handler import LoggingCallback, MCPLogLevel
 from .progress import ProgressCallback, wrap_progress_callback
 from .roots import Root, RootsProvider, call_roots_provider
+from .sampling import (
+    SamplingHandler,
+    from_sdk_params,
+    to_sdk_error,
+    to_sdk_result,
+)
 from .types import MCPServerConfig, MCPTransport
 
 _logger = logging.getLogger(__name__)
@@ -78,6 +84,10 @@ class MCPClient:
         # MCPToolSource invokes call_tool. None disables the capability
         # (no `_meta.progressToken` sent → server cannot emit progress).
         self._progress_callback: ProgressCallback | None = None
+        # sampling_handler: server-driven LLM call resolver. None means
+        # client does NOT declare the `sampling` capability (legacy + safe
+        # default — server can't co-opt operator's LLM credit).
+        self._sampling_handler: SamplingHandler | None = None
         # clock contract: 必须单调递增。生产默认 time.monotonic（避免 wall-clock
         # 跳变扰动 TTL 判定）；测试可注入可控函数。如果调用方误传非单调函数
         # （如 time.time）导致 age 计算出负值，_is_fresh 会按"已过期"处理（保守
@@ -174,6 +184,78 @@ class MCPClient:
         self._logging_callback = callback
         if level is not None:
             self._logging_level = level
+
+    # -----------------------------------------------------------------
+    # Sampling capability (server -> client LLM-call advertisement)
+    # -----------------------------------------------------------------
+
+    def set_sampling_handler(self, handler: SamplingHandler | None) -> None:
+        """Register a handler for `sampling/createMessage` requests.
+
+        Setting this declares the `sampling` capability — server can
+        thereafter ask the client to make LLM calls on its behalf.
+        Setting None disables (default; the client does NOT advertise
+        the capability and server requests will return method-not-found).
+
+        Security note: enabling sampling lends operator's LLM credit to
+        whatever MCP server is connected. Always pair with a token cap
+        (`LLMProviderSamplingHandler.max_tokens_cap`) and an allowlist
+        of trusted servers / models.
+        """
+        self._sampling_handler = handler
+
+    @property
+    def sampling_handler(self) -> SamplingHandler | None:
+        return self._sampling_handler
+
+    async def _sampling_callback(self, _context: Any, params: Any) -> Any:
+        """Adapter from our SamplingHandler → MCP SDK's SamplingFnT.
+
+        Lazy import of `mcp.types` happens inside `from_sdk_params` /
+        `to_sdk_result` / `to_sdk_error` so test code with mocked SDK
+        doesn't need the real package. Errors from the handler turn into
+        `ErrorData` instead of raising — raising would deadlock the
+        server's createMessage call."""
+        handler = self._sampling_handler
+        if handler is None:
+            return to_sdk_error(
+                "client did not register a sampling handler",
+                code=-32601,  # Method not found
+            )
+        try:
+            request = from_sdk_params(params)
+        except Exception as exc:
+            _logger.warning(
+                "mcp client %r failed to parse sampling params: %r",
+                self._name, exc, exc_info=True,
+            )
+            return to_sdk_error(
+                f"invalid sampling params: {type(exc).__name__}: {exc}",
+                code=-32602,  # Invalid params
+            )
+        from .sampling import RateLimitExceeded
+        try:
+            result = await handler(request)
+        except RateLimitExceeded as exc:
+            # 单独 code 让 server 知道是速率限制可退避重试，而不是 handler 故障。
+            # JSON-RPC 规范保留 -32000..-32099 作为 server-defined errors；
+            # MCP 没标准化 rate-limit code，这里选 -32000 作为该范围首位。
+            _logger.warning(
+                "mcp client %r sampling rate limit exceeded: %s",
+                self._name, exc,
+            )
+            return to_sdk_error(
+                f"rate limit exceeded: {exc}", code=-32000,
+            )
+        except Exception as exc:
+            _logger.warning(
+                "mcp client %r sampling_handler raised %r",
+                self._name, exc, exc_info=True,
+            )
+            return to_sdk_error(
+                f"sampling handler failed: {type(exc).__name__}: {exc}",
+            )
+        return to_sdk_result(result)
 
     def set_progress_callback(self, callback: ProgressCallback | None) -> None:
         """Register a progress callback used for every `call_tool` invocation.
@@ -447,6 +529,13 @@ def _make_real_session_factory(
             if client._roots_provider is not None
             else None
         )
+        # Same conditional attach for sampling: if no handler set, don't
+        # declare the capability (server gets method-not-found if it tries).
+        sampling_cb = (
+            client._sampling_callback
+            if client._sampling_handler is not None
+            else None
+        )
         # Logging callback: wrap user callback in a try/except so a bad
         # callback can't bring down the SDK's notification dispatch loop
         # (mirrors notify_list_changed exception isolation).
@@ -511,6 +600,7 @@ def _make_real_session_factory(
                     read, write,
                     list_roots_callback=list_roots_cb,
                     logging_callback=logging_cb,
+                    sampling_callback=sampling_cb,
                 ) as session:
                     await session.initialize()
                     await _post_init(session)
@@ -539,6 +629,7 @@ def _make_real_session_factory(
                         read, write,
                         list_roots_callback=list_roots_cb,
                         logging_callback=logging_cb,
+                        sampling_callback=sampling_cb,
                     ) as session:
                         await session.initialize()
                         await _post_init(session)

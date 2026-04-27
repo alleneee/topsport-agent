@@ -395,6 +395,51 @@ def create_app(
                 )
             prov = _make_provider(provider_name, cfg.api_key, cfg.base_url)
 
+        # MCP sampling handler 必须延迟到 prov 准备好之后挂载（_build_mcp_manager
+        # 在 create_app 同步段执行时还没有 provider 实例）。fail-fast：
+        # ENABLE_MCP_SAMPLING=true 但 default_model 为空时无法选模型 → 启动失败。
+        # 无 mcp_manager 时打 warning（与 default_model 缺失的 fail-fast 不对称
+        # —— enable_mcp_sampling + 无 server 是配置错位但非阻塞）。
+        if cfg.enable_mcp_sampling:
+            if mcp_manager is None:
+                _logger.warning(
+                    "ENABLE_MCP_SAMPLING=true but no MCP servers configured "
+                    "(MCP_CONFIG_PATH unset and ENABLE_BRAVE_SEARCH=false); "
+                    "sampling handler not attached"
+                )
+            else:
+                from ..mcp.sampling import (
+                    LLMProviderSamplingHandler, TokenBucketRateLimit,
+                )
+                if not cfg.default_model:
+                    raise RuntimeError(
+                        "ENABLE_MCP_SAMPLING=true but MODEL is empty — "
+                        "sampling handler needs a default model to resolve "
+                        "server requests when no hint matches"
+                    )
+                # 每个 client 一个独立 handler 实例，audit 日志自动携带 client name。
+                # 速率限制按 client 隔离（每个 bucket 独立），避免单 server 刷穷
+                # 整个 sampling quota；默认 60/min 是保守 baseline，operator 可
+                # 通过 MCP_SAMPLING_RATE_LIMIT_PER_MIN 调整。
+                rate_per_min = cfg.mcp_sampling_rate_limit_per_min
+                for client in mcp_manager.clients():
+                    rate = (
+                        TokenBucketRateLimit(
+                            capacity=rate_per_min,
+                            refill_per_minute=rate_per_min,
+                        )
+                        if rate_per_min > 0 else None
+                    )
+                    client.set_sampling_handler(
+                        LLMProviderSamplingHandler(
+                            prov,
+                            default_model=cfg.default_model,
+                            max_tokens_cap=cfg.mcp_sampling_max_tokens,
+                            rate_limit=rate,
+                            client_name=client.name,
+                        )
+                    )
+
         # sandbox 生命周期挂到 SessionStore
         create_hooks: list = []
         close_hooks: list = []

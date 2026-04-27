@@ -7,6 +7,7 @@ from .config import load_mcp_config
 from .logging_handler import LoggingCallback, MCPLogLevel
 from .progress import ProgressCallback
 from .roots import RootsProvider
+from .sampling import SamplingHandler
 from .tool_bridge import MCPToolSource
 
 
@@ -76,3 +77,12 @@ class MCPManager:
         progress reporting on all clients."""
         for client in self._clients.values():
             client.set_progress_callback(callback)
+
+    def set_sampling_handler(self, handler: SamplingHandler | None) -> None:
+        """Apply the same `SamplingHandler` to every registered client.
+
+        Subsequent `register()` calls do NOT inherit. Security: every
+        connected MCP server can now ask the client to make LLM calls;
+        usually paired with a token cap on the underlying handler."""
+        for client in self._clients.values():
+            client.set_sampling_handler(handler)

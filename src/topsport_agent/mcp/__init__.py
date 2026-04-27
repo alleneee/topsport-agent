@@ -16,6 +16,16 @@ from .progress import (
     wrap_progress_callback,
 )
 from .roots import Root, RootsProvider, path_to_root, static_roots
+from .sampling import (
+    LLMProviderSamplingHandler,
+    RateLimitExceeded,
+    RateLimitStrategy,
+    SamplingHandler,
+    SamplingMessage,
+    SamplingRequest,
+    SamplingResult,
+    TokenBucketRateLimit,
+)
 from .tool_bridge import MCPToolSource
 from .types import MCPServerConfig, MCPTransport
 
@@ -23,6 +33,7 @@ __all__ = [
     "BRAVE_DEFAULT_NAME",
     "BRAVE_PACKAGE",
     "AllowEntry",
+    "LLMProviderSamplingHandler",
     "LoggingCallback",
     "MCPClient",
     "MCPLogLevel",
@@ -33,9 +44,16 @@ __all__ = [
     "MCPToolSource",
     "MCPTransport",
     "ProgressCallback",
+    "RateLimitExceeded",
+    "RateLimitStrategy",
     "Root",
     "RootsProvider",
+    "SamplingHandler",
+    "SamplingMessage",
+    "SamplingRequest",
+    "SamplingResult",
     "SessionFactory",
+    "TokenBucketRateLimit",
     "brave_search_config",
     "build_mcp_meta_tools",
     "default_logging_callback",

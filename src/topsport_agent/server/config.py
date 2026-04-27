@@ -80,6 +80,18 @@ class ServerConfig:
     # logging notification 而非 progress notification，此时两者都开会让
     # 同一进度信息出现在两个日志树（运营侧自行去重）。
     enable_mcp_progress: bool = False
+    # 启用 MCP `sampling` capability：让连接的 MCP server 通过 `sampling/createMessage`
+    # 反向调用 client 的 LLM。**默认关闭**——开启即把 operator 的 LLM 配额借给所有
+    # 连接的 server 用，必须配合 mcp_sampling_max_tokens 上限。
+    enable_mcp_sampling: bool = False
+    # 单次 server-driven sampling 调用的 max_output_tokens 硬上限。即使 server 请求
+    # 更高，client 也截到这个值。默认 4096 是常见 chat 场景的合理配额。
+    mcp_sampling_max_tokens: int = 4096
+    # 单 MCP client 每分钟最多多少次 sampling 调用（token bucket）。0 = 不限制
+    # （仅在 trusted 内网部署 / 单元测试场景使用）。默认 60 ≈ 每秒 1 次，给
+    # 中等 workload 留够 burst（cold start 一次性可消耗满 60 个 token）。
+    # 调高需配合 cost 监控：每个 sampling 调用按 max_tokens 上限计费。
+    mcp_sampling_rate_limit_per_min: int = 60
     # Per-session disk workspace base directory. Each session gets
     # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
     # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
@@ -166,6 +178,15 @@ class ServerConfig:
             mcp_log_level=os.environ.get("MCP_LOG_LEVEL", "").strip().lower(),
             enable_mcp_progress=_parse_bool(
                 os.environ.get("ENABLE_MCP_PROGRESS"), default=False
+            ),
+            enable_mcp_sampling=_parse_bool(
+                os.environ.get("ENABLE_MCP_SAMPLING"), default=False
+            ),
+            mcp_sampling_max_tokens=int(
+                os.environ.get("MCP_SAMPLING_MAX_TOKENS", "4096")
+            ),
+            mcp_sampling_rate_limit_per_min=int(
+                os.environ.get("MCP_SAMPLING_RATE_LIMIT_PER_MIN", "60")
             ),
             workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
             workspace_delete_on_close=_parse_bool(
