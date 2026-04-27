@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ..llm.provider import LLMProvider
 from ..types.tool import ToolSpec
-from .base import Agent, AgentConfig
+from .base import Agent, AgentConfig, AgentRuntime
 
 BROWSER_SYSTEM_PROMPT = (
     "You are topsport-browser-agent, specialized in web automation and information retrieval.\n\n"
@@ -56,6 +56,7 @@ def browser_agent(
     memory_base_path: Path | None = None,
     local_skill_dirs: list[Path] | None = None,
     extra_tools: list[ToolSpec] | None = None,
+    runtime: AgentRuntime | None = None,
 ) -> Agent:
     """浏览器专精 Agent。启动后若没有注册到 browser_* 工具则抛 BrowserUnavailableError。"""
     config = AgentConfig(
@@ -71,7 +72,7 @@ def browser_agent(
         local_skill_dirs=local_skill_dirs or [Path.home() / ".claude" / "skills"],
         extra_tools=list(extra_tools or []),
     )
-    agent = Agent.from_config(provider, config)
+    agent = Agent.from_config(provider, config, runtime=runtime)
 
     # 验证 browser 工具确实被注册 — 未装 playwright 时 Agent.from_config 会静默跳过，
     # 这里主动检测并抛错，让 browser agent 的契约清晰：没有 browser 就不该创建。

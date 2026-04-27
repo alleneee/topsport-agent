@@ -26,7 +26,7 @@ notifications (`progress`, `logging`, `resources/updated`, all three
 (`roots`, `sampling`, `elicitation`) implemented with security caps
 (rate-limit / token cap / cross-tenant defence). Long-lived listening
 session with auto-reconnect (capped exponential backoff, replay on
-reconnect). 1162 tests passing including 6 in-process e2e against a
+reconnect). 1163 tests passing including 6 in-process e2e against a
 real `mcp.Server`.
 
 | Module | Location | State |
@@ -47,7 +47,7 @@ real `mcp.Server`.
 | agent | `src/topsport_agent/agent/` | high-level Agent abstraction with default/browser presets |
 | cli | `src/topsport_agent/cli/` | interactive REPL, builtin tools (echo/calc/current_time) |
 | server | `src/topsport_agent/server/` | HTTP + SSE chat & plan endpoints, RBAC middleware, admin permission API, MCP elicitation broker + reply endpoint |
-| tests | `tests/` | 1162 passing (6 in-process MCP e2e + 234 spec-coverage unit) |
+| tests | `tests/` | 1163 passing (6 in-process MCP e2e + 234 spec-coverage unit) |
 
 ## Quickstart
 
@@ -94,7 +94,8 @@ await agent.close()
   explains `@ref` snapshot model and browser workflow
 
 Custom Agents are built via `Agent.from_config(provider, AgentConfig(...))`
-— declare the capability flags and extras you need.
+— declare capability flags and extras in `AgentConfig`, and pass live services
+such as image clients or plan checkpointers through `AgentRuntime`.
 
 ## Multimodal Input & Image Generation
 
@@ -153,7 +154,7 @@ the LLM reasoning loop.
 
 ```python
 import os
-from topsport_agent.agent.base import Agent, AgentConfig
+from topsport_agent.agent.base import Agent, AgentConfig, AgentRuntime
 from topsport_agent.llm.image_generation import OpenAIImageGenerationClient
 
 def _openai_factory():
@@ -170,7 +171,8 @@ image_gen = OpenAIImageGenerationClient(
 
 agent = Agent.from_config(
     provider=my_provider,
-    config=AgentConfig(image_generator=image_gen),
+    config=AgentConfig(),
+    runtime=AgentRuntime(image_generator=image_gen),
 )
 
 resp = await agent.generate_image("a cyberpunk cat", size="1024x1024")

@@ -126,14 +126,8 @@ class AgentConfig:
     # Prompt injection 防御：None 表示禁用（Engine 对 untrusted 工具结果不做消毒）。
     # 非 None 时 Engine 对 untrusted 工具结果做消毒并注入 security guard。
     sanitizer: ToolResultSanitizer | None = None
-    # Multimodal: optional image generation client (e.g. OpenAI DALL-E).
-    # When set, Agent.generate_image(...) delegates here. Threaded through
-    # from_config → Agent() so operators only need to populate the config.
-    image_generator: "OpenAIImageGenerationClient | None" = None
     # 其它 engine 级选项
     provider_options: dict[str, Any] | None = None
-    plan_checkpointer: Checkpointer | None = None
-
     # -----------------------------------------------------------------
     # Structured views — read-only snapshots assembled from flat fields.
     # Three guarantees:
@@ -195,6 +189,19 @@ class AgentConfig:
         return cls(**kwargs)
 
 
+@dataclass(slots=True)
+class AgentRuntime:
+    """Runtime services attached to an Agent instance.
+
+    `AgentConfig` describes what the agent is and which capabilities are
+    enabled. `AgentRuntime` carries live process dependencies that should not
+    be serialized as config or compared as identity.
+    """
+
+    image_generator: OpenAIImageGenerationClient | None = None
+    plan_checkpointer: Checkpointer | None = None
+
+
 class Agent:
     """高层代理对象。组装 Engine 及其所有扩展，提供统一的 run/close 接口。"""
 
@@ -206,7 +213,8 @@ class Agent:
         engine: Engine,
         cleanup_callbacks: list[Callable[[], Awaitable[None]]] | None = None,
         capability_bundle: CapabilityBundle | None = None,
-        image_generator: "OpenAIImageGenerationClient | None" = None,
+        runtime: AgentRuntime | None = None,
+        image_generator: OpenAIImageGenerationClient | None = None,
     ) -> None:
         self._provider = provider
         self._config = config
@@ -216,7 +224,11 @@ class Agent:
         # subscribers），spawn_child 直接读 bundle 字段把它们 by-reference 给子代理。
         # skill_registry / plugin_manager 通过 bundle.state["..."] 派生 property。
         self._bundle: CapabilityBundle = capability_bundle or CapabilityBundle()
-        self._image_generator = image_generator
+        self._runtime = runtime or AgentRuntime(image_generator=image_generator)
+
+    @property
+    def runtime(self) -> AgentRuntime:
+        return self._runtime
 
     @property
     def config(self) -> AgentConfig:
@@ -377,7 +389,7 @@ class Agent:
             parent_agent=self,
             parent_session=session,
             run_options=run_options,
-            checkpointer=self._config.plan_checkpointer,
+            checkpointer=self._runtime.plan_checkpointer,
         )
         async for event in orchestrator.execute():
             yield event
@@ -388,18 +400,19 @@ class Agent:
         *,
         model: str | None = None,
         **kwargs: Any,
-    ) -> "ImageGenerationResponse":
+    ) -> ImageGenerationResponse:
         """Generate an image via the configured image_generator.
 
         Raises RuntimeError if no image_generator was wired into this Agent.
         """
-        if self._image_generator is None:
+        image_generator = self._runtime.image_generator
+        if image_generator is None:
             raise RuntimeError(
-                "No image_generator configured; pass image_generator= "
-                "to Agent(), or construct OpenAIImageGenerationClient directly."
+                "No image_generator configured; pass AgentRuntime(image_generator=...) "
+                "to Agent.from_config(), or construct OpenAIImageGenerationClient directly."
             )
         from ..llm.image_generation import ImageGenerationRequest
-        resolved_model = model or self._image_generator.default_model
+        resolved_model = model or image_generator.default_model
         if resolved_model is None:
             raise ValueError(
                 "model required (or set default_model on image_generator)"
@@ -407,7 +420,7 @@ class Agent:
         request = ImageGenerationRequest(
             prompt=prompt, model=resolved_model, **kwargs
         )
-        return await self._image_generator.generate(request)
+        return await image_generator.generate(request)
 
     def cancel(self) -> None:
         self._engine.cancel()
@@ -425,7 +438,13 @@ class Agent:
     # -----------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, provider: LLMProvider, config: AgentConfig) -> Agent:
+    def from_config(
+        cls,
+        provider: LLMProvider,
+        config: AgentConfig,
+        *,
+        runtime: AgentRuntime | None = None,
+    ) -> Agent:
         """按 config 声明组装所有能力并构造 Agent.
 
         Capability assembly goes through the CapabilityModule protocol: each
@@ -513,7 +532,7 @@ class Agent:
             engine=engine,
             cleanup_callbacks=agg.cleanup_callbacks,
             capability_bundle=agg,
-            image_generator=config.image_generator,
+            runtime=runtime or AgentRuntime(),
         )
         # 回填占位符，spawn_child 现在拿得到完整能力
         parent_ref.append(agent)

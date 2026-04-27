@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-
 from typing import Any
 
 from ..engine.hooks import ToolSource
 from ..engine.sanitizer import DefaultSanitizer, ToolResultSanitizer
 from ..llm.provider import LLMProvider
 from ..types.tool import ToolSpec
-from .base import Agent, AgentConfig
+from .base import Agent, AgentConfig, AgentRuntime
 from .config_parts import AgentIdentity, CapabilityRegistry, CapabilityToggles
 
 # sentinel：区分"未传 sanitizer"和"显式传 None 关闭"。
@@ -52,6 +51,7 @@ def default_agent(
     extra_tool_sources: list[ToolSource] | None = None,
     extra_event_subscribers: list[Any] | None = None,
     sanitizer: Any = _DEFAULT,
+    runtime: AgentRuntime | None = None,
 ) -> Agent:
     """标准 Agent 配置：skills + memory + plugins + file_ops + 可选 browser。
 
@@ -102,4 +102,4 @@ def default_agent(
             sanitizer=effective_sanitizer,
         ),
     )
-    return Agent.from_config(provider, config)
+    return Agent.from_config(provider, config, runtime=runtime)

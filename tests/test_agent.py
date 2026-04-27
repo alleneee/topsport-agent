@@ -13,6 +13,7 @@ from topsport_agent.agent import (
     DEFAULT_SYSTEM_PROMPT,
     Agent,
     AgentConfig,
+    AgentRuntime,
     BrowserUnavailableError,
     browser_agent,
     default_agent,
@@ -97,6 +98,25 @@ def test_agent_from_config_minimal(tmp_path: Path) -> None:
     assert agent.config.name == "bare"
     assert agent.skill_registry is None
     assert agent.plugin_manager is None
+
+
+def test_agent_from_config_keeps_runtime_separate_from_config() -> None:
+    provider = MockProvider()
+    runtime = AgentRuntime()
+    config = AgentConfig(
+        name="bare",
+        description="",
+        system_prompt="test",
+        model="m",
+        enable_skills=False,
+        enable_memory=False,
+        enable_plugins=False,
+        enable_browser=False,
+    )
+    agent = Agent.from_config(provider, config, runtime=runtime)  # type: ignore[arg-type]
+    assert agent.config is config
+    assert agent.runtime is runtime
+    assert not hasattr(agent.config, "plan_checkpointer")
 
 
 def test_agent_from_config_with_skills(tmp_path: Path) -> None:

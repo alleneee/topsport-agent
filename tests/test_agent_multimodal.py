@@ -5,8 +5,13 @@ from typing import Any
 
 import pytest
 
-from topsport_agent.agent.base import Agent, AgentConfig
+from topsport_agent.agent.base import Agent, AgentConfig, AgentRuntime
 from topsport_agent.engine.loop import Engine, EngineConfig
+from topsport_agent.llm.image_generation import (
+    GeneratedImage,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
+)
 from topsport_agent.types.message import (
     ContentPart,
     Message,
@@ -81,14 +86,6 @@ async def test_run_accepts_prebuilt_message() -> None:
     assert session.messages[0] is msg
     assert session.messages[0].extra == {"uid": "u1"}
 
-
-from topsport_agent.llm.image_generation import (
-    GeneratedImage,
-    ImageGenerationRequest,
-    ImageGenerationResponse,
-)
-
-
 class _RecordingImageGen:
     """Test double for OpenAIImageGenerationClient."""
 
@@ -114,9 +111,9 @@ def _make_agent_with_gen(gen: _RecordingImageGen) -> Agent:
     )
     return Agent(
         provider=provider,
-        config=AgentConfig(image_generator=gen),  # type: ignore[arg-type]
+        config=AgentConfig(),
         engine=engine,
-        image_generator=gen,  # type: ignore[arg-type]
+        runtime=AgentRuntime(image_generator=gen),  # type: ignore[arg-type]
     )
 
 
@@ -157,11 +154,14 @@ async def test_generate_image_requires_model_when_no_default() -> None:
 
 
 @pytest.mark.asyncio
-async def test_from_config_forwards_image_generator() -> None:
+async def test_from_config_accepts_runtime_image_generator() -> None:
     gen = _RecordingImageGen(default_model="dall-e-3")
     provider = _StubProvider()
-    config = AgentConfig(image_generator=gen)  # type: ignore[arg-type]
-    agent = Agent.from_config(provider=provider, config=config)  # type: ignore[arg-type]
+    agent = Agent.from_config(
+        provider=provider,
+        config=AgentConfig(),
+        runtime=AgentRuntime(image_generator=gen),  # type: ignore[arg-type]
+    )  # type: ignore[arg-type]
     resp = await agent.generate_image("cat")
     assert resp.images[0].url == "https://example.com/out.png"
     assert gen.last_request is not None

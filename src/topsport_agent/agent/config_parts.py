@@ -1,27 +1,25 @@
 """Structured sub-dataclasses for AgentConfig.
 
-`AgentConfig` historically grew into 22+ flat fields covering four orthogonal
+`AgentConfig` historically grew into many flat fields covering orthogonal
 concerns: agent identity, capability toggles, registries (extras + permission
-+ multimodal), and engine-level options. Tests had to fill 8-keyword mocks;
-new readers had to scan the whole class body to know what was a "name field"
-vs an "audit hook".
++ engine settings). Tests had to fill 8-keyword mocks; new readers had to
+scan the whole class body to know what was a "name field" vs an "audit hook".
 
 Phase 4 introduces three small dataclasses representing the natural concerns:
 
   AgentIdentity      — name / description / system_prompt / model / max_steps
   CapabilityToggles  — enable_* flags + filesystem path config for those flags
   CapabilityRegistry — extras (tools, hooks, modules) + permission objects +
-                       sanitizer / image_generator / provider_options
+                       sanitizer / provider_options
 
 These types are public API. Operators can construct them independently and
 hand them to `AgentConfig.from_parts(identity=..., toggles=..., registry=...)`,
 which produces a flat `AgentConfig` with all underlying fields populated.
 
 Backward compatibility: `AgentConfig` keeps its original flat keyword
-constructor and all 22 fields. Existing call sites (`AgentConfig(name="x",
-model="y", ...)`) and field accesses (`config.name`, `config.enable_skills`)
-continue to work unchanged. The flat fields remain the storage source of
-truth in this PR; sub-dataclasses are exposed as derived views via
+constructor and existing field accesses (`config.name`, `config.enable_skills`)
+continue to work unchanged. The flat fields remain the storage source of truth;
+sub-dataclasses are exposed as derived views via
 `AgentConfig.identity` / `.toggles` / `.registry` properties.
 
 This split follows the same pattern as splitting a CLAUDE.md into "agent
@@ -37,7 +35,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ..engine.checkpoint import Checkpointer
     from ..engine.hooks import (
         ContextProvider,
         EventSubscriber,
@@ -50,7 +47,6 @@ if TYPE_CHECKING:
     from ..engine.permission.filter import ToolVisibilityFilter
     from ..engine.permission.persona_registry import PersonaRegistry
     from ..engine.sanitizer import ToolResultSanitizer
-    from ..llm.image_generation import OpenAIImageGenerationClient
     from ..types.permission import PermissionAsker, PermissionChecker, Persona
     from ..types.tool import ToolSpec
     from .capabilities import CapabilityModule
@@ -103,8 +99,7 @@ class CapabilityToggles:
 class CapabilityRegistry:
     """Everything that gets handed to / wired into the Agent at construction:
     additional tools/hooks, capability modules, permission objects, and the
-    optional engine-level singletons (sanitizer / image_generator /
-    provider_options).
+    optional engine-level singletons (sanitizer / provider_options).
 
     All fields default to empty / None so mocks can construct an empty
     registry and only fill what's relevant. Operators in production
@@ -134,9 +129,7 @@ class CapabilityRegistry:
 
     # Engine-level singletons not modeled as CapabilityModule (yet).
     sanitizer: "ToolResultSanitizer | None" = None
-    image_generator: "OpenAIImageGenerationClient | None" = None
     provider_options: dict[str, Any] | None = None
-    plan_checkpointer: Checkpointer | None = None
 
 
 # ---------------------------------------------------------------------------

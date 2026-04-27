@@ -130,7 +130,7 @@ def _wrap_with_plan_checkpointer(
 
     def factory(provider: LLMProvider, model: str) -> Agent:
         agent = inner(provider, model)
-        agent.config.plan_checkpointer = checkpointer
+        agent.runtime.plan_checkpointer = checkpointer
         return agent
 
     return factory
