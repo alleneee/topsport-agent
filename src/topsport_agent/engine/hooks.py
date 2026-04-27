@@ -1,18 +1,19 @@
 """Engine 级与 Plan 级 hook 定义。
 
-四个 Engine Protocol 分别对应 ReAct 循环中不同阶段的扩展点。
+Engine Protocol 对应 ReAct 循环中不同阶段的扩展点。
 Engine 通过 Protocol 与外部模块解耦：memory/skills/mcp/observability
 都不直接被 engine 导入，而是在运行时注入。
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, Union
 
 from ..types.events import Event
-from ..types.message import Message
+from ..types.message import Message, ToolCall, ToolResult
 from ..types.session import Session
-from ..types.tool import ToolSpec
+from ..types.tool import ToolContext, ToolSpec
 
 if TYPE_CHECKING:
     from ..types.plan import Plan, PlanStep, StepDecision
@@ -54,6 +55,81 @@ class EventSubscriber(Protocol):
     name: str
 
     async def on_event(self, event: Event) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Pre/Post tool-use hooks (对标 Claude Code 的 PreToolUse / PostToolUse)
+# 与现有 permission_checker / sanitizer 共存：permission 走专属决策路径
+# （DENY/ALLOW/ASK 多阶段），sanitizer 走 PostToolUseHook 链的第一位。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class HookAllow:
+    """PreToolUseHook 放行。`updated_args` 非 None 时替换 call.arguments，
+    多个 hook 链式时依次覆盖（最后一个胜出）。"""
+
+    updated_args: dict[str, Any] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HookDeny:
+    """PreToolUseHook 拒绝。Engine 短路：写一个 is_error=True 的 ToolResult，
+    跳过 handler 执行，仍走 audit + post hooks。"""
+
+    reason: str
+
+
+ToolDecision = Union[HookAllow, HookDeny]
+
+
+class PreToolUseHook(Protocol):
+    """Tool handler 调用前的扩展点。
+
+    触发位置：permission_checker / permission_asker 已通过、handler.invoke 之前。
+    多个 hook 按注册顺序执行；首个返回 HookDeny 立即短路，后续 hook 不再调用。
+    HookAllow.updated_args 非 None 时改写后续 hook 与 handler 看到的 args
+    （允许重写，例如路径净化）。
+
+    异常处理：抛异常视为 hook 失败，Engine 写一条 warning，**不**短路链路
+    （等同于 HookAllow 无 updated_args），让单个 hook 故障不阻塞工具执行。
+    安全敏感的 hook 应自行包装为 HookDeny 而非抛异常。
+    """
+
+    name: str
+
+    async def before_tool(
+        self,
+        call: ToolCall,
+        tool: ToolSpec,
+        ctx: ToolContext,
+    ) -> ToolDecision: ...
+
+
+class PostToolUseHook(Protocol):
+    """Tool handler 返回之后、写入 session.messages 之前的扩展点。
+
+    触发位置：handler.invoke 完成（含异常→is_error result）后立即触发；
+    Engine 内置的 sanitizer 作为链首已运行（如配置）。`tool` 可能为 None
+    （LLM 调用了未注册工具的 path），便于审计 hook 观测此类错误；安全/重写类
+    hook 收到 None 时通常应原样返回。
+    多个 hook 按注册顺序串成 result -> hook1 -> hook2 -> ... 链路；
+    每个 hook 接收前一段输出，可改写或原样返回。
+
+    异常处理：抛异常视为透传（log warning 后用前一段输出继续往后跑）。
+    """
+
+    name: str
+
+    async def after_tool(
+        self,
+        call: ToolCall,
+        tool: ToolSpec | None,
+        result: ToolResult,
+        ctx: ToolContext,
+        *,
+        trust_level: str,
+    ) -> ToolResult: ...
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -15,7 +16,16 @@ from ..types.events import Event, EventType
 from ..types.message import Message, Role, ToolCall, ToolResult
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
-from .hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
+from .hooks import (
+    ContextProvider,
+    EventSubscriber,
+    HookAllow,
+    HookDeny,
+    PostStepHook,
+    PostToolUseHook,
+    PreToolUseHook,
+    ToolSource,
+)
 from .prompt import PromptBuilder, SectionPriority
 from .sanitizer import SECURITY_GUARD_CONTENT, SECURITY_GUARD_TAG, ToolResultSanitizer
 
@@ -73,6 +83,8 @@ class Engine:
         tool_sources: list[ToolSource] | None = None,
         post_step_hooks: list[PostStepHook] | None = None,
         event_subscribers: list[EventSubscriber] | None = None,
+        pre_tool_hooks: list[PreToolUseHook] | None = None,
+        post_tool_hooks: list[PostToolUseHook] | None = None,
         sanitizer: ToolResultSanitizer | None = None,
         blob_store: BlobStore | None = None,
         default_max_result_chars: int | None = None,
@@ -88,6 +100,12 @@ class Engine:
         self._tool_sources = list(tool_sources or [])
         self._post_step_hooks = list(post_step_hooks or [])
         self._event_subscribers = list(event_subscribers or [])
+        # PreToolUseHook / PostToolUseHook 链：tool 调用前/后的扩展点，对标 Claude
+        # Code 的 PreToolUse / PostToolUse。permission_checker / sanitizer 仍走专属
+        # 路径（permission 多阶段 ASK 决策、sanitizer 围栏注入）；hooks 是“我也想插
+        # 一脚”的通用入口。空列表完全等价于关闭，零额外开销。
+        self._pre_tool_hooks = list(pre_tool_hooks or [])
+        self._post_tool_hooks = list(post_tool_hooks or [])
         # sanitizer 为 None 时 Engine 行为与加入该字段前完全一致（向后兼容）。
         # 非 None 时对 untrusted 工具结果做 prompt injection 防御，并在 system
         # prompt 里注入 security guard section 告知 LLM 围栏语义。
@@ -111,6 +129,12 @@ class Engine:
         # 默认参数回退使用。外部 patch 0-arg spy 也能正确读取当前 session。
         self._current_session: Session | None = None
         self._cancel_event = asyncio.Event()
+        # PreToolUseHook 链没有并发安全契约（hook 可能 prompt 用户、读写共享状态、
+        # 限流/审计依赖顺序）。当 LLM 一次发多个 concurrency_safe 工具调用、
+        # _invoke_tool 被并发调度时，用这把锁把 hook 链强制串行化，保留"按注册
+        # 顺序执行"的语义；handler 仍可并发。post hook 走在 _execute_tool_calls
+        # 的串行 for-loop 内，天然不受影响。
+        self._pre_tool_hook_lock = asyncio.Lock()
         # subscriber 失败计数（按 name 分组）。critical=True 的 subscriber 失败
         # 应该被外部健康检查消费，决定是否标记实例为 degraded。
         self.subscriber_failures: dict[str, int] = {}
@@ -533,9 +557,12 @@ class Engine:
         call: ToolCall,
         tool: ToolSpec | None,
         session: Session,
-    ) -> tuple[ToolResult, str]:
-        """执行单个 tool_call：validate_input → handler → 异常 → 返回 (result, trust_level)。
+    ) -> tuple[ToolResult, str, dict[str, Any]]:
+        """执行单个 tool_call：validate_input → hook → permission → handler。
 
+        返回 (result, trust_level, effective_args)：effective_args 是经过
+        PreToolUseHook / permission 改写后真正喂给 handler 的 args，下游
+        PostToolUseHook 用它构造 hook_call，避免观察到陈旧 args。
         独立成方法是为了让并发组（concurrency_safe）可预先 asyncio.create_task 本方法，
         外层 yield 事件时 await 已完成的 task，事件顺序保持和 calls 列表一致。
         """
@@ -546,8 +573,11 @@ class Engine:
                 is_error=True,
             )
             await self._audit_call(session, tool, call.arguments, result)
-            return result, "trusted"
+            return result, "trusted", call.arguments
         trust_level = getattr(tool, "trust_level", "trusted")
+        # effective_args 提前初始化以便所有早返回点都能携带它给调用方
+        # （PostToolUseHook 用它构造看见最终 args 的 hook_call）。
+        effective_args = call.arguments
         # Pre-flight 参数校验：返回错误字符串则跳过 handler，直接回 LLM 自我修正。
         # 对标 CC 的 validateInput() -> ValidationResult。
         validator = getattr(tool, "validate_input", None)
@@ -563,13 +593,13 @@ class Engine:
                     is_error=True,
                 )
                 await self._audit_call(session, tool, call.arguments, result)
-                return result, trust_level
+                return result, trust_level, effective_args
             if err is not None:
                 result = ToolResult(
                     call_id=call.id, output=err, is_error=True,
                 )
                 await self._audit_call(session, tool, call.arguments, result)
-                return result, trust_level
+                return result, trust_level, effective_args
 
         ctx = ToolContext(
             session_id=session.id,
@@ -583,12 +613,85 @@ class Engine:
             ),
         )
 
-        # Permission check：checker 返回 DENY/ASK→(asker→)→ 最终决策。
-        # checker 为 None 完全跳过（兼容现有行为）。
-        effective_args = call.arguments
-        if self._permission_checker is not None:
+        # 改写跟踪：仅当 PreToolUseHook 或 permission_checker 显式改写过 args
+        # 时才需要在 handler 调用前再跑一次 validate_input。
+        args_rewritten = False
+
+        # PreToolUseHook 链：放在 permission_checker **之前**，使 permission 始终
+        # 对最终 args 做把关（hook 改写后 permission 重新评估）。Hook 看到的是
+        # effective_args 的 deepcopy：嵌套对象的 in-place 突变也改不到上游，
+        # 想改写必须走 HookAllow(updated_args=...)，由 args_rewritten flag 保证
+        # 后续 revalidate。Hook 抛异常视为透传（log warning，不阻塞工具调用）。
+        # 整段在 _pre_tool_hook_lock 内执行：即便 _invoke_tool 被多个 concurrent
+        # tool calls 并发调度，hook 链跨调用之间也是串行的（防 hook 共享状态竞争）。
+        if self._pre_tool_hooks:
+            async with self._pre_tool_hook_lock:
+                for hook in self._pre_tool_hooks:
+                    pre_call = ToolCall(
+                        id=call.id,
+                        name=call.name,
+                        arguments=copy.deepcopy(effective_args),
+                    )
+                    try:
+                        decision_h = await hook.before_tool(pre_call, tool, ctx)
+                    except Cancelled:
+                        raise
+                    except Exception:
+                        _logger.warning(
+                            "pre_tool_hook %r raised; passing through for %s",
+                            getattr(hook, "name", type(hook).__name__),
+                            call.name,
+                            exc_info=True,
+                        )
+                        continue
+                    if isinstance(decision_h, HookDeny):
+                        result = ToolResult(
+                            call_id=call.id,
+                            output=decision_h.reason or f"tool '{call.name}' denied by hook",
+                            is_error=True,
+                        )
+                        await self._audit_call(session, tool, effective_args, result)
+                        return result, trust_level, effective_args
+                    if isinstance(decision_h, HookAllow) and decision_h.updated_args is not None:
+                        effective_args = decision_h.updated_args
+                        args_rewritten = True
+
+        # 改写后立即重跑 validate_input：避免 hook 写出非法 args 直接进入
+        # permission_checker 与 handler。permission_checker 用最终 args 决策。
+        if validator is not None and args_rewritten:
             try:
-                decision = await self._permission_checker.check(tool, call, ctx)
+                err = await validator(effective_args)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"validate_input (post-hook) raised {type(exc).__name__}: {exc}",
+                    is_error=True,
+                )
+                await self._audit_call(session, tool, effective_args, result)
+                return result, trust_level, effective_args
+            if err is not None:
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"validate_input (post-hook): {err}",
+                    is_error=True,
+                )
+                await self._audit_call(session, tool, effective_args, result)
+                return result, trust_level, effective_args
+            # validator 通过后清 flag；permission rewrite 自己再 set 一次
+            args_rewritten = False
+
+        # Permission check：checker 返回 DENY/ASK→(asker→)→ 最终决策。
+        # checker 为 None 完全跳过（兼容现有行为）。当 hook 已改写过 args，
+        # 用改写后的版本构造 check_call，让 permission 看到最终值。
+        if self._permission_checker is not None:
+            check_call = (
+                call if effective_args is call.arguments
+                else ToolCall(id=call.id, name=call.name, arguments=effective_args)
+            )
+            try:
+                decision = await self._permission_checker.check(tool, check_call, ctx)
             except Cancelled:
                 raise
             except Exception as exc:
@@ -604,8 +707,8 @@ class Engine:
                     output=f"permission_checker error: {type(exc).__name__}: {exc}",
                     is_error=True,
                 )
-                await self._audit_call(session, tool, call.arguments, result)
-                return result, trust_level
+                await self._audit_call(session, tool, effective_args, result)
+                return result, trust_level, effective_args
             # 用字符串字面量比较 behavior，避免在模块级导入 legacy PermissionBehavior
             # 触发自己的 DeprecationWarning。v1 runtime-decision 路径整体下个版本下线。
             if decision.behavior == "ask":
@@ -620,11 +723,11 @@ class Engine:
                         output=decision.reason or "permission ask without asker; denied",
                         is_error=True,
                     )
-                    await self._audit_call(session, tool, call.arguments, result)
-                    return result, trust_level
+                    await self._audit_call(session, tool, effective_args, result)
+                    return result, trust_level, effective_args
                 try:
                     decision = await self._permission_asker.ask(
-                        tool, call, ctx, decision.reason,
+                        tool, check_call, ctx, decision.reason,
                     )
                 except Cancelled:
                     raise
@@ -641,8 +744,8 @@ class Engine:
                         output=f"permission_asker error: {type(exc).__name__}: {exc}",
                         is_error=True,
                     )
-                    await self._audit_call(session, tool, call.arguments, result)
-                    return result, trust_level
+                    await self._audit_call(session, tool, effective_args, result)
+                    return result, trust_level, effective_args
                 # asker 再返回 ASK 是契约违反，保守按 DENY 处理
                 if decision.behavior == "ask":
                     import warnings as _w
@@ -663,11 +766,35 @@ class Engine:
                     output=decision.reason or f"tool '{call.name}' denied",
                     is_error=True,
                 )
-                await self._audit_call(session, tool, call.arguments, result)
-                return result, trust_level
+                await self._audit_call(session, tool, effective_args, result)
+                return result, trust_level, effective_args
             # ALLOW：允许 checker/asker 改写入参（如安全路径重写）
             if decision.updated_input is not None:
                 effective_args = decision.updated_input
+                args_rewritten = True
+
+        # permission 路径若再次改写 args，再跑一次 validator 兜底。
+        if validator is not None and args_rewritten:
+            try:
+                err = await validator(effective_args)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"validate_input (post-permission) raised {type(exc).__name__}: {exc}",
+                    is_error=True,
+                )
+                await self._audit_call(session, tool, effective_args, result)
+                return result, trust_level, effective_args
+            if err is not None:
+                result = ToolResult(
+                    call_id=call.id,
+                    output=f"validate_input (post-rewrite): {err}",
+                    is_error=True,
+                )
+                await self._audit_call(session, tool, effective_args, result)
+                return result, trust_level, effective_args
 
         try:
             output = await tool.handler(effective_args, ctx)
@@ -679,7 +806,7 @@ class Engine:
                 output = cap_result.output
             result = ToolResult(call_id=call.id, output=output)
             await self._audit_call(session, tool, effective_args, result)
-            return result, trust_level
+            return result, trust_level, effective_args
         except Cancelled:
             raise
         except Exception as exc:
@@ -689,7 +816,7 @@ class Engine:
                 is_error=True,
             )
             await self._audit_call(session, tool, effective_args, result)
-            return result, trust_level
+            return result, trust_level, effective_args
 
     async def _audit_call(
         self,
@@ -724,7 +851,7 @@ class Engine:
         # 并发分组策略：concurrency_safe 的 handler 预先 create_task 后台跑，事件仍按
         # calls 原顺序 yield（测试可预期）。unsafe 的走原地串行。连续多个 read_only
         # browser_get_text / search 这种一次能省大量 wall-clock。
-        scheduled: dict[int, asyncio.Task[tuple[ToolResult, str]]] = {}
+        scheduled: dict[int, asyncio.Task[tuple[ToolResult, str, dict[str, Any]]]] = {}
         for idx, call in enumerate(calls):
             tool = self._find_tool(call.name, pool)
             if tool is not None and getattr(tool, "concurrency_safe", False):
@@ -749,7 +876,7 @@ class Engine:
             if idx in scheduled:
                 # 并发已调度——要么已完成、要么很快完成；await 拿结果即可。
                 try:
-                    result, trust_level = await scheduled[idx]
+                    result, trust_level, eff_args = await scheduled[idx]
                 except Cancelled:
                     # 取消其他未完成的并发 task，避免资源泄漏
                     for other_idx, task in scheduled.items():
@@ -757,7 +884,7 @@ class Engine:
                             task.cancel()
                     raise
             else:
-                result, trust_level = await self._invoke_tool(call, tool, session)
+                result, trust_level, eff_args = await self._invoke_tool(call, tool, session)
 
             # Prompt injection 防御：untrusted 工具结果在落入 session.messages 前消毒。
             # sanitizer 为 None 时直通，保证向后兼容。
@@ -775,6 +902,42 @@ class Engine:
                         },
                         exc_info=True,
                     )
+
+            # PostToolUseHook 链：sanitizer 后、append 到 messages 前。
+            # 链式 result -> hook1 -> hook2 -> ...；hook 抛异常视为透传。
+            # hook 看到的 call.arguments 应是 handler 实际收到的 effective_args
+            # （PreToolUseHook 改写 / permission rewrite 之后的最终值），不是
+            # LLM 提交的原 args，否则审计/redaction 类 hook 会观察到陈旧输入。
+            if self._post_tool_hooks:
+                tool_for_hook = self._find_tool(call.name, pool)
+                hook_ctx = ToolContext(
+                    session_id=session.id,
+                    call_id=call.id,
+                    cancel_event=self._cancel_event,
+                    workspace_root=(
+                        session.workspace.files_dir
+                        if session.workspace is not None else None
+                    ),
+                )
+                hook_call = (
+                    call if eff_args is call.arguments
+                    else ToolCall(id=call.id, name=call.name, arguments=eff_args)
+                )
+                for hook in self._post_tool_hooks:
+                    try:
+                        result = await hook.after_tool(
+                            hook_call, tool_for_hook, result, hook_ctx,
+                            trust_level=trust_level,
+                        )
+                    except Cancelled:
+                        raise
+                    except Exception:
+                        _logger.warning(
+                            "post_tool_hook %r raised; passing previous result for %s",
+                            getattr(hook, "name", type(hook).__name__),
+                            call.name,
+                            exc_info=True,
+                        )
 
             # 工具结果也写回会话，供下一轮 LLM 继续读取和推理。
             session.messages.append(Message(role=Role.TOOL, tool_results=[result]))

@@ -16,7 +16,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..engine import Engine, EngineConfig
-from ..engine.hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
+from ..engine.hooks import (
+    ContextProvider,
+    EventSubscriber,
+    PostStepHook,
+    PostToolUseHook,
+    PreToolUseHook,
+    ToolSource,
+)
 from ..engine.sanitizer import ToolResultSanitizer
 from ..llm.provider import LLMProvider
 from ..plugins import PluginManager
@@ -79,6 +86,10 @@ class AgentConfig:
     extra_tool_sources: list[ToolSource] = field(default_factory=list)
     extra_post_step_hooks: list[PostStepHook] = field(default_factory=list)
     extra_event_subscribers: list[EventSubscriber] = field(default_factory=list)
+    # PreToolUseHook / PostToolUseHook：Tool 调用前/后的扩展点，对标 Claude Code
+    # 的 PreToolUse / PostToolUse hook（拒绝/改写/审计）。
+    extra_pre_tool_hooks: list[PreToolUseHook] = field(default_factory=list)
+    extra_post_tool_hooks: list[PostToolUseHook] = field(default_factory=list)
 
     # Prompt injection 防御：None 表示禁用（Engine 对 untrusted 工具结果不做消毒）。
     # 非 None 时 Engine 对 untrusted 工具结果做消毒并注入 security guard。
@@ -344,6 +355,8 @@ class Agent:
             tool_sources=list(config.extra_tool_sources),
             post_step_hooks=list(config.extra_post_step_hooks),
             event_subscribers=list(config.extra_event_subscribers),
+            pre_tool_hooks=list(config.extra_pre_tool_hooks),
+            post_tool_hooks=list(config.extra_post_tool_hooks),
         )
 
         # parent_ref is a late-binding slot: modules that build spawn executors
@@ -385,6 +398,8 @@ class Agent:
             tool_sources=agg.tool_sources,
             post_step_hooks=agg.post_step_hooks,
             event_subscribers=agg.event_subscribers,
+            pre_tool_hooks=agg.pre_tool_hooks,
+            post_tool_hooks=agg.post_tool_hooks,
             sanitizer=agg.sanitizer,
             permission_filter=agg.permission_filter,
             audit_logger=agg.audit_logger,
@@ -457,6 +472,8 @@ class Agent:
             tool_sources=list(self._bundle.tool_sources),
             post_step_hooks=list(self._bundle.post_step_hooks),
             event_subscribers=list(self._bundle.event_subscribers),
+            pre_tool_hooks=list(self._bundle.pre_tool_hooks),
+            post_tool_hooks=list(self._bundle.post_tool_hooks),
             sanitizer=self._bundle.sanitizer,
             # v2 capability-ACL parity：permission filter + audit + checker/asker
             # 必须和父代理一致，否则 delegation 路径可以绕过企业 ACL。

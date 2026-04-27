@@ -29,6 +29,8 @@ if TYPE_CHECKING:
         ContextProvider,
         EventSubscriber,
         PostStepHook,
+        PostToolUseHook,
+        PreToolUseHook,
         ToolSource,
     )
     from ..engine.permission.audit import AuditLogger
@@ -81,6 +83,8 @@ class CapabilityBundle:
     tool_sources: list["ToolSource"] = field(default_factory=list)
     post_step_hooks: list["PostStepHook"] = field(default_factory=list)
     event_subscribers: list["EventSubscriber"] = field(default_factory=list)
+    pre_tool_hooks: list["PreToolUseHook"] = field(default_factory=list)
+    post_tool_hooks: list["PostToolUseHook"] = field(default_factory=list)
     cleanup_callbacks: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
     sanitizer: "ToolResultSanitizer | None" = None
     permission_filter: "ToolVisibilityFilter | None" = None
@@ -100,6 +104,8 @@ class CapabilityBundle:
         self.tool_sources.extend(other.tool_sources)
         self.post_step_hooks.extend(other.post_step_hooks)
         self.event_subscribers.extend(other.event_subscribers)
+        self.pre_tool_hooks.extend(other.pre_tool_hooks)
+        self.post_tool_hooks.extend(other.post_tool_hooks)
         self.cleanup_callbacks.extend(other.cleanup_callbacks)
         if other.sanitizer is not None:
             self.sanitizer = other.sanitizer
