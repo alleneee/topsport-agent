@@ -587,6 +587,7 @@ class TestFailureHandler:
 async def test_orchestrator_with_parent_agent_inherits_capabilities() -> None:
     """Orchestrator 挂 parent_agent 时，每个 step 的子 Engine 带父的订阅者与 provider。"""
     from topsport_agent.agent import Agent, AgentConfig
+    from topsport_agent.agent.capabilities import CapabilityBundle
     from topsport_agent.engine import Engine, EngineConfig
     from topsport_agent.engine.orchestrator import Orchestrator, SubAgentConfig
     from topsport_agent.llm.provider import LLMResponse
@@ -616,13 +617,7 @@ async def test_orchestrator_with_parent_agent_inherits_capabilities() -> None:
         enable_browser=False,
     )
     parent_engine = Engine(provider, tools=[], config=EngineConfig(model="m"))
-    parent_bundle = {
-        "tools": [],
-        "context_providers": [],
-        "tool_sources": [],
-        "post_step_hooks": [],
-        "event_subscribers": [subscriber],
-    }
+    parent_bundle = CapabilityBundle(event_subscribers=[subscriber])
     parent = Agent(
         provider=provider,
         config=config,

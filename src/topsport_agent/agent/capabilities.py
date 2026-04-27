@@ -31,7 +31,11 @@ if TYPE_CHECKING:
         PostStepHook,
         ToolSource,
     )
+    from ..engine.permission.audit import AuditLogger
+    from ..engine.permission.filter import ToolVisibilityFilter
+    from ..engine.sanitizer import ToolResultSanitizer
     from ..llm.provider import LLMProvider
+    from ..types.permission import PermissionAsker, PermissionChecker
     from ..types.tool import ToolSpec
     from .base import Agent, AgentConfig
 
@@ -61,10 +65,15 @@ class InstallContext:
 class CapabilityBundle:
     """What a capability module contributes to the Agent assembly.
 
-    Every field is optional — a module that only adds tools leaves everything
-    else empty. Merger semantics are "extend list / update dict", no dedup:
-    collision handling (e.g. tool name conflict) is owned by the engine's
-    snapshot/dedup logic, not by the bundle merge.
+    List fields are accumulated across modules (extend, no dedup). Scalar
+    fields (sanitizer / permission_*) are typically populated once from
+    AgentConfig in `Agent.from_config`; modules that produce them use
+    last-non-None semantics via `merge()`.
+
+    This dataclass is the single source of truth for the parent capability
+    surface that `Agent.spawn_child` hands down to sub-agents. Previously the
+    same payload lived as `dict[str, Any]`, which let typo'd keys silently
+    drop subscribers/tracing on spawn paths (see commit f02235a).
     """
 
     tools: list["ToolSpec"] = field(default_factory=list)
@@ -73,10 +82,36 @@ class CapabilityBundle:
     post_step_hooks: list["PostStepHook"] = field(default_factory=list)
     event_subscribers: list["EventSubscriber"] = field(default_factory=list)
     cleanup_callbacks: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+    sanitizer: "ToolResultSanitizer | None" = None
+    permission_filter: "ToolVisibilityFilter | None" = None
+    audit_logger: "AuditLogger | None" = None
+    permission_checker: "PermissionChecker | None" = None
+    permission_asker: "PermissionAsker | None" = None
     # state is both "published to later modules" (written into ctx.shared after
     # install) AND "exposed to Agent constructor" (keys like skill_registry,
     # plugin_manager are lifted into Agent attributes for direct access).
     state: dict[str, Any] = field(default_factory=dict)
+
+    def merge(self, other: "CapabilityBundle") -> None:
+        """Fold `other` into self in place. Lists extend; scalars take other
+        when non-None; state dict updates."""
+        self.tools.extend(other.tools)
+        self.context_providers.extend(other.context_providers)
+        self.tool_sources.extend(other.tool_sources)
+        self.post_step_hooks.extend(other.post_step_hooks)
+        self.event_subscribers.extend(other.event_subscribers)
+        self.cleanup_callbacks.extend(other.cleanup_callbacks)
+        if other.sanitizer is not None:
+            self.sanitizer = other.sanitizer
+        if other.permission_filter is not None:
+            self.permission_filter = other.permission_filter
+        if other.audit_logger is not None:
+            self.audit_logger = other.audit_logger
+        if other.permission_checker is not None:
+            self.permission_checker = other.permission_checker
+        if other.permission_asker is not None:
+            self.permission_asker = other.permission_asker
+        self.state.update(other.state)
 
 
 @runtime_checkable

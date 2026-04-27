@@ -19,23 +19,15 @@ from ..engine import Engine, EngineConfig
 from ..engine.hooks import ContextProvider, EventSubscriber, PostStepHook, ToolSource
 from ..engine.sanitizer import ToolResultSanitizer
 from ..llm.provider import LLMProvider
-from ..memory.file_store import FileMemoryStore
-from ..memory.injector import MemoryInjector
-from ..memory.tools import build_memory_tools
 from ..plugins import PluginManager
-from ..plugins.agent_registry import AgentDefinition, build_agent_tools
-from ..skills import (
-    SkillInjector,
-    SkillLoader,
-    SkillMatcher,
-    SkillRegistry,
-    build_skill_tools,
-)
+from ..plugins.agent_registry import AgentDefinition
+from ..skills import SkillRegistry
 from ..types.events import Event, EventType
 from ..types.message import ContentPart, Message, Role
 from ..types.plan import Plan
 from ..types.session import RunState, Session
 from ..types.tool import ToolContext, ToolSpec
+from .capabilities import CapabilityBundle
 
 if TYPE_CHECKING:
     from ..engine.permission.audit import AuditLogger
@@ -124,20 +116,17 @@ class Agent:
         *,
         engine: Engine,
         cleanup_callbacks: list[Callable[[], Awaitable[None]]] | None = None,
-        skill_registry: SkillRegistry | None = None,
-        plugin_manager: PluginManager | None = None,
-        capability_bundle: dict[str, Any] | None = None,
+        capability_bundle: CapabilityBundle | None = None,
         image_generator: "OpenAIImageGenerationClient | None" = None,
     ) -> None:
         self._provider = provider
         self._config = config
         self._engine = engine
         self._cleanup_callbacks = list(cleanup_callbacks or [])
-        self._skill_registry = skill_registry
-        self._plugin_manager = plugin_manager
         # H-A2：父 Agent 构造期的能力快照（tools / providers / sources / hooks /
-        # subscribers），spawn_child 要拿来给子代理用，实现能力 parity。
-        self._capability_bundle: dict[str, Any] = capability_bundle or {}
+        # subscribers），spawn_child 直接读 bundle 字段把它们 by-reference 给子代理。
+        # skill_registry / plugin_manager 通过 bundle.state["..."] 派生 property。
+        self._bundle: CapabilityBundle = capability_bundle or CapabilityBundle()
         self._image_generator = image_generator
 
     @property
@@ -150,11 +139,27 @@ class Agent:
 
     @property
     def skill_registry(self) -> SkillRegistry | None:
-        return self._skill_registry
+        return self._bundle.state.get("skill_registry")
 
     @property
     def plugin_manager(self) -> PluginManager | None:
-        return self._plugin_manager
+        return self._bundle.state.get("plugin_manager")
+
+    # -----------------------------------------------------------------
+    # Post-construction capability registration. Always updates BOTH the
+    # live engine AND the bundle so spawn_child sees the addition. Server-
+    # side decorators (metrics / Langfuse / MCP) used to mutate
+    # `_capability_bundle` dict directly — that path is now closed; callers
+    # must go through these helpers.
+    # -----------------------------------------------------------------
+
+    def add_event_subscriber(self, subscriber: EventSubscriber) -> None:
+        self._engine.add_event_subscriber(subscriber)
+        self._bundle.event_subscribers.append(subscriber)
+
+    def add_tool_source(self, source: ToolSource) -> None:
+        self._engine.add_tool_source(source)
+        self._bundle.tool_sources.append(source)
 
     def new_session(self, session_id: str | None = None) -> Session:
         """创建一个绑定当前 Agent system_prompt 的新会话。"""
@@ -330,12 +335,16 @@ class Agent:
         from .capabilities import InstallContext
         from .capability_impls import default_capability_modules
 
-        tools: list[ToolSpec] = list(config.extra_tools)
-        context_providers: list[ContextProvider] = list(config.extra_context_providers)
-        tool_sources: list[ToolSource] = list(config.extra_tool_sources)
-        post_step_hooks: list[PostStepHook] = list(config.extra_post_step_hooks)
-        event_subscribers: list[EventSubscriber] = list(config.extra_event_subscribers)
-        cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
+        # Single aggregator. Pre-seeded with the operator's `extra_*` lists,
+        # then merged with each enabled module's bundle. List fields keep
+        # registration order (extras first, modules in default order).
+        agg = CapabilityBundle(
+            tools=list(config.extra_tools),
+            context_providers=list(config.extra_context_providers),
+            tool_sources=list(config.extra_tool_sources),
+            post_step_hooks=list(config.extra_post_step_hooks),
+            event_subscribers=list(config.extra_event_subscribers),
+        )
 
         # parent_ref is a late-binding slot: modules that build spawn executors
         # (PluginsModule) capture it now, dereference on tool-call time — by
@@ -343,26 +352,24 @@ class Agent:
         parent_ref: list[Agent] = []
         ctx = InstallContext(config=config, provider=provider, parent_ref=parent_ref)
 
-        skill_registry: SkillRegistry | None = None
-        plugin_manager: PluginManager | None = None
-
         for module in default_capability_modules():
             if not module.is_enabled(ctx):
                 continue
-            bundle = module.install(ctx)
-            tools.extend(bundle.tools)
-            context_providers.extend(bundle.context_providers)
-            tool_sources.extend(bundle.tool_sources)
-            post_step_hooks.extend(bundle.post_step_hooks)
-            event_subscribers.extend(bundle.event_subscribers)
-            cleanup_callbacks.extend(bundle.cleanup_callbacks)
-            # Published state: available to later modules + lifted onto Agent
-            ctx.shared.update(bundle.state)
+            module_bundle = module.install(ctx)
+            agg.merge(module_bundle)
+            # Published state: available to later modules. (`agg.merge` already
+            # folded module_bundle.state into agg.state for downstream consumers
+            # like Agent property accessors.)
+            ctx.shared.update(module_bundle.state)
 
-        # Lift well-known state keys onto Agent attributes (direct access
-        # from calling code expects these to live on the Agent itself).
-        plugin_manager = ctx.shared.get("plugin_manager")
-        skill_registry = ctx.shared.get("skill_registry")
+        # Scalar permission/sanitizer surface comes from AgentConfig directly
+        # (modules don't produce these today). Sub-agents inherit them via
+        # spawn_child reading the same bundle fields.
+        agg.sanitizer = config.sanitizer
+        agg.permission_filter = config.permission_filter
+        agg.audit_logger = config.audit_logger
+        agg.permission_checker = config.permission_checker
+        agg.permission_asker = config.permission_asker
 
         engine_config = EngineConfig(
             model=config.model,
@@ -372,43 +379,25 @@ class Agent:
         )
         engine = Engine(
             provider=provider,
-            tools=tools,
+            tools=agg.tools,
             config=engine_config,
-            context_providers=context_providers,
-            tool_sources=tool_sources,
-            post_step_hooks=post_step_hooks,
-            event_subscribers=event_subscribers,
-            sanitizer=config.sanitizer,
-            permission_filter=config.permission_filter,
-            audit_logger=config.audit_logger,
-            permission_checker=config.permission_checker,
-            permission_asker=config.permission_asker,
+            context_providers=agg.context_providers,
+            tool_sources=agg.tool_sources,
+            post_step_hooks=agg.post_step_hooks,
+            event_subscribers=agg.event_subscribers,
+            sanitizer=agg.sanitizer,
+            permission_filter=agg.permission_filter,
+            audit_logger=agg.audit_logger,
+            permission_checker=agg.permission_checker,
+            permission_asker=agg.permission_asker,
         )
-
-        bundle: dict[str, Any] = {
-            "tools": list(tools),
-            "context_providers": list(context_providers),
-            "tool_sources": list(tool_sources),
-            "post_step_hooks": list(post_step_hooks),
-            "event_subscribers": list(event_subscribers),
-            "sanitizer": config.sanitizer,
-            # v2 capability-ACL: sub-agents must inherit the parent's permission
-            # surface. Missing any of these would let delegation paths bypass
-            # the ACL — which is exactly the scenario enterprise ACLs must cover.
-            "permission_filter": config.permission_filter,
-            "audit_logger": config.audit_logger,
-            "permission_checker": config.permission_checker,
-            "permission_asker": config.permission_asker,
-        }
 
         agent = cls(
             provider=provider,
             config=config,
             engine=engine,
-            cleanup_callbacks=cleanup_callbacks,
-            skill_registry=skill_registry,
-            plugin_manager=plugin_manager,
-            capability_bundle=bundle,
+            cleanup_callbacks=agg.cleanup_callbacks,
+            capability_bundle=agg,
             image_generator=config.image_generator,
         )
         # 回填占位符，spawn_child 现在拿得到完整能力
@@ -447,7 +436,7 @@ class Agent:
         仅 tools 可按 allowed_tool_names 收窄；model 可覆盖；system_prompt 子代理自定。
         调用方自行驱动 engine.run(session) 并收集事件。
         """
-        parent_tools: list[ToolSpec] = self._capability_bundle.get("tools", [])
+        parent_tools: list[ToolSpec] = self._bundle.tools
         if allowed_tool_names is not None:
             allow = set(allowed_tool_names)
             sub_tools = [t for t in parent_tools if t.name in allow]
@@ -462,22 +451,19 @@ class Agent:
                 max_steps=self._config.max_steps,
                 provider_options=self._config.provider_options,
             ),
-            # H-A2 关键：把所有非 tool 的能力 by reference 传给子 Engine
-            context_providers=list(
-                self._capability_bundle.get("context_providers", [])
-            ),
-            tool_sources=list(self._capability_bundle.get("tool_sources", [])),
-            post_step_hooks=list(self._capability_bundle.get("post_step_hooks", [])),
-            event_subscribers=list(
-                self._capability_bundle.get("event_subscribers", [])
-            ),
-            sanitizer=self._capability_bundle.get("sanitizer"),
+            # H-A2 关键：把所有非 tool 的能力 by reference 传给子 Engine。
+            # 静态属性访问替代 dict.get(key, []) —— typo 立刻暴露在类型检查里。
+            context_providers=list(self._bundle.context_providers),
+            tool_sources=list(self._bundle.tool_sources),
+            post_step_hooks=list(self._bundle.post_step_hooks),
+            event_subscribers=list(self._bundle.event_subscribers),
+            sanitizer=self._bundle.sanitizer,
             # v2 capability-ACL parity：permission filter + audit + checker/asker
             # 必须和父代理一致，否则 delegation 路径可以绕过企业 ACL。
-            permission_filter=self._capability_bundle.get("permission_filter"),
-            audit_logger=self._capability_bundle.get("audit_logger"),
-            permission_checker=self._capability_bundle.get("permission_checker"),
-            permission_asker=self._capability_bundle.get("permission_asker"),
+            permission_filter=self._bundle.permission_filter,
+            audit_logger=self._bundle.audit_logger,
+            permission_checker=self._bundle.permission_checker,
+            permission_asker=self._bundle.permission_asker,
         )
         sub_session = Session(
             id=f"{session_id_prefix}:{uuid.uuid4().hex[:8]}",
@@ -500,15 +486,6 @@ class Agent:
 # ---------------------------------------------------------------------------
 # 共享辅助
 # ---------------------------------------------------------------------------
-
-
-def _async_wrap(sync_fn: Callable[[], None]) -> Callable[[], Awaitable[None]]:
-    """同步函数包为异步 callable，统一清理回调签名。"""
-
-    async def wrapper() -> None:
-        sync_fn()
-
-    return wrapper
 
 
 def _try_make_browser() -> tuple[Any, list[ToolSource]]:

@@ -17,6 +17,7 @@ from typing import Any
 
 from topsport_agent.agent import Agent, AgentConfig, default_agent
 from topsport_agent.agent.base import _build_spawn_executor
+from topsport_agent.agent.capabilities import CapabilityBundle
 from topsport_agent.engine import Engine, EngineConfig
 from topsport_agent.llm.provider import LLMResponse
 from topsport_agent.llm.request import LLMRequest
@@ -42,13 +43,7 @@ def _mock_parent_agent(
         enable_browser=False,
     )
     engine = Engine(provider, tools=tools, config=EngineConfig(model=model))
-    bundle = {
-        "tools": list(tools),
-        "context_providers": [],
-        "tool_sources": [],
-        "post_step_hooks": [],
-        "event_subscribers": [],
-    }
+    bundle = CapabilityBundle(tools=list(tools))
     return Agent(
         provider=provider, config=config, engine=engine,
         capability_bundle=bundle,
@@ -362,13 +357,13 @@ async def test_spawn_child_inherits_all_capabilities() -> None:
         enable_browser=False,
     )
     engine = Engine(provider, tools=tools, config=EngineConfig(model="m"))
-    bundle = {
-        "tools": tools,
-        "context_providers": [_CP()],
-        "tool_sources": [_TS()],
-        "post_step_hooks": [_PSH()],
-        "event_subscribers": [_ES()],
-    }
+    bundle = CapabilityBundle(
+        tools=tools,
+        context_providers=[_CP()],
+        tool_sources=[_TS()],
+        post_step_hooks=[_PSH()],
+        event_subscribers=[_ES()],
+    )
     parent = Agent(
         provider=provider, config=config, engine=engine,
         capability_bundle=bundle,
@@ -417,13 +412,10 @@ async def test_spawn_child_filters_tools_by_allowed() -> None:
     engine = Engine(
         provider, tools=[tool_keep, tool_drop], config=EngineConfig(model="m")
     )
-    bundle = {
-        "tools": [tool_keep, tool_drop],
-        "context_providers": [_CP()],
-        "tool_sources": [],
-        "post_step_hooks": [],
-        "event_subscribers": [],
-    }
+    bundle = CapabilityBundle(
+        tools=[tool_keep, tool_drop],
+        context_providers=[_CP()],
+    )
     parent = Agent(
         provider=provider, config=config, engine=engine,
         capability_bundle=bundle,

@@ -79,15 +79,15 @@ def _wrap_with_metrics(
     inner: Callable[[LLMProvider, str], Agent],
     metrics: Any,
 ) -> Callable[[LLMProvider, str], Agent]:
-    """在 agent_factory 外层装饰：把 metrics subscriber 挂到新 agent 的 engine。
+    """在 agent_factory 外层装饰：把 metrics subscriber 挂到新 agent。
 
-    同步到 `_capability_bundle` 确保 spawn_child 的 sub-agent 也能被 metrics 采集
-    （见 _wrap_with_extras docstring 的同款陷阱）。"""
+    Agent.add_event_subscriber 内部同时更新 engine 与 capability bundle，
+    确保 spawn_child 创建的 sub-agent 也被 metrics 采集（典型症状：plan
+    mode 的 sub-step 不进 Langfuse / Prometheus）。"""
 
     def factory(provider: LLMProvider, model: str) -> Agent:
         agent = inner(provider, model)
-        agent.engine.add_event_subscriber(metrics)
-        agent._capability_bundle.setdefault("event_subscribers", []).append(metrics)
+        agent.add_event_subscriber(metrics)
         return agent
 
     return factory
@@ -99,26 +99,21 @@ def _wrap_with_extras(
     event_subscribers: list[Any],
 ) -> Callable[[LLMProvider, str], Agent]:
     """装饰 factory：把 MCP tool sources / Langfuse 等 event subscribers 挂到
-    每个新 agent 的 engine。与 _wrap_with_metrics 互不干扰，可叠加。
+    每个新 agent。与 _wrap_with_metrics 互不干扰，可叠加。
 
-    关键：除了加到 engine runtime，**也必须同步到 `_capability_bundle`**，否则
-    spawn_child 创建的 sub-agent 会漏掉这些 —— 表现为 plan mode 的 sub-step
-    没有 tracing / 没有 MCP 工具（plan_id 的 trace 不出现在 Langfuse 里是
-    典型症状）。spawn_child 从 bundle 读 subscribers/tool_sources，不从
-    engine runtime 读。
+    走 Agent.add_tool_source / add_event_subscriber，这两个方法保证 engine
+    runtime 与 capability bundle 同步更新；之前版本必须手工 mutate
+    `_capability_bundle` dict 才不漏 sub-agent，重构后这条陷阱已关闭。
     """
     if not tool_sources and not event_subscribers:
         return inner
 
     def factory(provider: LLMProvider, model: str) -> Agent:
         agent = inner(provider, model)
-        bundle = agent._capability_bundle
         for src in tool_sources:
-            agent.engine.add_tool_source(src)
-            bundle.setdefault("tool_sources", []).append(src)
+            agent.add_tool_source(src)
         for sub in event_subscribers:
-            agent.engine.add_event_subscriber(sub)
-            bundle.setdefault("event_subscribers", []).append(sub)
+            agent.add_event_subscriber(sub)
         return agent
 
     return factory
