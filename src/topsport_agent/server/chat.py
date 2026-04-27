@@ -303,11 +303,47 @@ async def _stream_chat(
         saw_delta = False
         baseline_msg_count = len(entry.session.messages)
 
+        # Server-initiated elicitation: drain pending requests for this
+        # session before/between events. Yielding `event: elicitation`
+        # frames in-band lets the existing chat SSE channel carry both
+        # assistant deltas and user-input requests; front-end identifies
+        # the prompt by event name and POSTs the answer to
+        # /v1/elicitations/<id>.
+        broker = getattr(request.app.state, "elicitation_broker", None)
+        sid = entry.session.id
+
+        async def _drain_elicitations() -> AsyncIterator[str]:
+            if broker is None:
+                return
+            try:
+                pending = await broker.pending_for_session(sid)
+            except Exception as exc:
+                # Elicitation is best-effort; broker failure must not
+                # break the main chat stream.
+                _logger.warning(
+                    "elicitation drain failed for session=%s: %r",
+                    sid, exc, exc_info=True,
+                )
+                return
+            for eid, req in pending:
+                yield sse_event("elicitation", {
+                    "id": eid,
+                    "message": req.message,
+                    "mode": req.mode,
+                    "requested_schema": req.requested_schema,
+                    "url": req.url,
+                })
+
         try:
             async for event in entry.agent.run(user_input, entry.session):
                 if await request.is_disconnected():
                     entry.agent.cancel()
                     break
+                # Drain elicitation queue between every agent event so
+                # server prompts surface promptly (rather than waiting
+                # for the next LLM_TEXT_DELTA).
+                async for frame in _drain_elicitations():
+                    yield frame
                 if event.type == EventType.LLM_TEXT_DELTA:
                     delta = event.payload.get("delta", "")
                     if delta:
@@ -323,6 +359,10 @@ async def _stream_chat(
                         }
                     }
                     yield sse_data(err)
+            # Final drain: if elicitation arrived after the last agent
+            # event but before stream close, still surface it.
+            async for frame in _drain_elicitations():
+                yield frame
         except asyncio.CancelledError:
             entry.agent.cancel()
             raise

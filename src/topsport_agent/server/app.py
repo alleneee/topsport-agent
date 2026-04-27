@@ -37,6 +37,8 @@ from ..ratelimit.redis_client import create_redis_client
 from .auth import AuthConfig
 from .chat import router as chat_router
 from .config import ServerConfig
+from .elicitation import HTTPElicitationBroker
+from .elicitation_api import router as elicitation_router
 from .images import router as images_router
 from .plan import router as plan_router
 from .sessions import SessionStore
@@ -186,6 +188,8 @@ def _build_mcp_manager(cfg: ServerConfig) -> Any | None:
         for client in manager.clients():
             client.set_progress_callback(default_progress_callback(client.name))
 
+    # Elicitation handler is wired in lifespan after `app.state.elicitation_broker`
+    # is created — broker can't exist before app instance does.
     return manager
 
 
@@ -439,6 +443,20 @@ def create_app(
                             client_name=client.name,
                         )
                     )
+
+        # Elicitation broker — singleton routing server-driven user
+        # prompts through the active chat SSE stream. Stays alive for
+        # the app lifetime; in-memory state acceptable for v1 (single
+        # replica). Multi-replica deployments need Redis-backed broker.
+        broker: HTTPElicitationBroker | None = None
+        if cfg.enable_mcp_elicitation and mcp_manager is not None:
+            broker = HTTPElicitationBroker(
+                default_timeout_seconds=cfg.mcp_elicitation_timeout_seconds,
+            )
+            handler = broker.make_handler()
+            for client in mcp_manager.clients():
+                client.set_elicitation_handler(handler)  # type: ignore[arg-type]
+        app.state.elicitation_broker = broker
 
         # sandbox 生命周期挂到 SessionStore
         create_hooks: list = []
@@ -730,6 +748,7 @@ def create_app(
     app.include_router(plan_router)
     app.include_router(sessions_router)
     app.include_router(images_router)
+    app.include_router(elicitation_router)
 
     # Permission admin API 可选挂载：三件依赖都齐才暴露 /v1/admin/* 路由，
     # 缺任一（典型 CLI/测试场景）保持不变。

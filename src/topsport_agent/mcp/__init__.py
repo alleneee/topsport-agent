@@ -1,6 +1,13 @@
 from .builtin import BRAVE_DEFAULT_NAME, BRAVE_PACKAGE, brave_search_config
 from .client import MCPClient, SessionFactory
 from .config import load_mcp_config
+from .elicitation import (
+    ElicitationAction,
+    ElicitationHandler,
+    ElicitationMode,
+    ElicitationRequest,
+    ElicitationResponse,
+)
 from .listener import (
     ExponentialBackoff,
     ListenerState,
@@ -41,6 +48,11 @@ __all__ = [
     "BRAVE_DEFAULT_NAME",
     "BRAVE_PACKAGE",
     "AllowEntry",
+    "ElicitationAction",
+    "ElicitationHandler",
+    "ElicitationMode",
+    "ElicitationRequest",
+    "ElicitationResponse",
     "ExponentialBackoff",
     "LLMProviderSamplingHandler",
     "ListenerState",

@@ -9,6 +9,41 @@ from .client import MCPClient
 _logger = logging.getLogger(__name__)
 
 
+async def _do_call(
+    client: MCPClient, raw_name: str, args: dict[str, Any],
+) -> dict[str, Any]:
+    """Invoke MCP `call_tool` and normalise the response shape.
+
+    Three-layer error model:
+      - Transport / SDK exception → handler returns is_error=True with
+        the exception text (engine's ToolResult layer adds nothing).
+      - MCP isError=True (server-reported tool error) → passed through
+        verbatim so the LLM can interpret.
+      - Everything else → text + structured payload.
+    """
+    try:
+        result = await client.call_tool(raw_name, args)
+    except Exception as exc:
+        return {
+            "is_error": True,
+            "error": f"{type(exc).__name__}: {exc}",
+            "text": "",
+            "structured": None,
+        }
+
+    text_parts: list[str] = []
+    for content in getattr(result, "content", None) or []:
+        text = getattr(content, "text", None)
+        if text is not None:
+            text_parts.append(text)
+
+    return {
+        "is_error": bool(getattr(result, "isError", False)),
+        "text": "\n".join(text_parts),
+        "structured": getattr(result, "structuredContent", None),
+    }
+
+
 class MCPToolSource:
     """桥接层：把远端 MCP 工具描述翻译成引擎 ToolSpec，通过 <server>.<tool> 前缀避免跨服务重名。"""
     def __init__(self, client: MCPClient, *, prefix: str | None = None) -> None:
@@ -61,26 +96,20 @@ class MCPToolSource:
             # 此处不显式传 progress_callback —— 让 manager.set_progress_callback
             # 设的全局 callback 生效。需要 per-call override 的高级用例可在
             # 上游构造工具时改写此 closure。
-            try:
-                result = await client.call_tool(raw_name, args)
-            except Exception as exc:
-                return {
-                    "is_error": True,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "text": "",
-                    "structured": None,
-                }
-
-            text_parts: list[str] = []
-            for content in getattr(result, "content", None) or []:
-                text = getattr(content, "text", None)
-                if text is not None:
-                    text_parts.append(text)
-
-            return {
-                "is_error": bool(getattr(result, "isError", False)),
-                "text": "\n".join(text_parts),
-                "structured": getattr(result, "structuredContent", None),
-            }
+            #
+            # Elicitation 路由：把 ctx.session_id 写到 client 实例字段
+            # （ContextVar 跨 SDK task 失效，必须用实例字段）。当 elicitation
+            # 启用时，`_call_lock` 把同一 client 的 call_tool 串行化以避免
+            # 并发用户的 sid 串扰；elicitation 未启用时 lock 退化为 no-op
+            # 等价（contention 微小）。
+            elicit_enabled = client._elicitation_handler is not None
+            if elicit_enabled:
+                async with client._call_lock:
+                    client._current_call_session_id = ctx.session_id
+                    try:
+                        return await _do_call(client, raw_name, args)
+                    finally:
+                        client._current_call_session_id = None
+            return await _do_call(client, raw_name, args)
 
         return handler

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import asyncio
 import inspect
 import logging
 import time
@@ -9,6 +10,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Literal
 
+from . import elicitation as _elicit
+from .elicitation import ElicitationHandler
 from .logging_handler import LoggingCallback, MCPLogLevel
 from .progress import ProgressCallback, wrap_progress_callback
 from .roots import Root, RootsProvider, call_roots_provider
@@ -94,6 +97,21 @@ class MCPClient:
         # leaves both as None and subscription is unavailable.
         self._listener: Any = None
         self._listener_config: MCPServerConfig | None = None
+        # elicitation_handler: server-driven user-input request resolver.
+        # None means client does NOT declare the `elicitation` capability
+        # (server can't ask the user for input). Default safe.
+        self._elicitation_handler: ElicitationHandler | None = None
+        # Current tool-call session_id (set by MCPToolSource handler), read
+        # by `_elicitation_callback` to route server-initiated elicitation
+        # back to the right user. **Cannot use ContextVar**: SDK message
+        # handler runs in its own task whose context snapshot was taken
+        # at session start (before any tool call), so ContextVar never
+        # reaches it. Instance field + lock is the correct cross-task
+        # shared-state primitive at the cost of serialising tool calls
+        # **only when elicitation is enabled** (operators opt into the
+        # serialisation by enabling the capability).
+        self._current_call_session_id: str | None = None
+        self._call_lock = asyncio.Lock()
         # clock contract: 必须单调递增。生产默认 time.monotonic（避免 wall-clock
         # 跳变扰动 TTL 判定）；测试可注入可控函数。如果调用方误传非单调函数
         # （如 time.time）导致 age 计算出负值，_is_fresh 会按"已过期"处理（保守
@@ -269,6 +287,71 @@ class MCPClient:
     @property
     def sampling_handler(self) -> SamplingHandler | None:
         return self._sampling_handler
+
+    # -----------------------------------------------------------------
+    # Elicitation capability (server -> client user-input request)
+    # -----------------------------------------------------------------
+
+    def set_elicitation_handler(
+        self, handler: ElicitationHandler | None,
+    ) -> None:
+        """Register a handler for `elicitation/create` requests.
+
+        Setting this declares the `elicitation` capability — server can
+        thereafter ask the user for input (form schema or external URL
+        confirmation). Setting None disables (default; server requests
+        return method-not-found).
+
+        UX note: handler is invoked from the SDK's message-handling
+        task; production HTTP server impl uses contextvars to route
+        the request to the user session that triggered the underlying
+        tool call (see `mcp.elicitation.current_session_id` ContextVar)."""
+        self._elicitation_handler = handler
+
+    @property
+    def elicitation_handler(self) -> ElicitationHandler | None:
+        return self._elicitation_handler
+
+    async def _elicitation_callback(self, _context: Any, params: Any) -> Any:
+        """Adapter from our ElicitationHandler → MCP SDK's ElicitationFnT.
+
+        Reads `_current_call_session_id` from the client instance (set by
+        MCPToolSource handler under `_call_lock`), so routing works
+        across the SDK task boundary where ContextVar fails."""
+        import uuid as _uuid
+
+        handler = self._elicitation_handler
+        if handler is None:
+            return _elicit.to_sdk_error(
+                "client did not register an elicitation handler",
+                code=-32601,  # Method not found
+            )
+        try:
+            request = _elicit.from_sdk_params(
+                params,
+                request_id=_uuid.uuid4().hex,
+                session_id=self._current_call_session_id,
+            )
+        except Exception as exc:
+            _logger.warning(
+                "mcp client %r failed to parse elicitation params: %r",
+                self._name, exc, exc_info=True,
+            )
+            return _elicit.to_sdk_error(
+                f"invalid elicitation params: {type(exc).__name__}: {exc}",
+                code=-32602,
+            )
+        try:
+            response = await handler(request)
+        except Exception as exc:
+            _logger.warning(
+                "mcp client %r elicitation_handler raised %r",
+                self._name, exc, exc_info=True,
+            )
+            return _elicit.to_sdk_error(
+                f"elicitation handler failed: {type(exc).__name__}: {exc}",
+            )
+        return _elicit.to_sdk_result(response)
 
     async def _sampling_callback(self, _context: Any, params: Any) -> Any:
         """Adapter from our SamplingHandler → MCP SDK's SamplingFnT.
@@ -598,6 +681,12 @@ def _make_real_session_factory(
             if client._sampling_handler is not None
             else None
         )
+        # Elicitation: same conditional pattern.
+        elicitation_cb = (
+            client._elicitation_callback
+            if client._elicitation_handler is not None
+            else None
+        )
         # Logging callback: wrap user callback in a try/except so a bad
         # callback can't bring down the SDK's notification dispatch loop
         # (mirrors notify_list_changed exception isolation).
@@ -663,6 +752,7 @@ def _make_real_session_factory(
                     list_roots_callback=list_roots_cb,
                     logging_callback=logging_cb,
                     sampling_callback=sampling_cb,
+                    elicitation_callback=elicitation_cb,
                 ) as session:
                     await session.initialize()
                     await _post_init(session)
@@ -692,6 +782,7 @@ def _make_real_session_factory(
                         list_roots_callback=list_roots_cb,
                         logging_callback=logging_cb,
                         sampling_callback=sampling_cb,
+                        elicitation_callback=elicitation_cb,
                     ) as session:
                         await session.initialize()
                         await _post_init(session)

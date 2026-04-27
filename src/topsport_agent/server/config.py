@@ -92,6 +92,15 @@ class ServerConfig:
     # 中等 workload 留够 burst（cold start 一次性可消耗满 60 个 token）。
     # 调高需配合 cost 监控：每个 sampling 调用按 max_tokens 上限计费。
     mcp_sampling_rate_limit_per_min: int = 60
+    # 启用 MCP `elicitation` capability：让 server 通过现有 chat SSE 通道
+    # 反向问用户（form schema 或 url 模式）。默认关闭。开启后所有连接的 MCP
+    # server 都能向当前活跃 chat session 推问答；user 通过
+    # `POST /v1/elicitations/<id>` 回答。无活跃 session 时自动 decline。
+    enable_mcp_elicitation: bool = False
+    # 单次 elicitation 等用户回答的最长秒数。超时后 broker 自动用 decline 回应
+    # MCP server，避免 server-side 调用挂死。默认 60s 给用户合理时间看到、思考、
+    # 回答；可调高（5min for 异步 form fill）或调低（10s for 即时确认）。
+    mcp_elicitation_timeout_seconds: float = 60.0
     # Per-session disk workspace base directory. Each session gets
     # <workspace_root>/<safe_session_id>/files/ as its file_ops sandbox.
     # Empty string / None 默认回落到 ~/.topsport-agent/workspaces/。
@@ -187,6 +196,12 @@ class ServerConfig:
             ),
             mcp_sampling_rate_limit_per_min=int(
                 os.environ.get("MCP_SAMPLING_RATE_LIMIT_PER_MIN", "60")
+            ),
+            enable_mcp_elicitation=_parse_bool(
+                os.environ.get("ENABLE_MCP_ELICITATION"), default=False
+            ),
+            mcp_elicitation_timeout_seconds=float(
+                os.environ.get("MCP_ELICITATION_TIMEOUT_SECONDS", "60")
             ),
             workspace_root=os.environ.get("WORKSPACE_ROOT") or None,
             workspace_delete_on_close=_parse_bool(

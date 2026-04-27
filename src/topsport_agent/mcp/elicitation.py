@@ -1,0 +1,181 @@
+"""MCP `elicitation` capability — server-initiated user input.
+
+Per the MCP spec (2025-11-25):
+    - Server sends `elicitation/create` to ask the user for input.
+    - Two modes:
+        * form: server provides a JSON schema; client fills it in.
+        * url: server provides a URL; client opens it in a browser.
+    - Client returns `{action: accept|decline|cancel, content?: dict}`.
+
+Why this is the trickiest MCP capability to wire into a multi-tenant
+HTTP server: the elicitation request lands inside the MCP SDK message
+handler **with no native knowledge of which user session triggered the
+underlying tool call**. We bridge that with a `contextvars.ContextVar`
+set right before `MCPToolSource` invokes `client.call_tool`; the
+elicitation adapter reads the ContextVar to route the question to the
+right SSE stream.
+
+Public surface:
+    - `ElicitationRequest` / `ElicitationResponse`: stable façade types
+      decoupling callers from `mcp.types`.
+    - `ElicitationHandler`: Callable Protocol implementations resolve
+      requests (typically by routing to UI / async wait / decline).
+    - `from_sdk_params` / `to_sdk_result` / `to_sdk_error`: lazy SDK
+      boundary helpers.
+
+Routing strategy lives in `server/elicitation.py` (HTTPElicitationBroker);
+this module is just types + SDK boundary, kept transport-neutral so
+CLI / SDK callers can plug their own handler (e.g. raw stdin prompt).
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+_logger = logging.getLogger(__name__)
+
+ElicitationMode = Literal["form", "url"]
+ElicitationAction = Literal["accept", "decline", "cancel"]
+
+
+@dataclass(slots=True, frozen=True)
+class ElicitationRequest:
+    """Server's question to the user.
+
+    `mode="form"`: client should render `requested_schema` (JSON Schema
+    object) as a form, collect inputs, return them as `content`.
+    `mode="url"`: client should open `url` in a browser; server tracks
+    completion server-side via `elicitation_id`. `content` is unused.
+
+    `id` is generated client-side (uuid). It's the key under which the
+    HTTPElicitationBroker tracks the pending future and which the
+    `POST /v1/elicitations/<id>` endpoint answers against.
+
+    `session_id` is set by `MCPClient._elicitation_callback` from the
+    client instance's `_current_call_session_id` (populated under
+    `_call_lock` by `MCPToolSource` before invoking call_tool). This
+    is how the broker routes the request back to the right user
+    session — ContextVar can't cross the SDK task boundary, so we
+    pass it explicitly through the request payload.
+    """
+
+    id: str
+    message: str
+    mode: ElicitationMode
+    session_id: str | None = None
+    requested_schema: dict[str, Any] | None = None
+    url: str | None = None
+    elicitation_id_url_mode: str | None = None  # url-mode only
+    meta: dict[str, Any] | None = field(default=None)
+
+
+@dataclass(slots=True, frozen=True)
+class ElicitationResponse:
+    """User's reply.
+
+    `accept`: content carries the form values (form mode) or empty
+    dict (url mode where user just confirmed).
+    `decline`: user explicitly refused; server should not retry the
+    same prompt without changes.
+    `cancel`: user dismissed the prompt without answering; server
+    may retry.
+    """
+
+    action: ElicitationAction
+    content: dict[str, Any] | None = None
+
+
+ElicitationHandler = Callable[[ElicitationRequest], Awaitable[ElicitationResponse]]
+
+
+# ---------------------------------------------------------------------------
+# Context propagation: tool-call site → elicitation handler
+# ---------------------------------------------------------------------------
+#
+# Originally implemented via `contextvars.ContextVar`, but ContextVar is
+# task-local and the MCP SDK's ClientSession message-handling task starts
+# **before** any tool call sets a value — the SDK task's context snapshot
+# captures the empty default forever, and `_elicitation_callback` running
+# inside that task always reads None. We replaced it with an instance
+# field on MCPClient (`_current_call_session_id`) protected by `_call_lock`
+# in `tool_bridge._make_handler`. This ContextVar is kept around for any
+# external (non-mcp-bridge) callers that want to push the same identity
+# in single-task scenarios — but it is NOT how production routing works.
+
+current_session_id: ContextVar[str | None] = ContextVar(
+    "topsport_agent.mcp.current_session_id", default=None,
+)
+
+
+# ---------------------------------------------------------------------------
+# SDK boundary
+# ---------------------------------------------------------------------------
+
+
+def from_sdk_params(
+    params: Any,
+    *,
+    request_id: str,
+    session_id: str | None = None,
+) -> ElicitationRequest:
+    """Convert MCP SDK `ElicitRequestFormParams` / `ElicitRequestURLParams`
+    → our `ElicitationRequest`.
+
+    `request_id` is generated by the caller (typically uuid4().hex);
+    SDK's params.elicitationId (URL mode) is preserved separately.
+    `session_id` is read from the MCPClient's `_current_call_session_id`
+    field at the SDK callback boundary so the broker can route the
+    question to the right user session (see module docstring).
+    """
+    mode_raw = getattr(params, "mode", "form")
+    mode: ElicitationMode = "url" if mode_raw == "url" else "form"
+    return ElicitationRequest(
+        id=request_id,
+        message=getattr(params, "message", "") or "",
+        mode=mode,
+        session_id=session_id,
+        requested_schema=(
+            dict(getattr(params, "requestedSchema", None) or {})
+            if mode == "form" else None
+        ),
+        url=getattr(params, "url", None) if mode == "url" else None,
+        elicitation_id_url_mode=(
+            getattr(params, "elicitationId", None) if mode == "url" else None
+        ),
+        meta=dict(getattr(params, "meta", None) or {}) or None,
+    )
+
+
+def to_sdk_result(response: ElicitationResponse) -> Any:
+    """Convert `ElicitationResponse` → MCP SDK `ElicitResult`."""
+    import importlib
+
+    mcp_types = importlib.import_module("mcp.types")
+    kwargs: dict[str, Any] = {"action": response.action}
+    if response.content is not None:
+        kwargs["content"] = response.content
+    return mcp_types.ElicitResult(**kwargs)
+
+
+def to_sdk_error(message: str, code: int = -32603) -> Any:
+    import importlib
+
+    mcp_types = importlib.import_module("mcp.types")
+    return mcp_types.ErrorData(code=code, message=message)
+
+
+__all__ = [
+    "ElicitationAction",
+    "ElicitationHandler",
+    "ElicitationMode",
+    "ElicitationRequest",
+    "ElicitationResponse",
+    "current_session_id",
+    "from_sdk_params",
+    "to_sdk_error",
+    "to_sdk_result",
+]
